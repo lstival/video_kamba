@@ -9,6 +9,9 @@ defaults:
 # Global seeds
 seed: 42
 
+# Auto Batch Size tuning flag
+auto_batch_size: false
+
 # Work directory path (inferred at runtime or set)
 work_dir: ${hydra:runtime.cwd}
 

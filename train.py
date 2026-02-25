@@ -20,13 +20,21 @@ def main(cfg: DictConfig):
     )
     
     # Initialize datamodule (Placeholder for now)
-    # datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.datamodule)
+    datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.datamodule)
     
     # Initialize model (Placeholder for now)
-    # model: L.LightningModule = hydra.utils.instantiate(cfg.model)
+    model: L.LightningModule = hydra.utils.instantiate(cfg.model)
     
+    # Optional: Automatically find maximum batch size
+    if cfg.get("auto_batch_size", False):
+        from lightning.pytorch.tuner import Tuner
+        tuner = Tuner(trainer)
+        # This automatically modifies model.hparams.batch_size or datamodule.batch_size
+        tuner.scale_batch_size(model, datamodule=datamodule, mode="binsearch")
+        print(f"Auto batch size found. Starting training...")
+        
     # Train the model
-    # trainer.fit(model=model, datamodule=datamodule)
+    trainer.fit(model=model, datamodule=datamodule)
     
     print("Project initialized successfully.")
 
