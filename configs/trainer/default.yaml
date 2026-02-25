@@ -1,0 +1,14 @@
+# Default PyTorch Lightning Trainer config
+
+_target_: lightning.Trainer
+
+default_root_dir: ${work_dir}
+
+min_epochs: 1
+max_epochs: 100
+
+accelerator: gpu
+devices: 1
+precision: 16-mixed
+
+deterministic: false

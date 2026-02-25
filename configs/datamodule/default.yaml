@@ -1,0 +1,5 @@
+# Default datamodule configuration
+_target_: data.datamodule.VideoDataModule
+
+batch_size: 4
+num_workers: 2
