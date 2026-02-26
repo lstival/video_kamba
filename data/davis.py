@@ -70,7 +70,7 @@ class DAVISDataset(Dataset):
             mask = F.resize(mask, (self.img_size, self.img_size), interpolation=F.InterpolationMode.NEAREST)
             
             img_tensor = F.normalize(F.to_tensor(img), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            mask_tensor = torch.from_numpy(np.array(mask)).long()
+            mask_tensor = (torch.from_numpy(np.array(mask)) > 0).long()
             
             # Binary segmentation masks: non-zero is object
             # DAVIS mask values represent integer object IDs (0=background, 1=obj1, 2=obj2...)
