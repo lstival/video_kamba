@@ -554,19 +554,15 @@ class IntricateKANSSMCore(nn.Module):
     ) -> Float[torch.Tensor, "B T D"]:
         """Selective scan with KAN-modulated B and C matrices (fully optimized).
         
-        This version batches ALL computations:
-        - B modulations computed for all timesteps upfront
-        - C modulations computed for all timesteps upfront (based on input)
-        - Matrix exponentials batched across time
-        - Only state updates remain sequential (fundamental RNN constraint)
-        - Output computation is vectorized post-loop
+        This method implements the core 'Temporal Modeling' step of the Training/Inference processes.
+        It uses KAN-based modulation factors to adjust the SSM matrices dynamically.
         
         Args:
-            x: Input sequence [batch, seq_len, inner_dim]
-            delta: Step sizes [batch, seq_len, 1]
+            x: Input sequence [batch, seq_len, inner_dim].
+            delta: Step sizes [batch, seq_len, 1].
             
         Returns:
-            Output sequence [batch, seq_len, inner_dim]
+            Output sequence [batch, seq_len, inner_dim].
         """
         batch, seq_len, _ = x.shape
         device = x.device

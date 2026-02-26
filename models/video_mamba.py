@@ -98,6 +98,21 @@ class VideoMambaSystem(L.LightningModule):
     def forward(self, x: torch.Tensor, ref_frame: torch.Tensor = None, ref_mask: torch.Tensor = None) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
+        """Main inference process for multi-task video understanding.
+
+        Performs:
+        1. Feature extraction using DinoV3.
+        2. Sequence contextualization using KangaSSM.
+        3. Task decoding via specialized heads.
+
+        Args:
+            x: Query video sequence of shape [B, T, C, H, W].
+            ref_frame: Optional reference frame [B, 1, C, H, W] for VOS.
+            ref_mask: Optional reference mask [B, H, W] for VOS.
+
+        Returns:
+            A tuple of (logits_clf, pred_boxes, pred_box_logits, logits_seg).
+        """
         # 1. Spatial feature extraction (DinoV3)
         query_cls, query_patch = self.feature_extractor(x)
         
@@ -193,6 +208,19 @@ class VideoMambaSystem(L.LightningModule):
     # ------------------------------------------------------------------
 
     def _shared_step(self, batch, batch_idx, prefix="train"):
+        """Shared logic for training, validation, and test steps.
+
+        Dispatches the batch to the appropriate task-specific processing (VOS, Detection, or Classification)
+        based on the 'Batch Type Detection' process.
+
+        Args:
+            batch: The input batch from the dataloader.
+            batch_idx: Index of the current batch.
+            prefix: Log prefix ('train', 'val', 'test').
+
+        Returns:
+            The computed loss for the step.
+        """
         loss = 0.0
 
         # ── Multi-object VOS (YouTube-VOS / MOSE) ────────────────────────
