@@ -45,7 +45,11 @@ class VideoMambaSystem(L.LightningModule):
             
             # Embed the reference integer mask and pool it to match CLS token dimension
             # ref_mask is [B, H, W]. Output of embedding is [B, H, W, dim_in]
-            ref_mask_emb = self.mask_embedding(ref_mask).mean(dim=(1, 2)).unsqueeze(1) # [B, 1, dim_in]
+            # Replace 255 (ignore index) with 0 (background) to prevent out-of-bounds in embedding
+            ref_mask_safe = ref_mask.clone()
+            ref_mask_safe[ref_mask == 255] = 0
+            
+            ref_mask_emb = self.mask_embedding(ref_mask_safe).mean(dim=(1, 2)).unsqueeze(1) # [B, 1, dim_in]
             
             # Infuse the reference class token with the mask information
             ref_cls_infused = ref_cls + ref_mask_emb
@@ -87,7 +91,7 @@ class VideoMambaSystem(L.LightningModule):
             logits_clf, pred_boxes, pred_box_logits, logits_seg = self(query_images, ref_frame=ref_img, ref_mask=ref_mask)
             
             BT, C, H, W = logits_seg.shape[0] * logits_seg.shape[1], logits_seg.shape[2], logits_seg.shape[3], logits_seg.shape[4]
-            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), query_masks.view(BT, H, W))
+            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), query_masks.view(BT, H, W), ignore_index=255)
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg)
             

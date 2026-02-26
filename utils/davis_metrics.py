@@ -81,6 +81,9 @@ def evaluate_j_f(pred_mask: torch.Tensor, gt_mask: torch.Tensor, num_objects: in
     pred_np = pred_mask.cpu().numpy()
     gt_np = gt_mask.cpu().numpy()
     
+    # Ignore void index (255) by making prediction match background there
+    pred_np[gt_np == 255] = 0
+    
     j_scores = []
     f_scores = []
     
@@ -119,7 +122,10 @@ class DAVISMetric(Metric):
         # preds, target: [B, T, H, W] integer masks
         B = preds.shape[0]
         for b in range(B):
-            num_objects = int(target[b].max().item())
+            valid_mask = target[b] != 255
+            if not valid_mask.any():
+                continue
+            num_objects = int(target[b][valid_mask].max().item())
             if num_objects == 0:
                 continue
             j, f = evaluate_j_f(preds[b], target[b], num_objects)
