@@ -21,8 +21,19 @@ def main(cfg: DictConfig):
 
     print(f"Loading model from {checkpoint_path}...")
     
-    # Load model from checkpoint
-    model = VideoMambaSystem.load_from_checkpoint(checkpoint_path)
+    # Load model from checkpoint with strict=False to handle potential code changes.
+    # We look for overrides in global config (CLI) or model sub-config.
+    num_seg = cfg.get("num_seg_classes") or cfg.model.get("num_seg_classes", 11)
+    num_clf = cfg.get("num_clf_classes") or cfg.model.get("num_clf_classes", 51)
+    
+    print(f"Instantiating model with: num_seg_classes={num_seg}, num_clf_classes={num_clf}")
+
+    model = VideoMambaSystem.load_from_checkpoint(
+        checkpoint_path, 
+        strict=False,
+        num_seg_classes=num_seg,
+        num_clf_classes=num_clf
+    )
     model.eval()
     
     # Initialize DataModule using Hydra

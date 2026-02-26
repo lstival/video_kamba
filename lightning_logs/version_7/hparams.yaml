@@ -1,0 +1,8 @@
+dim_in: 768
+dim_out: 256
+num_clf_classes: 51
+num_seg_classes: 51
+num_boxes: 10
+target_size: 224
+learning_rate: 0.0001
+vos_loss_beta: 0.5

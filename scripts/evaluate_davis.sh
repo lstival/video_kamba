@@ -45,13 +45,19 @@ CLEAN_ARGS=()
 for arg in "$@"; do
     if [[ $arg == checkpoint=* ]]; then
         CKPT_PATH="${arg#checkpoint=}"
+        # Strip literal single or double quotes if present
+        CKPT_PATH="${CKPT_PATH#\'}"
+        CKPT_PATH="${CKPT_PATH%\'}"
+        CKPT_PATH="${CKPT_PATH#\"}"
+        CKPT_PATH="${CKPT_PATH%\"}"
+        
         if [[ $CKPT_PATH == *"="* ]]; then
             echo "Detected '=' in checkpoint path. Creating symlink workaround..."
             TEMP_CKPT="eval_tmp_davis_$(date +%s).ckpt"
             ln -sf "$(realpath "$CKPT_PATH")" "$TEMP_CKPT"
-            CLEAN_ARGS+=("checkpoint=$TEMP_CKPT")
+            CLEAN_ARGS+=("checkpoint=$PROJECT_ROOT/$TEMP_CKPT")
         else
-            CLEAN_ARGS+=("$arg")
+            CLEAN_ARGS+=("checkpoint=$(realpath "$CKPT_PATH")")
         fi
     else
         CLEAN_ARGS+=("$arg")
@@ -75,7 +81,7 @@ python scripts/eval_visuals.py "${CLEAN_ARGS[@]}"
 
 # Cleanup temporary symlink
 for arg in "${CLEAN_ARGS[@]}"; do
-    if [[ $arg == checkpoint=eval_tmp_davis_* ]]; then
+    if [[ $arg == checkpoint=$PROJECT_ROOT/eval_tmp_davis_* ]]; then
         rm "${arg#checkpoint=}"
     fi
 done
