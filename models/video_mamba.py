@@ -5,6 +5,7 @@ import lightning as L
 from jaxtyping import Float
 from torchmetrics import Accuracy, F1Score, Recall, JaccardIndex
 from utils.davis_metrics import DAVISMetric
+from utils.vos_loss import HybridVOSLoss
 
 from models.components.dinov3_wrapper import DinoV3Wrapper
 from models.components.kanga_ssm import KangaSSM
@@ -13,26 +14,87 @@ from models.components.detection_head import DetectionHead
 from models.components.segmentation_decoder import SegmentationDecoder
 
 class VideoMambaSystem(L.LightningModule):
-    def __init__(self, dim_in: int = 768, dim_out: int = 256, num_classes: int = 10, num_boxes: int = 10, target_size: int = 224, learning_rate: float = 1e-4):
+    """Multi-task video understanding model.
+
+    Supports three task families configured purely through YAML:
+
+    * **Action classification** – HMDB51 style ``(frames, labels)``.
+    * **DAVIS semi-supervised VOS** – ``(ref_img, ref_mask, query_imgs, query_masks)``.
+    * **Multi-object VOS** – YouTube-VOS / MOSE style 6-element batches
+      ``(ref_img, ref_mask, query_imgs, query_masks, obj_present, meta)``.
+
+    Args:
+        dim_in:          Feature dimension from DinoV3 (default 768).
+        dim_out:         Projection dimension (unused by default, reserved).
+        num_clf_classes: Number of action-classification output classes
+                         (e.g. 51 for HMDB51).
+        num_seg_classes: Number of segmentation output channels
+                         (background + n_id, e.g. 11 for n_id=10).
+        num_boxes:       Fixed number of predicted bounding boxes per frame.
+        target_size:     Spatial resolution of segmentation output.
+        learning_rate:   AdamW base learning rate.
+        vos_loss_beta:   Beta for HybridVOSLoss (BCE weight; default 0.5).
+    """
+
+    def __init__(
+        self,
+        dim_in: int = 768,
+        dim_out: int = 256,
+        num_clf_classes: int = 51,
+        num_seg_classes: int = 11,
+        num_boxes: int = 10,
+        target_size: int = 224,
+        learning_rate: float = 1e-4,
+        vos_loss_beta: float = 0.5,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        
+
         self.feature_extractor = DinoV3Wrapper(freeze=True)
         self.temporal_model = KangaSSM(d_model=dim_in)
-        self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_classes)
-        self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_classes, num_boxes=num_boxes)
-        self.seg_decoder = SegmentationDecoder(dim_in=dim_in, num_classes=num_classes, target_size=target_size)
-        
-        # Object Memory
-        self.mask_embedding = nn.Embedding(num_classes + 1, dim_in)
+        self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
+        self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
+        self.seg_decoder = SegmentationDecoder(dim_in=dim_in, num_classes=num_seg_classes, target_size=target_size)
+
+        # Object Memory: one embedding per segmentation channel (bg + objects)
+        self.mask_embedding = nn.Embedding(num_seg_classes, dim_in)
+
+        # Hybrid VOS loss
+        self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
         
         # Metrics
-        self.test_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.test_f1 = F1Score(task="multiclass", num_classes=num_classes, average="macro")
-        self.test_recall = Recall(task="multiclass", num_classes=num_classes, average="macro")
-        self.test_miou = JaccardIndex(task="multiclass", num_classes=num_classes)
+        self.test_acc = Accuracy(task="multiclass", num_classes=num_clf_classes)
+        self.test_f1 = F1Score(task="multiclass", num_classes=num_clf_classes, average="macro")
+        self.test_recall = Recall(task="multiclass", num_classes=num_clf_classes, average="macro")
+        self.test_miou = JaccardIndex(task="multiclass", num_classes=num_seg_classes)
         self.davis_metric = DAVISMetric()
+        self.vos_val_metric = DAVISMetric()  # reused for YouTube-VOS / MOSE val
         
+    # ------------------------------------------------------------------
+    # Batch type detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_vos_batch(batch) -> bool:
+        """Return True iff ``batch`` is a 6-element multi-object VOS batch.
+
+        Multi-object VOS batches from ``MultiObjectVOSDataModule`` carry:
+        ``(ref_img, ref_mask, query_images, query_masks, obj_present, meta)``.
+        The 5th element (index 4) is a boolean ``obj_present`` tensor, which
+        distinguishes this format from the standard DAVIS 4-tuple and from
+        HMDB51 2-tuples.
+        """
+        return (
+            isinstance(batch, (list, tuple))
+            and len(batch) == 6
+            and isinstance(batch[4], torch.Tensor)
+            and batch[4].dtype == torch.bool
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
     def forward(self, x: torch.Tensor, ref_frame: torch.Tensor = None, ref_mask: torch.Tensor = None) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
@@ -78,9 +140,61 @@ class VideoMambaSystem(L.LightningModule):
         
         return logits_clf, pred_boxes, pred_box_logits, logits_seg
 
+    # ------------------------------------------------------------------
+    # Multi-object VOS step (YouTube-VOS / MOSE)
+    # ------------------------------------------------------------------
+
+    def _vos_step(
+        self,
+        batch,
+        batch_idx: int,
+        prefix: str,
+    ) -> torch.Tensor:
+        """Training / validation step for multi-object VOS batches.
+
+        Batch format: ``(ref_img, ref_mask, query_images, query_masks,
+        obj_present, meta)``.
+
+        Args:
+            batch:     6-element tuple from ``MultiObjectVOSDataModule``.
+            batch_idx: Batch index (unused, kept for API consistency).
+            prefix:    Log prefix – ``"train"`` or ``"val"``.
+
+        Returns:
+            Scalar hybrid VOS loss.
+        """
+        ref_img, ref_mask, query_images, query_masks, obj_present, _meta = batch
+
+        # Forward pass with reference memory
+        _logits_clf, _pred_boxes, _pred_box_logits, logits_seg = self(
+            query_images, ref_frame=ref_img, ref_mask=ref_mask
+        )
+        # logits_seg: [B, T, num_seg_classes, H, W]
+
+        loss = self.vos_loss_fn(logits_seg, query_masks, obj_present)
+
+        assert not torch.isnan(loss), "_vos_step: NaN loss detected."
+
+        self.log(f"{prefix}_loss_vos", loss, prog_bar=(prefix == "val"), on_epoch=True, on_step=(prefix == "train"))
+        self.log(f"{prefix}_loss", loss, prog_bar=True, on_epoch=True, on_step=(prefix == "train"))
+
+        if prefix in ("val", "test"):
+            preds = torch.argmax(logits_seg, dim=2)  # [B, T, H, W]
+            self.vos_val_metric.update(preds, query_masks)
+
+        return loss
+
+    # ------------------------------------------------------------------
+    # Shared step (dispatches by batch format)
+    # ------------------------------------------------------------------
+
     def _shared_step(self, batch, batch_idx, prefix="train"):
         loss = 0.0
-        
+
+        # ── Multi-object VOS (YouTube-VOS / MOSE) ────────────────────────
+        if self._is_vos_batch(batch):
+            return self._vos_step(batch, batch_idx, prefix)
+
         # Handle DAVIS Semi-Supervised format: (ref_img, ref_mask, query_images, query_masks)
         if len(batch) == 4 and batch[0].dim() == 4 and batch[1].dim() == 3 and batch[2].dim() == 5:
             ref_img, ref_mask, query_images, query_masks = batch
@@ -138,7 +252,7 @@ class VideoMambaSystem(L.LightningModule):
             boxes_gt, box_labels_gt = batch[2], batch[3]
             loss_box = F.l1_loss(pred_boxes, boxes_gt)
             loss_box_cls = F.cross_entropy(
-                pred_box_logits.view(-1, self.hparams.num_classes), 
+                pred_box_logits.view(-1, self.hparams.num_clf_classes),
                 box_labels_gt.view(-1).long()
             )
             loss_detection = loss_box + loss_box_cls
@@ -164,20 +278,27 @@ class VideoMambaSystem(L.LightningModule):
         self.log("test_f1", self.test_f1.compute())
         self.log("test_recall", self.test_recall.compute())
         self.log("test_miou", self.test_miou.compute())
-        
+
         davis_res = self.davis_metric.compute()
         if davis_res["J&F"] > 0:
             self.log("test_J", davis_res["J"])
             self.log("test_F", davis_res["F"])
             self.log("test_J_and_F", davis_res["J&F"])
-        
+
+        vos_res = self.vos_val_metric.compute()
+        if vos_res["J&F"] > 0:
+            self.log("test_vos_J", vos_res["J"])
+            self.log("test_vos_F", vos_res["F"])
+            self.log("test_vos_J_and_F", vos_res["J&F"])
+
         # Reset metrics
         self.test_acc.reset()
         self.test_f1.reset()
         self.test_recall.reset()
         self.test_miou.reset()
         self.davis_metric.reset()
-        
+        self.vos_val_metric.reset()
+
     def on_validation_epoch_end(self):
         davis_res = self.davis_metric.compute()
         if davis_res["J&F"] > 0:
@@ -185,6 +306,13 @@ class VideoMambaSystem(L.LightningModule):
             self.log("val_F", davis_res["F"])
             self.log("val_J_and_F", davis_res["J&F"])
         self.davis_metric.reset()
+
+        vos_res = self.vos_val_metric.compute()
+        if vos_res["J&F"] > 0:
+            self.log("val_vos_J", vos_res["J"])
+            self.log("val_vos_F", vos_res["F"])
+            self.log("val_vos_J_and_F", vos_res["J&F"])
+        self.vos_val_metric.reset()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)

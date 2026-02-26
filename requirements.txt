@@ -17,5 +17,8 @@ mamba-ssm
 huggingface_hub
 av
 
+# Augmentation (TPS + affine for VOS training)
+kornia>=0.7.0
+
 # Validation
 pytest
