@@ -127,13 +127,14 @@ class DAVISDataset(Dataset):
 
 class DAVISDataModule(L.LightningDataModule):
     def __init__(self, data_dir: str, batch_size: int = 2, num_workers: int = 4, 
-                 seq_len: int = 16, img_size: int = 224):
+                 seq_len: int = 16, img_size: int = 224, test_split: str = "val"):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.seq_len = seq_len
         self.img_size = img_size
+        self.test_split = test_split
         
         self.train_dataset = None
         self.val_dataset = None
@@ -146,10 +147,8 @@ class DAVISDataModule(L.LightningDataModule):
                 self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
         
         if stage == "test" or stage is None:
-            # We default test stage to "val" since test-dev requires a separate download,
-            # but users can easily override via dataset instantiation if test-dev is present.
             self.test_dataset = DAVISDataset(
-                self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
+                self.data_dir, image_set=self.test_split, seq_len=self.seq_len, img_size=self.img_size)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, 

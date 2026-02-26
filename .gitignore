@@ -3,3 +3,4 @@ data/*
 logs/
 venv/
 __pycache__/
+eval_results/
