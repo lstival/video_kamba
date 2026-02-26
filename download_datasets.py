@@ -37,6 +37,17 @@ def download_hmdb51(base_dir):
         print(f"Downloading to {hmdb51_dir}...")
         snapshot_download(repo_id="jili5044/hmdb51", repo_type="dataset", local_dir=hmdb51_dir)
         print("HMDB51 Download complete.")
+        
+        # Add extraction logic
+        zip_path = os.path.join(hmdb51_dir, "hmdb51.zip")
+        if os.path.exists(zip_path):
+            print(f"Extracting {zip_path}...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(hmdb51_dir)
+            print("HMDB51 Extraction complete.")
+        else:
+            print(f"Warning: {zip_path} not found for extraction.")
+            
     except ImportError:
         print("\nError: The 'huggingface_hub' package is required to download HMDB51.")
         print("Please install it by running: pip install huggingface_hub")

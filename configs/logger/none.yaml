@@ -1,0 +1,4 @@
+# Dummy logger to disable logging
+_target_: lightning.pytorch.loggers.CSVLogger
+save_dir: logs/csv/
+name: "none"

@@ -1,0 +1,2 @@
+epoch,step,test_acc,test_f1,test_loss,test_loss_seg,test_miou,test_recall
+0,0,0.0,0.0,5.101858139038086,5.101858139038086,0.0018144631758332253,0.0

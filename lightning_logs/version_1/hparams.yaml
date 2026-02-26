@@ -1,0 +1,6 @@
+dim_in: 768
+dim_out: 256
+num_classes: 51
+num_boxes: 10
+target_size: 224
+learning_rate: 0.0001

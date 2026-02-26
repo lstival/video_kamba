@@ -1,0 +1,8 @@
+# HMDB51 datamodule configuration
+_target_: data.hmdb51.HMDB51DataModule
+
+data_dir: ${work_dir}/data/HMDB51/hmdb51
+batch_size: 4
+num_workers: 4
+seq_len: 16
+img_size: 224

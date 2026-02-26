@@ -30,11 +30,13 @@ def test_video_mamba_system():
     inputs = torch.randn(B, T, C, H, W)
     model = VideoMambaSystem(dim_in=768, num_classes=num_classes, target_size=224)
     
-    logits_clf, logits_seg = model(inputs)
+    logits_clf, pred_boxes, pred_box_logits = model(inputs)
     
     assert logits_clf.shape == (B, num_classes)
-    assert logits_seg.shape == (B, T, num_classes, 224, 224)
+    assert pred_boxes.shape == (B, T, 10, 4) # 10 is num_boxes default
+    assert pred_box_logits.shape == (B, T, 10, num_classes)
 
     # test defensive assertions
     assert not torch.isnan(logits_clf).any()
-    assert not torch.isnan(logits_seg).any()
+    assert not torch.isnan(pred_boxes).any()
+    assert not torch.isnan(pred_box_logits).any()

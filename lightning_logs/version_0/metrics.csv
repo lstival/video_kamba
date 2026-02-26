@@ -1,0 +1,2 @@
+epoch,step,test_loss,test_loss_box,test_loss_clf,test_loss_det
+0,0,90.67594146728516,0.4805510938167572,4.077101707458496,86.59883117675781

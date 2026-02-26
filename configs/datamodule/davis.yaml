@@ -1,0 +1,8 @@
+# DAVIS datamodule configuration
+_target_: data.davis.DAVISDataModule
+
+data_dir: ${work_dir}/data/DAVIS/DAVIS
+batch_size: 2
+num_workers: 4
+seq_len: 16
+img_size: 224

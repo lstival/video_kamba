@@ -9,6 +9,9 @@ defaults:
 # Global seeds
 seed: 42
 
+# Checkpoint for evaluation
+checkpoint: null
+
 # Auto Batch Size tuning flag
 auto_batch_size: false
 

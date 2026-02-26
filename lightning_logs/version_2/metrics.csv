@@ -1,0 +1,2 @@
+epoch,step,test_acc,test_f1,test_loss,test_loss_box,test_loss_clf,test_loss_det,test_miou,test_recall
+0,0,0.0,0.0,90.56233215332031,0.47867852449417114,4.096522808074951,86.46580505371094,nan,0.0

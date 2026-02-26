@@ -125,6 +125,10 @@ class DAVISDataModule(L.LightningDataModule):
                 self.data_dir, image_set="train", seq_len=self.seq_len, img_size=self.img_size)
             self.val_dataset = DAVISDataset(
                 self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
+        
+        if stage == "test" or stage is None:
+            self.test_dataset = DAVISDataset(
+                self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, 
@@ -132,4 +136,8 @@ class DAVISDataModule(L.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size, 
+                          num_workers=self.num_workers, shuffle=False)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, 
                           num_workers=self.num_workers, shuffle=False)

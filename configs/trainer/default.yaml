@@ -12,3 +12,4 @@ devices: 1
 precision: 16-mixed
 
 deterministic: false
+fast_dev_run: false

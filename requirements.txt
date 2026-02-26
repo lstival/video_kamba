@@ -10,8 +10,12 @@ omegaconf
 comet-ml
 
 # KANGA / SSM dependencies (Unix only)
-causal-conv1d; sys_platform != "win32"
-mamba-ssm; sys_platform != "win32"
+causal-conv1d>=1.4.0
+mamba-ssm
+
+# Dataset utilities
+huggingface_hub
+av
 
 # Validation
 pytest
