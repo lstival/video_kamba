@@ -1,0 +1,55 @@
+{
+  "name": "Video_Mamba",
+  "version": "1.0.0",
+  "description": "Multi-task Video Understanding with KAN-Modulated SSMs",
+  "clusters": [
+    {
+      "name": "Data Pipeline",
+      "path": "data/",
+      "description": "Dataset loading and preprocessing for DAVIS, HMDB51, and Multi-object VOS."
+    },
+    {
+      "name": "Temporal Modeling",
+      "path": "models/components/",
+      "description": "Core KAN-SSM implementation and its mathematical foundations."
+    },
+    {
+      "name": "Model Hub",
+      "path": "models/",
+      "description": "Central LightningModule and high-level architecture."
+    },
+    {
+      "name": "Configuration",
+      "path": "configs/",
+      "description": "Hydra-based experiment configurations."
+    }
+  ],
+  "processes": [
+    {
+      "name": "Training",
+      "entry": "train.py",
+      "steps": [
+        "Data Loading",
+        "Feature Extraction",
+        "Temporal Modeling",
+        "Loss Computation",
+        "Optimization"
+      ]
+    },
+    {
+      "name": "Inference",
+      "entry": "models/video_mamba.py:forward",
+      "description": "Multi-task forward pass dispatching."
+    },
+    {
+      "name": "Evaluation",
+      "entry": "eval/",
+      "description": "Metric computation and result analysis."
+    }
+  ],
+  "symbols": {
+    "main_system": "models.video_mamba.VideoMambaSystem",
+    "ssm_core": "models.components.kan_ssm_core.IntricateKANSSMCore",
+    "data_module": "data.datamodule.VideoDataModule"
+  }
+}
