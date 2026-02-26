@@ -13,7 +13,7 @@ class DAVISDataset(Dataset):
     """
     def __init__(self, root_dir, image_set="train", seq_len=16, img_size=224, resolution="480p"):
         self.root_dir = root_dir
-        self.image_set = image_set # "train" or "val"
+        self.image_set = image_set # "train", "val", or "test-dev"
         self.seq_len = seq_len
         self.img_size = img_size
         self.resolution = resolution
@@ -23,10 +23,11 @@ class DAVISDataset(Dataset):
         self.split_file = os.path.join(root_dir, 'ImageSets', '2017', f'{image_set}.txt')
         
         if not os.path.exists(self.split_file):
-            raise FileNotFoundError(f"Cannot find split file {self.split_file}")
-            
-        with open(self.split_file, 'r') as f:
-            self.sequences = [line.strip() for line in f.readlines() if line.strip()]
+            print(f"Warning: Cannot find split file {self.split_file}. Ignoring if not needed.")
+            self.sequences = []
+        else:
+            with open(self.split_file, 'r') as f:
+                self.sequences = [line.strip() for line in f.readlines() if line.strip()]
             
         # Group frames by sequence
         self.sequence_frames = {}
@@ -70,11 +71,8 @@ class DAVISDataset(Dataset):
             mask = F.resize(mask, (self.img_size, self.img_size), interpolation=F.InterpolationMode.NEAREST)
             
             img_tensor = F.normalize(F.to_tensor(img), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            # Preserve semantic integer IDs (0=bg, 1=obj1, 2=obj2)
             mask_tensor = torch.from_numpy(np.array(mask)).long()
-            
-            # Binary segmentation masks: non-zero is object
-            # DAVIS mask values represent integer object IDs (0=background, 1=obj1, 2=obj2...)
-            # We turn it into a single classification map or dense binary map for semantic segmentation.
             
             transformed_images.append(img_tensor)
             transformed_masks.append(mask_tensor)
@@ -94,16 +92,37 @@ class DAVISDataset(Dataset):
         loaded_images = []
         loaded_masks = []
         
+        # 1. Load the absolute first frame of the sequence as the reference
+        ref_frame = self.sequence_frames[seq][0]
+        ref_img_path = os.path.join(self.img_dir, seq, ref_frame)
+        ref_mask_path = os.path.join(self.mask_dir, seq, ref_frame.replace('.jpg', '.png'))
+        
+        loaded_images.append(Image.open(ref_img_path).convert('RGB'))
+        # If mask doesn't exist (e.g., test-dev queries), create empty mask
+        if os.path.exists(ref_mask_path):
+            loaded_masks.append(Image.open(ref_mask_path))
+        else:
+            w, h = loaded_images[-1].size
+            loaded_masks.append(Image.new('L', (w, h), 0))
+        
+        # 2. Load the query frames
         for frame in frames:
             img_path = os.path.join(self.img_dir, seq, frame)
             mask_path = os.path.join(self.mask_dir, seq, frame.replace('.jpg', '.png'))
             
             loaded_images.append(Image.open(img_path).convert('RGB'))
-            loaded_masks.append(Image.open(mask_path))
+            if os.path.exists(mask_path):
+                loaded_masks.append(Image.open(mask_path))
+            else:
+                w, h = loaded_images[-1].size
+                loaded_masks.append(Image.new('L', (w, h), 0))
             
         images, masks = self._transform_clip(loaded_images, loaded_masks)
         
-        return images, masks
+        ref_img, ref_mask = images[0], masks[0]
+        query_images, query_masks = images[1:], masks[1:]
+        
+        return ref_img, ref_mask, query_images, query_masks
 
 
 class DAVISDataModule(L.LightningDataModule):
@@ -127,6 +146,8 @@ class DAVISDataModule(L.LightningDataModule):
                 self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
         
         if stage == "test" or stage is None:
+            # We default test stage to "val" since test-dev requires a separate download,
+            # but users can easily override via dataset instantiation if test-dev is present.
             self.test_dataset = DAVISDataset(
                 self.data_dir, image_set="val", seq_len=self.seq_len, img_size=self.img_size)
 
