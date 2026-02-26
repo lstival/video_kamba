@@ -1,0 +1,30 @@
+# MOSE 2023 datamodule configuration
+# Usage: python train.py datamodule=mose
+#
+# Expected data layout:
+#   data/MOSE/train/{JPEGImages,Annotations}/<video_id>/
+#   data/MOSE/valid/{JPEGImages,Annotations}/<video_id>/
+#
+# Dataset stats:
+#   Train: ~1,507 videos | Valid: ~311 videos
+#   Object disappearance rate: 41.5%  (vs. DAVIS 16.1%)
+#   The obj_present tensor [B, T, n_id] handles absent objects in the loss.
+_target_: data.multi_object_vos.MultiObjectVOSDataModule
+
+dataset_type: mose
+data_dir: ${work_dir}/data/MOSE
+
+# Sequence length: 5 query frames per clip
+seq_len: 5
+
+# MOSE annotations are 480p
+img_size: 480
+
+# Identity bank size
+n_id: 10
+
+batch_size: 2
+num_workers: 4
+
+# Apply kornia affine + TPS augmentation on train split
+augment_train: true

@@ -26,17 +26,25 @@ def test_kanga_ssm_shapes():
 
 def test_video_mamba_system():
     B, T, C, H, W = 2, 4, 3, 224, 224
-    num_classes = 5
+    num_clf_classes = 5
+    num_seg_classes = 11
     inputs = torch.randn(B, T, C, H, W)
-    model = VideoMambaSystem(dim_in=768, num_classes=num_classes, target_size=224)
-    
-    logits_clf, pred_boxes, pred_box_logits = model(inputs)
-    
-    assert logits_clf.shape == (B, num_classes)
-    assert pred_boxes.shape == (B, T, 10, 4) # 10 is num_boxes default
-    assert pred_box_logits.shape == (B, T, 10, num_classes)
+    model = VideoMambaSystem(
+        dim_in=768,
+        num_clf_classes=num_clf_classes,
+        num_seg_classes=num_seg_classes,
+        target_size=224,
+    )
+
+    logits_clf, pred_boxes, pred_box_logits, logits_seg = model(inputs)
+
+    assert logits_clf.shape == (B, num_clf_classes), f"clf: {logits_clf.shape}"
+    assert pred_boxes.shape == (B, T, 10, 4)  # 10 is num_boxes default
+    assert pred_box_logits.shape == (B, T, 10, num_clf_classes)
+    assert logits_seg.shape == (B, T, num_seg_classes, 224, 224), f"seg: {logits_seg.shape}"
 
     # test defensive assertions
     assert not torch.isnan(logits_clf).any()
     assert not torch.isnan(pred_boxes).any()
     assert not torch.isnan(pred_box_logits).any()
+    assert not torch.isnan(logits_seg).any()

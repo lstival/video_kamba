@@ -3,4 +3,12 @@ _target_: models.video_mamba.VideoMambaSystem
 
 dim_in: 768
 dim_out: 256
-num_classes: 51
+# Classification head output classes (e.g. HMDB51 = 51)
+num_clf_classes: 51
+# Segmentation head output channels = background + n_id objects (default n_id=10 → 11)
+num_seg_classes: 11
+num_boxes: 10
+target_size: 224
+learning_rate: 1e-4
+# Weight for BCE in hybrid VOS loss (1 - vos_loss_beta = SoftDice weight)
+vos_loss_beta: 0.5
