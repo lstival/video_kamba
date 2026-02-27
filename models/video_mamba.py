@@ -46,6 +46,7 @@ class VideoMambaSystem(L.LightningModule):
         target_size: int = 224,
         learning_rate: float = 1e-4,
         vos_loss_beta: float = 0.5,
+        use_ref_context: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -114,46 +115,73 @@ class VideoMambaSystem(L.LightningModule):
             A tuple of (logits_clf, pred_boxes, pred_box_logits, logits_seg).
         """
         # 1. Spatial feature extraction (DinoV3)
-        query_cls, query_patch = self.feature_extractor(x)
+        B, T = x.shape[0], x.shape[1]
+        query_cls, query_patch = self.feature_extractor(x) # query_patch: [B, T, D, P]
         
-        if ref_frame is not None and ref_mask is not None:
+        if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
             # Extract ref features
-            ref_cls, ref_patch = self.feature_extractor(ref_frame.unsqueeze(1))
+            ref_cls, ref_patch = self.feature_extractor(ref_frame.unsqueeze(1)) # ref_patch: [B, 1, D, P]
             
-            # Embed the reference integer mask and pool it to match CLS token dimension
-            # ref_mask is [B, H, W]. Output of embedding is [B, H, W, dim_in]
-            # Replace 255 (ignore index) with 0 (background) to prevent out-of-bounds in embedding
-            ref_mask_safe = ref_mask.clone()
-            ref_mask_safe[ref_mask == 255] = 0
+            # Robust extraction of dimensions
+            B_ref, T_ref, D_feat, P_feat = ref_patch.shape
+            H_p = W_p = int(P_feat**0.5) 
             
-            ref_mask_emb = self.mask_embedding(ref_mask_safe).mean(dim=(1, 2)).unsqueeze(1) # [B, 1, dim_in]
+            # Spatial Infusion: Map mask to the patch grid
+            ref_mask_small = F.interpolate(
+                ref_mask.unsqueeze(1).float(), 
+                size=(H_p, W_p), 
+                mode="nearest"
+            ).long() # [B, 1, H_p, W_p]
             
-            # Infuse the reference class token with the mask information
-            ref_cls_infused = ref_cls + ref_mask_emb
+            ref_mask_safe = ref_mask_small.clone()
+            ref_mask_safe[ref_mask_small == 255] = 0
             
-            # Prepend context to the sequence
-            cls_tokens = torch.cat([ref_cls_infused, query_cls], dim=1)
+            # Embed mask patches -> [B, P, D]
+            ref_mask_patch_emb = self.mask_embedding(ref_mask_safe.squeeze(1)) 
+            ref_mask_patch_emb = ref_mask_patch_emb.reshape(B, H_p * W_p, -1) 
+            
+            # Correct Transposition: ref_patch is [B, 1, D, P]. We need [B, 1, P, D]
+            ref_patch_p = ref_patch.transpose(2, 3) # [B, 1, P, D]
+            
+            # Infuse patch tokens
+            ref_patch_infused = ref_patch_p + ref_mask_patch_emb.unsqueeze(1) # [B, 1, P, D]
+            
+            # --- PATCH-SEQUENCE SSM ---
+            # Instead of flattening patches into one sequence, treat each (x,y) location as a sequence
+            # Query patches: [B, T, D, P] -> [B, T, P, D]
+            query_patch_p = query_patch.transpose(2, 3) 
+            
+            # Full sequence per patch: [RefPatch, Q1Patch, Q2Patch, ..., QTPatch]
+            all_patches = torch.cat([ref_patch_infused, query_patch_p], dim=1) # [B, T+1, P, D]
+            
+            # Group by patch location: [B, P, T+1, D] -> [B*P, T+1, D]
+            all_patches = all_patches.permute(0, 2, 1, 3).reshape(B * P_feat, T + 1, D_feat)
+            
+            # Temporal modeling
+            ssm_out_raw = self.temporal_model(all_patches) # [B*P, T+1, D]
+            
+            # Reshape back and extract query part: [B, P, T+1, D]
+            ssm_out_full = ssm_out_raw.reshape(B, P_feat, T + 1, D_feat)
+            ssm_out_query = ssm_out_full[:, :, 1:, :] # [B, P, T, D]
+            
+            # Final infused patches for decoder: [B, T, D, P]
+            infused_patches = ssm_out_query.permute(0, 2, 3, 1)
+            
+            # Global representation for ClassificationHead: pool over patches
+            # [B, P, T, D] -> [B, T, D]
+            ssm_cls = ssm_out_query.mean(dim=1) 
         else:
-            cls_tokens = query_cls
+            # Fallback for no-ref case (e.g. action recognition)
+            # Treat each patch as a sequence independently
+            P_feat = query_patch.shape[-1]
+            all_patches = query_patch.transpose(2, 3).reshape(B * P_feat, T, -1)
+            ssm_out_raw = self.temporal_model(all_patches)
+            infused_patches = ssm_out_raw.view(B, P_feat, T, -1).permute(0, 2, 3, 1)
+            ssm_cls = ssm_out_raw.view(B, P_feat, T, -1).mean(dim=1)
             ref_patch = None
         
-        # 2. Temporal modeling (KANGA SSM)
-        # We contextualize the sequence of cls tokens
-        ssm_out = self.temporal_model(cls_tokens)
-        
-        if ref_frame is not None and ref_mask is not None:
-            # Discard the memory sequence element for task decoding
-            ssm_out = ssm_out[:, 1:, :]
-        
         # 3. Heads
-        # Classification uses the temporal context
-        logits_clf = self.clf_head(ssm_out)
-        
-        # Object Detection and Segmentation use the patch tokens infused with temporal context
-        B, T, D, P = query_patch.shape
-        ssm_context = ssm_out.unsqueeze(-1) # [B, T, D, 1]
-        infused_patches = query_patch + ssm_context
-        
+        logits_clf = self.clf_head(ssm_cls)
         pred_boxes, pred_box_logits = self.detection_head(infused_patches)
         logits_seg = self.seg_decoder(infused_patches)
         
@@ -222,6 +250,7 @@ class VideoMambaSystem(L.LightningModule):
             The computed loss for the step.
         """
         loss = 0.0
+        label_smoothing = 0.1 if prefix == "train" else 0.0
 
         # ── Multi-object VOS (YouTube-VOS / MOSE) ────────────────────────
         if self._is_vos_batch(batch):
@@ -233,7 +262,12 @@ class VideoMambaSystem(L.LightningModule):
             logits_clf, pred_boxes, pred_box_logits, logits_seg = self(query_images, ref_frame=ref_img, ref_mask=ref_mask)
             
             BT, C, H, W = logits_seg.shape[0] * logits_seg.shape[1], logits_seg.shape[2], logits_seg.shape[3], logits_seg.shape[4]
-            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), query_masks.view(BT, H, W), ignore_index=255)
+            loss_seg = F.cross_entropy(
+                logits_seg.view(BT, C, H, W), 
+                query_masks.view(BT, H, W), 
+                ignore_index=255,
+                label_smoothing=label_smoothing
+            )
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg)
             
@@ -255,7 +289,7 @@ class VideoMambaSystem(L.LightningModule):
         # 1. Classification Loss (HMDB51 style)
         if len(batch) >= 2 and batch[1].dim() == 1:
             labels = batch[1]
-            loss_clf = F.cross_entropy(logits_clf, labels)
+            loss_clf = F.cross_entropy(logits_clf, labels, label_smoothing=label_smoothing)
             loss += loss_clf
             self.log(f"{prefix}_loss_clf", loss_clf)
             
@@ -271,7 +305,7 @@ class VideoMambaSystem(L.LightningModule):
             # logits_seg: [B, T, num_classes, H, W]
             # Flatten to [BT, C, H, W] and [BT, H, W] for CrossEntropy
             BT, C, H, W = logits_seg.shape[0] * logits_seg.shape[1], logits_seg.shape[2], logits_seg.shape[3], logits_seg.shape[4]
-            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), masks.view(BT, H, W))
+            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), masks.view(BT, H, W), label_smoothing=label_smoothing)
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg)
             
@@ -285,7 +319,8 @@ class VideoMambaSystem(L.LightningModule):
             loss_box = F.l1_loss(pred_boxes, boxes_gt)
             loss_box_cls = F.cross_entropy(
                 pred_box_logits.view(-1, self.hparams.num_clf_classes),
-                box_labels_gt.view(-1).long()
+                box_labels_gt.view(-1).long(),
+                label_smoothing=label_smoothing
             )
             loss_detection = loss_box + loss_box_cls
             loss += loss_detection
@@ -347,5 +382,9 @@ class VideoMambaSystem(L.LightningModule):
         self.vos_val_metric.reset()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.hparams.learning_rate,
+            weight_decay=1e-2
+        )
         return optimizer

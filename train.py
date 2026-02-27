@@ -1,3 +1,4 @@
+import comet_ml  # Must be imported before lightning/torch
 import os
 import lightning as L
 import hydra
@@ -11,6 +12,8 @@ def main(cfg: DictConfig):
     
     # Initialize logger
     logger = hydra.utils.instantiate(cfg.logger) if "logger" in cfg else None
+    if logger and hasattr(logger, "experiment"):
+        print(f"Comet Logger initialized. Experiment: {logger.experiment.url}")
     
     # Initialize trainer
     trainer: L.Trainer = hydra.utils.instantiate(

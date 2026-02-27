@@ -16,8 +16,10 @@ class SegmentationDecoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(dim_in, 256, kernel_size=2, stride=2),
             nn.ReLU(),
+            nn.Dropout2d(0.1),
             nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
             nn.ReLU(),
+            nn.Dropout2d(0.1),
             nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
             nn.ReLU(),
             nn.ConvTranspose2d(64, num_classes, kernel_size=2, stride=2)
@@ -33,7 +35,7 @@ class SegmentationDecoder(nn.Module):
         h = w = int(P ** 0.5)
         
         # [B*T, D, h, w]
-        x = patch_tokens.view(B * T, D, h, w)
+        x = patch_tokens.reshape(B * T, D, h, w)
         
         # [B*T, num_classes, H', W']
         logits = self.decoder(x)
@@ -44,4 +46,4 @@ class SegmentationDecoder(nn.Module):
                                                mode='bilinear', align_corners=False)
             
         _, C, H, W = logits.shape
-        return logits.view(B, T, C, H, W)
+        return logits.reshape(B, T, C, H, W)

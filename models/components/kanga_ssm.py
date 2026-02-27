@@ -9,7 +9,7 @@ class KangaSSM(nn.Module):
     Temporal State Space Model based on the KANGA IntricateKANSSMCore.
     Uses FastKAN for modulating B and C matrices to integrate spatial-temporal dynamics.
     """
-    def __init__(self, d_model: int = 768, d_state: int = 16, expand: int = 2):
+    def __init__(self, d_model: int = 768, d_state: int = 16, expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         
@@ -25,6 +25,7 @@ class KangaSSM(nn.Module):
         )
         
         self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
         
         # Projection mixing layer standard in Mamba block architectures (out_proj)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -44,7 +45,7 @@ class KangaSSM(nn.Module):
         
         # Sequence processing via Intricate Modulated SSM
         x = self.core(x, delta) 
-        
+        x = self.dropout(x)
         x = self.out_proj(x)
         
         return x + residual
