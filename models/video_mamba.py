@@ -47,15 +47,23 @@ class VideoMambaSystem(L.LightningModule):
         learning_rate: float = 1e-4,
         vos_loss_beta: float = 0.5,
         use_ref_context: bool = True,
+        identity_mode: str = "add", # "add", "concat", "modulate"
+        online_context: bool = False,
+        consistency_weight: float = 0.0,
+        ssm_d_state: int = 16,
+        ssm_layers: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters()
 
+        # Adjusted dimension for identity injection
+        self.dim_infused = dim_in * 2 if identity_mode == "concat" else dim_in
+        
         self.feature_extractor = DinoV3Wrapper(freeze=True)
-        self.temporal_model = KangaSSM(d_model=dim_in)
-        self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
-        self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
-        self.seg_decoder = SegmentationDecoder(dim_in=dim_in, num_classes=num_seg_classes, target_size=target_size)
+        self.temporal_model = KangaSSM(d_model=self.dim_infused, d_state=ssm_d_state, num_layers=ssm_layers)
+        self.clf_head = ClassificationHead(dim_in=self.dim_infused, num_classes=num_clf_classes)
+        self.detection_head = DetectionHead(dim_in=self.dim_infused, num_classes=num_clf_classes, num_boxes=num_boxes)
+        self.seg_decoder = SegmentationDecoder(dim_in=self.dim_infused, num_classes=num_seg_classes, target_size=target_size)
 
         # Object Memory: one embedding per segmentation channel (bg + objects)
         self.mask_embedding = nn.Embedding(num_seg_classes, dim_in)
@@ -144,24 +152,40 @@ class VideoMambaSystem(L.LightningModule):
             ref_patch_p = ref_patch.transpose(2, 3) # [B, 1, P, D]
             
             # Infuse patch tokens
-            ref_patch_infused = ref_patch_p + ref_mask_patch_emb.unsqueeze(1) # [B, 1, P, D]
+            if self.hparams.identity_mode == "concat":
+                # [B, 1, P, D] concat [B, 1, P, D] -> [B, 1, P, 2D]
+                ref_patch_infused = torch.cat([ref_patch_p, ref_mask_patch_emb.unsqueeze(1)], dim=-1)
+            elif self.hparams.identity_mode == "modulate":
+                # Gated modulation (multiplication)
+                ref_patch_infused = ref_patch_p * torch.sigmoid(ref_mask_patch_emb.unsqueeze(1))
+            else:
+                # Default: Add
+                ref_patch_infused = ref_patch_p + ref_mask_patch_emb.unsqueeze(1) # [B, 1, P, D]
             
             # --- PATCH-SEQUENCE SSM ---
             # Instead of flattening patches into one sequence, treat each (x,y) location as a sequence
             # Query patches: [B, T, D, P] -> [B, T, P, D]
             query_patch_p = query_patch.transpose(2, 3) 
             
-            # Full sequence per patch: [RefPatch, Q1Patch, Q2Patch, ..., QTPatch]
-            all_patches = torch.cat([ref_patch_infused, query_patch_p], dim=1) # [B, T+1, P, D]
+            # Match dimensions for identity_mode == "concat"
+            if self.hparams.identity_mode == "concat":
+                # Pad query patches with zeros: [B, T, P, D] -> [B, T, P, 2D]
+                null_identity = torch.zeros_like(query_patch_p)
+                query_patch_infused = torch.cat([query_patch_p, null_identity], dim=-1)
+            else:
+                query_patch_infused = query_patch_p
             
-            # Group by patch location: [B, P, T+1, D] -> [B*P, T+1, D]
-            all_patches = all_patches.permute(0, 2, 1, 3).reshape(B * P_feat, T + 1, D_feat)
+            # Full sequence per patch: [RefPatch, Q1Patch, Q2Patch, ..., QTPatch]
+            all_patches = torch.cat([ref_patch_infused, query_patch_infused], dim=1) # [B, T+1, P, DimInfused]
+            
+            # Group by patch location: [B, P, T+1, DimInfused] -> [B*P, T+1, DimInfused]
+            all_patches = all_patches.permute(0, 2, 1, 3).reshape(B * P_feat, T + 1, self.dim_infused)
             
             # Temporal modeling
             ssm_out_raw = self.temporal_model(all_patches) # [B*P, T+1, D]
             
             # Reshape back and extract query part: [B, P, T+1, D]
-            ssm_out_full = ssm_out_raw.reshape(B, P_feat, T + 1, D_feat)
+            ssm_out_full = ssm_out_raw.reshape(B, P_feat, T + 1, self.dim_infused)
             ssm_out_query = ssm_out_full[:, :, 1:, :] # [B, P, T, D]
             
             # Final infused patches for decoder: [B, T, D, P]
@@ -184,6 +208,10 @@ class VideoMambaSystem(L.LightningModule):
         logits_clf = self.clf_head(ssm_cls)
         pred_boxes, pred_box_logits = self.detection_head(infused_patches)
         logits_seg = self.seg_decoder(infused_patches)
+        
+        # 4. Optional: Online Context Feedback (Internal Logic)
+        # In a real recurrent setting, we would feed back logits_seg[t-1] to x[t]
+        # Here we just return everything for the trainer to handle consistency.
         
         return logits_clf, pred_boxes, pred_box_logits, logits_seg
 
@@ -270,6 +298,14 @@ class VideoMambaSystem(L.LightningModule):
             )
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg)
+            
+            # 2. Temporal Consistency Loss (Tactic E)
+            if self.hparams.consistency_weight > 0 and query_images.shape[1] > 1:
+                # Encourage subsequent frames to have similar predictions
+                probs = torch.softmax(logits_seg, dim=2)
+                loss_cons = F.mse_loss(probs[:, 1:], probs[:, :-1])
+                loss += self.hparams.consistency_weight * loss_cons
+                self.log(f"{prefix}_loss_consistency", loss_cons)
             
             if prefix in ["val", "test"]:
                 preds = torch.argmax(logits_seg, dim=2) # [B, T, H, W]
