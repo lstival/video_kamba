@@ -53,8 +53,19 @@ def main(cfg: DictConfig):
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            # batch: ref_img, ref_mask, query_images, query_masks
-            ref_img, ref_mask, query_images, query_masks = [b.to(model.device) for b in batch]
+            # batch unpacking for MultiObjectVOSDataset (metas as list of dicts)
+            if len(batch) == 6:
+                ref_img, ref_mask, query_images, query_masks, _, metas = batch
+            else:
+                # Fallback for old/other datasets
+                ref_img, ref_mask, query_images, query_masks = batch
+                metas = None
+            
+            # Move tensors to device
+            ref_img = ref_img.to(model.device)
+            ref_mask = ref_mask.to(model.device)
+            query_images = query_images.to(model.device)
+            query_masks = query_masks.to(model.device)
             
             # Forward pass
             _, _, _, logits_seg = model(query_images, ref_frame=ref_img, ref_mask=ref_mask)
@@ -62,10 +73,12 @@ def main(cfg: DictConfig):
             
             # Update metrics per sample in batch
             for b in range(preds.shape[0]):
-                # Identify sequence name if available (from dataset clips)
-                # Note: DAVIS dataset clips contain 'seq' info.
-                clip_info = dm.test_dataset.clips[batch_idx * cfg.datamodule.batch_size + b]
-                seq_name = clip_info['seq']
+                # Identify sequence name
+                if metas is not None:
+                    seq_name = metas[b]['video_id']
+                else:
+                    clip_info = dm.test_dataset.clips[batch_idx * cfg.datamodule.batch_size + b]
+                    seq_name = clip_info['seq']
                 
                 # Compute J&F for this specific sample
                 num_objects = int(query_masks[b].max().item())

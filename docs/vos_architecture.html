@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>VOS Architecture Diagram</title>
+</head>
+<body style="background: white">
+  <div class="mermaid" style="font-size: 24px">
+    graph TD
+        Q_Frames["Query Frames<br/>[B, T, C, H, W]"] --> Dino["DinoV3Wrapper (DINOv2)"]
+        R_Frame["ref_frame"] --> Dino
+        Dino -->|"Layer 11 (Deepest)"| Q_Patch["Query Patches<br/>[B, T, P, D]"]
+        Dino -->|"Layer 11"| R_Patch["Ref Patches<br/>[B, 1, P, D]"]
+        Dino -->|"Layers 3, 6, 9"| Skip["High-Res Skips"]
+        R_Mask["ref_mask"] --> Emb["Mask Embedding"]
+        Emb -->|"[B, P, D]"| Infuse1["Identity Infusion<br/>(Add/Concat/Modulate)"]
+        R_Patch --> Infuse1
+        Infuse1 --> SeqState["Sequence State<br/>(Current Sequence)"]
+        subgraph RecursiveLoop ["Recursive Memory Loop (Over T steps)"]
+            Q_Patch_t["Query Patch (t)"]
+            Prev_Mask["Previous Mask Emb (t-1)"]
+            Q_Patch_t --> Infuse2["Identity Infusion"]
+            Prev_Mask --> Infuse2
+            Infuse2 --> SeqState
+            SeqState --> SSM["KangaSSM (MambaKAN)<br/>Temporal Modulated State Space"]
+            SSM -->|"Latest Features"| Decoder["SegmentationDecoder"]
+            Skip -->|"Layers 3, 6, 9"| Decoder
+            Decoder --> Logits["Mask Logits (t)"]
+            Logits -->|"argmax & Embed"| Prev_Mask
+        end
+        Q_Patch -->|"Time step t"| Q_Patch_t
+        Logits --> Pred_Masks["Predicted Masks<br/>[B, T, num_classes, H, W]"]
+        Pred_Masks --> VOS_Loss["HybridVOSLoss<br/>(BCE + SoftDice)"]
+        GT_Masks["Ground Truth Masks"] --> VOS_Loss
+        Obj_Present["obj_present Mask"] --> VOS_Loss
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true });
+  </script>
+</body>
+</html>

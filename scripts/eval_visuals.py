@@ -32,8 +32,19 @@ def export_mask(mask, save_path):
 def visualize_sequence(model, dataset, clip_idx, save_dir):
     """Generate visuals (masks, GIFs) for a specific sequence/clip."""
     batch = dataset[clip_idx]
-    # batch: ref_img, ref_mask, query_images, query_masks
-    ref_img, ref_mask, query_images, query_masks = [b.unsqueeze(0).to(model.device) for b in batch]
+    # Handle MultiObjectVOSDataset (6 elements) vs old format (4 elements)
+    if len(batch) == 6:
+        ref_img, ref_mask, query_images, query_masks, _, meta = batch
+        seq_name = meta['video_id']
+    else:
+        ref_img, ref_mask, query_images, query_masks = batch
+        seq_name = dataset.clips[clip_idx]['seq']
+    
+    # Move and unsqueeze for batch dimension
+    ref_img = ref_img.unsqueeze(0).to(model.device)
+    ref_mask = ref_mask.unsqueeze(0).to(model.device)
+    query_images = query_images.unsqueeze(0).to(model.device)
+    query_masks = query_masks.unsqueeze(0).to(model.device)
     
     with torch.no_grad():
         _, _, _, logits_seg = model(query_images, ref_frame=ref_img, ref_mask=ref_mask)
@@ -41,8 +52,6 @@ def visualize_sequence(model, dataset, clip_idx, save_dir):
     preds = torch.argmax(logits_seg, dim=2).squeeze(0).cpu().numpy() # [T, H, W]
     gt_masks = query_masks.squeeze(0).cpu().numpy() # [T, H, W]
     query_imgs = query_images.squeeze(0).cpu() # [T, C, H, W]
-    
-    seq_name = dataset.clips[clip_idx]['seq']
     seq_dir = os.path.join(save_dir, seq_name)
     os.makedirs(seq_dir, exist_ok=True)
     os.makedirs(os.path.join(seq_dir, "masks"), exist_ok=True)

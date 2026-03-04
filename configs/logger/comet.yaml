@@ -2,7 +2,7 @@
 _target_: lightning.pytorch.loggers.CometLogger
 
 api_key: SNv4ks5JjUxZ1X0FhARDGt4SY # To be set via environment variable COMET_API_KEY
-project_name: "video_mamba"
+project: "video_mamba"
 workspace: null # Set your workspace here
-experiment_name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
-save_dir: ${work_dir}/logs/
+name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+offline_directory: ${work_dir}/logs/

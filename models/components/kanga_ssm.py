@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as cp
 from jaxtyping import Float
 
 from .kan_ssm_core import IntricateKANSSMCore
@@ -9,10 +10,11 @@ class KangaSSM(nn.Module):
     Temporal State Space Model based on the KANGA IntricateKANSSMCore.
     Uses FastKAN for modulating B and C matrices to integrate spatial-temporal dynamics.
     """
-    def __init__(self, d_model: int = 768, d_state: int = 16, expand: int = 2, num_layers: int = 1, dropout: float = 0.1):
+    def __init__(self, d_model: int = 768, d_state: int = 16, expand: int = 2, num_layers: int = 1, dropout: float = 0.1, use_checkpointing: bool = False):
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
+        self.use_checkpointing = use_checkpointing
         
         # We enforce modulating B and C matrices through FastKAN per the icip_experiment_sota design
         self.layers = nn.ModuleList([
@@ -48,7 +50,10 @@ class KangaSSM(nn.Module):
         
         # Sequence processing via Intricate Modulated SSM
         for layer in self.layers:
-            x = layer(x, delta) 
+            if self.use_checkpointing and x.requires_grad:
+                x = cp.checkpoint(layer, x, delta, use_reentrant=False)
+            else:
+                x = layer(x, delta) 
         x = self.dropout(x)
         x = self.out_proj(x)
         

@@ -28,14 +28,20 @@ def main(cfg: DictConfig):
     # Initialize model (Placeholder for now)
     model: L.LightningModule = hydra.utils.instantiate(cfg.model)
     
-    # Optional: Automatically find maximum batch size
-    if cfg.get("auto_batch_size", False):
-        from lightning.pytorch.tuner import Tuner
-        tuner = Tuner(trainer)
-        # This automatically modifies model.hparams.batch_size or datamodule.batch_size
-        tuner.scale_batch_size(model, datamodule=datamodule, mode="binsearch")
-        print(f"Auto batch size found. Starting training...")
+    # Load weights from checkpoint if provided (for fine-tuning)
+    ckpt_path = cfg.get("checkpoint")
+    if ckpt_path and os.path.exists(ckpt_path):
+        print(f"Loading pre-trained weights from: {ckpt_path}")
+        import torch
+        # Load the state_dict directly to allow fine-tuning on different datasets/configs
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint["state_dict"]
         
+        # Filter out keys if needed (e.g. classifier heads if classes change, 
+        # but for VOS num_seg_classes should match)
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(f"Weights loaded with results: {msg}")
+    
     # Train the model
     trainer.fit(model=model, datamodule=datamodule)
     

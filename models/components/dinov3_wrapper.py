@@ -24,32 +24,41 @@ class DinoV3Wrapper(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def forward(self, x: Float[torch.Tensor, "B T C H W"]) -> Tuple[Float[torch.Tensor, "B T D"], Float[torch.Tensor, "B T D P"]]:
+    def forward(self, x: Float[torch.Tensor, "B T C H W"]) -> Tuple[torch.Tensor, dict]:
         """
-        Process sequences of frames.
-        Returns:
+        Process sequences of frames and return multi-scale features.
         
-            cls_tokens: shape [B, T, D]
-            patch_tokens: shape [B, T, D, P]
+        Returns:
+            cls_token: shape [B, T, D] (from last layer)
+            features: dictionary of {scale: tensor} where tensor is [B, T, D, P]
+                      Scales typically include layers 3, 6, 9, 11 for hierarchical fusion.
         """
+        import torch.nn.functional as F
         B, T, C, H, W = x.shape
         x_flat = x.view(B * T, C, H, W)
-        
-        # Get features from DINOv2
-        # get_intermediate_layers returns patch tokens (and optionally cls token)
-        # For simplicity, we can use the forward pass to get cls token and then extract patches
-        
-        # Get intermediate layers for patch tokens
-        layers = self.backbone.get_intermediate_layers(x_flat, n=1, return_class_token=True)
-        # layers[0] is (patch_tokens, cls_token)
-        patches_flat, cls_flat = layers[0]
-        
-        # cls_flat: [BT, D]
-        # patches_flat: [BT, P, D] -> [BT, D, P]
         D = self.feature_dim
-        P = patches_flat.shape[1]
         
-        cls_tokens = cls_flat.view(B, T, D)
-        patch_tokens = patches_flat.transpose(1, 2).view(B, T, D, P)
+        # Ensure image dimensions are multiples of 14 for DINOv2 patch size
+        patch_size = 14
+        if H % patch_size != 0 or W % patch_size != 0:
+            new_H = (H // patch_size) * patch_size
+            new_W = (W // patch_size) * patch_size
+            x_flat = F.interpolate(x_flat, size=(new_H, new_W), mode='bilinear', align_corners=False)
+            
+        # Extract features from multiple intermediate layers (3, 6, 9, 11)
+        # This allows the decoder to have high-res spatial details (early layers) 
+        # and deep semantic context (later layers).
+        layers_idxs = [3, 6, 9, 11]
+        multi_scale_out = self.backbone.get_intermediate_layers(x_flat, n=layers_idxs, return_class_token=True)
         
-        return cls_tokens, patch_tokens
+        # multi_scale_out is a list of (patch_tokens, cls_token) for each layer requested
+        features = {}
+        for idx, (patches_flat, cls_flat) in zip(layers_idxs, multi_scale_out):
+            # patches_flat: [BT, P, D] -> [B, T, D, P]
+            P = patches_flat.shape[1]
+            features[f"layer_{idx}"] = patches_flat.transpose(1, 2).view(B, T, D, P)
+        
+        # Use the CLS token from the last layer (idx 11) for global features
+        last_cls = multi_scale_out[-1][1].view(B, T, D)
+        
+        return last_cls, features
