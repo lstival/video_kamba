@@ -1,0 +1,19 @@
+# MLP Baseline model — ablation counterpart to the KAN model.
+# Overrides fusion_mode and modulator_type to remove all KAN components.
+# Everything else (dim_in, ssm_d_state, etc.) is inherited from default.yaml.
+_target_: models.video_mamba.VideoMambaSystem
+
+dim_in: 768
+dim_out: 256
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+target_size: 224
+learning_rate: 1e-4
+vos_loss_beta: 0.5
+# --- Ablation overrides ---
+fusion_mode: 'concat'        # ConcatUpBlock (Conv + BN + ReLU) instead of KANSpatialGatingUpBlock
+modulator_type: 'mlp'        # MLPModulator instead of FastKANModulator in IntricateKANSSMCore
+# -------------------------
+propagation_mode: 'soft_mask'
+scheduled_sampling_rate: 0.0

@@ -6,16 +6,38 @@ from jaxtyping import Float
 from .kan_ssm_core import IntricateKANSSMCore
 
 class KangaSSM(nn.Module):
+    """Temporal State Space Model based on the KANGA IntricateKANSSMCore.
+
+    Uses FastKAN for modulating B and C matrices to integrate
+    spatial-temporal dynamics.
+
+    Args:
+        d_model: Feature dimension.
+        d_state: SSM hidden-state dimension.
+        expand: Unused expansion factor (reserved for future use).
+        num_layers: Number of stacked :class:`IntricateKANSSMCore` layers.
+        dropout: Dropout rate applied after scanning.
+        use_checkpointing: Enables gradient checkpointing per layer.
+        modulator_type: ``'kan'`` (default, FastKAN RBF) or ``'mlp'``
+            (dense two-layer MLP baseline for ablation experiments).
     """
-    Temporal State Space Model based on the KANGA IntricateKANSSMCore.
-    Uses FastKAN for modulating B and C matrices to integrate spatial-temporal dynamics.
-    """
-    def __init__(self, d_model: int = 768, d_state: int = 16, expand: int = 2, num_layers: int = 1, dropout: float = 0.1, use_checkpointing: bool = False):
+
+    def __init__(
+        self,
+        d_model: int = 768,
+        d_state: int = 16,
+        expand: int = 2,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        use_checkpointing: bool = False,
+        modulator_type: str = "kan",
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
         self.use_checkpointing = use_checkpointing
-        
+        self.modulator_type = modulator_type
+
         # We enforce modulating B and C matrices through FastKAN per the icip_experiment_sota design
         self.layers = nn.ModuleList([
             IntricateKANSSMCore(
@@ -23,9 +45,10 @@ class KangaSSM(nn.Module):
                 state_dim=d_state,
                 modulate_B=True,
                 modulate_C=True,
-                modulation_mode="factor", 
+                modulation_mode="factor",
                 use_fast_kan=True,
-                use_mamba_kernels=True  # Will silently fallback to naive loop if mamba_ssm not installed
+                modulator_type=modulator_type,
+                use_mamba_kernels=True,  # silently falls back to Python loop if mamba_ssm absent
             ) for _ in range(num_layers)
         ])
         

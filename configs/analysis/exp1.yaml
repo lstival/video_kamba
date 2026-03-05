@@ -1,0 +1,29 @@
+# Experiment 1 — Activation Entropy (Disentanglement Proof)
+# Compares Shannon entropy of temporal gate B_mod between KAN and MLP models.
+
+# Paths to trained checkpoints  (override via CLI: kan_ckpt=path/to/best.ckpt)
+kan_ckpt: ???
+mlp_ckpt: ???
+
+# DAVIS data root — must contain ImageSets/, JPEGImages/, Annotations/
+data_dir: data/DAVIS/DAVIS
+
+# Directory where outputs (CSV, PDF, summary TXT) are written
+output_dir: results/exp1
+
+# Maximum number of validation batches to process (set to -1 for full val set)
+max_batches: 50
+
+# Dataloader settings
+batch_size: 1
+num_workers: 4
+img_size: 224
+seq_len: 8
+
+# Reproducibility
+seed: 42
+
+# Name of the B_modulator submodule inside KangaSSM layers.
+# Override if architecture changes.
+# Path format: temporal_model.layers.<idx>.B_modulator
+b_mod_layer_idx: 0   # which KangaSSM layer to hook (0-indexed)

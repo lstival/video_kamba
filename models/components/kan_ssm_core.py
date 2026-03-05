@@ -297,6 +297,100 @@ class FastKANModulator(nn.Module):
         return self.kan.regularization_loss()
 
 
+class MLPModulator(nn.Module):
+    """Two-layer MLP modulator — drop-in baseline for FastKANModulator.
+
+    Used in ablation experiments to provide a dense, entangled gating
+    vector as a contrast to the sparse KAN modulation.
+
+    The hidden dimension ``input_dim`` gives the same width as the input,
+    ensuring a fair comparison without inflating the parameter count.
+
+    Args:
+        input_dim: Dimension of the input features.
+        output_dim: Dimension of the modulation output.
+        grid_size: Accepted for API parity with FastKANModulator; not used.
+        activation: Activation to ensure positive modulation
+            (``'softplus'``, ``'sigmoid'``, or ``'exp'``).
+
+    Shape:
+        - Input:  ``[B, input_dim]``
+        - Output: ``[B, output_dim]``
+
+    Example::
+
+        >>> mod = MLPModulator(768, 768)
+        >>> out = mod(torch.randn(4, 768))
+        >>> out.shape
+        torch.Size([4, 768])
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        grid_size: int = 8,          # noqa: ARG002  — API parity only
+        activation: Literal["softplus", "sigmoid", "exp"] = "softplus",
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}")
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
+
+        hidden_dim = input_dim  # symmetric 2-layer MLP
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.activation_type = activation
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialise output linear so activation(0) ≈ 1.0 at start of training."""
+        # Last linear in self.net is index 3
+        nn.init.zeros_(self.net[3].weight)
+        if self.activation_type == "softplus":
+            # softplus(x) + 0.1 = 1.0  =>  x ≈ 0.378
+            nn.init.constant_(self.net[3].bias, 0.38)
+        else:
+            nn.init.zeros_(self.net[3].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute dense modulation factors.
+
+        Args:
+            x: Input tensor ``[B, input_dim]``.
+
+        Returns:
+            Modulation factors ``[B, output_dim]``, positive-valued.
+        """
+        out = self.net(x)
+        if self.activation_type == "softplus":
+            return F.softplus(out) + 0.1
+        elif self.activation_type == "sigmoid":
+            return torch.sigmoid(out) + 0.5
+        elif self.activation_type == "exp":
+            return torch.exp(out.clamp(-5, 5))
+        return out
+
+    def regularization_loss(self) -> torch.Tensor:
+        """L1 regularisation on weight matrices."""
+        return sum(p.abs().mean() for p in self.parameters() if p.ndim >= 2)
+
+    def extra_repr(self) -> str:
+        hidden = self.net[1].out_features
+        return (
+            f"input_dim={self.net[1].in_features}, "
+            f"hidden_dim={hidden}, "
+            f"output_dim={self.net[3].out_features}, "
+            f"activation={self.activation_type}"
+        )
+
+
 class IntricateKANSSMCore(nn.Module):
     """Intricate KAN-SSM Core with learned B and C modulation.
     
@@ -332,6 +426,7 @@ class IntricateKANSSMCore(nn.Module):
         modulation_mode: Literal["element", "factor", "mixture"] = "factor",
         n_mixtures: int = 4,  # Only used if modulation_mode == "mixture"
         use_fast_kan: bool = False,
+        modulator_type: str = "kan",
         use_mamba_kernels: bool = True,
         learnable_A: bool = False,  # Default to False for stability
     ) -> None:
@@ -344,6 +439,7 @@ class IntricateKANSSMCore(nn.Module):
         self.modulation_mode = modulation_mode
         self.n_mixtures = n_mixtures
         self.use_fast_kan = use_fast_kan
+        self.modulator_type = modulator_type
         self.use_mamba_kernels = use_mamba_kernels and HAS_MAMBA_KERNELS
         
         # Initialize HiPPO-LegS matrices for long-range dependencies
@@ -376,8 +472,13 @@ class IntricateKANSSMCore(nn.Module):
             self.C = nn.Parameter(C_init.unsqueeze(0).repeat(inner_dim, 1) * scale)
         
         # KAN Modulators for B matrix (input-to-state)
-        # Select modulator class based on flag
-        ModulatorClass = FastKANModulator if use_fast_kan else KANModulator
+        # Select modulator class based on modulator_type flag.
+        # 'mlp'  → dense two-layer MLP (ablation baseline)
+        # 'kan'  → FastKAN (RBF) or B-spline KAN depending on use_fast_kan
+        if modulator_type == "mlp":
+            ModulatorClass = MLPModulator
+        else:
+            ModulatorClass = FastKANModulator if use_fast_kan else KANModulator
         
         if modulate_B:
             if modulation_mode == "element":
@@ -769,6 +870,7 @@ class IntricateKANSSMCore(nn.Module):
             f"modulate_B={self.modulate_B}, "
             f"modulate_C={self.modulate_C}, "
             f"modulation_mode={self.modulation_mode}, "
+            f"modulator_type={self.modulator_type}, "
             f"use_fast_kan={self.use_fast_kan}, "
             f"mamba_kernels={self.use_mamba_kernels}"
         )

@@ -1,0 +1,30 @@
+# Experiment 3 — 1D RBF Activation Profile  (Qualitative Interpretability Proof)
+# Visualises the learned univariate basis functions of FastKANLayer inside
+# the temporal gate modulator.
+
+# Path to trained KAN checkpoint
+kan_ckpt: ???
+
+# Output directory
+output_dir: results/exp3
+
+# Number of top-K channels (ranked by mean |activation|) to profile
+n_top_channels: 5
+
+# x-axis range for the 1D function plot (normalised DINOv2 feature units)
+x_range: [-3.0, 3.0]
+x_points: 500   # grid resolution for the reconstructed curve
+
+# Which SSM layer to inspect (0-indexed; maps to temporal_model.layers.<idx>)
+ssm_layer_idx: 0
+
+# Dataloader settings (only needed for channel auto-discovery)
+data_dir: data/DAVIS/DAVIS
+batch_size: 1
+num_workers: 4
+img_size: 224
+seq_len: 8
+max_batches: 30   # batches used to rank channels by activation magnitude
+
+# Reproducibility
+seed: 42

@@ -55,6 +55,7 @@ class VideoMambaSystem(L.LightningModule):
         compress_skip: bool = False,
         use_checkpointing: bool = False,
         fusion_mode: str = "concat",
+        modulator_type: str = "kan",
         propagation_mode: str = "soft_mask", # "soft_mask", "direct_feature", "teacher_forcing"
         scheduled_sampling_rate: float = 0.0, # 0.0 = always use GT (teacher forcing), 1.0 = always use prediction
     ):
@@ -65,7 +66,13 @@ class VideoMambaSystem(L.LightningModule):
         self.dim_infused = dim_in * 2 if identity_mode == "concat" else dim_in
         
         self.feature_extractor = DinoV3Wrapper(freeze=True)
-        self.temporal_model = KangaSSM(d_model=self.dim_infused, d_state=ssm_d_state, num_layers=ssm_layers, use_checkpointing=use_checkpointing)
+        self.temporal_model = KangaSSM(
+            d_model=self.dim_infused,
+            d_state=ssm_d_state,
+            num_layers=ssm_layers,
+            use_checkpointing=use_checkpointing,
+            modulator_type=modulator_type,
+        )
         self.clf_head = ClassificationHead(dim_in=self.dim_infused, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=self.dim_infused, num_classes=num_clf_classes, num_boxes=num_boxes)
         self.seg_decoder = SegmentationDecoder(

@@ -13,6 +13,10 @@ learning_rate: 1e-4
 # Weight for BCE in hybrid VOS loss (1 - vos_loss_beta = SoftDice weight)
 vos_loss_beta: 0.5
 fusion_mode: 'kan_spatial'
+# Modulator type for IntricateKANSSMCore B/C matrices:
+# 'kan'  → FastKAN Gaussian RBF (production default)
+# 'mlp'  → two-layer MLP (ablation baseline)
+modulator_type: 'kan'
 # Propagation mode for recurrent mask feedback
 # Options: 'soft_mask', 'direct_feature', 'teacher_forcing'
 propagation_mode: 'soft_mask'

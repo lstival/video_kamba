@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from jaxtyping import Float
@@ -49,8 +51,19 @@ class FPNUpBlock(nn.Module):
 
 class CrossAttentionUpBlock(nn.Module):
     """Cross-attention: Semantic features (Query) attend to Spatial Features (Key/Value)."""
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, num_heads: int = 4):
+
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        num_heads: int = 4,
+        return_gate: bool = False,
+    ):
         super().__init__()
+        self.return_gate = return_gate
+        # Stores averaged attention weights [B, H*W, H*W] when return_gate=True.
+        self._last_attn: Optional[torch.Tensor] = None
         self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
         self.skip_proj = nn.Conv2d(skip_channels, out_channels, kernel_size=1)
         
@@ -81,7 +94,10 @@ class CrossAttentionUpBlock(nn.Module):
         q = x.view(B, C, -1).permute(0, 2, 1)
         kv = skip.view(B, C, -1).permute(0, 2, 1)
         
-        attn_out, _ = self.attn(query=q, key=kv, value=kv)
+        attn_out, attn_weights = self.attn(query=q, key=kv, value=kv)
+        if self.return_gate:
+            # attn_weights: [B, tgt_len, src_len] (averaged over heads by default)
+            self._last_attn = attn_weights.detach() if attn_weights is not None else None
         x_att = self.norm1(q + attn_out)
         
         ffn_out = self.ffn(x_att)
@@ -174,25 +190,45 @@ class CombinedUpBlock(nn.Module):
 
 
 class KANSpatialGatingUpBlock(nn.Module):
-    """KAN-Modulated Spatial Alignment decoder block.
+    """KAN-Modulated Spatial Alignment decoder block (G_k).
 
     Fuses temporal (SSM) context with high-resolution DINOv2 skip features at
     strictly O(N·D) cost — no N×N pixel-to-pixel similarity matrix is computed.
 
     Three operations per pyramid level
     -----------------------------------
-    1. Contextual Projection  (1×1 conv):
+    1. Contextual Projection  (1×1 conv)::
+
        x̃ = Conv_1x1(upsample(x))          [BT, skip_ch, H, W]
 
-    2. KAN Spatial Gating (FastKANLayer applied pixel-wise):
-       G = σ(FastKAN(x̃))                  [BT, skip_ch, H, W]   ∈ [0,1]
+    2. KAN Spatial Gating (FastKANLayer applied pixel-wise)::
 
-    3. Modulated Fusion (Hadamard product + residual):
-       out = out_conv(x̃ + G ⊙ skip)       [BT, out_ch, H, W]
+       G_k = σ(FastKAN(x̃))               [BT, skip_ch, H, W]   ∈ [0,1]
+
+    3. Modulated Fusion (Hadamard product + residual)::
+
+       out = out_conv(x̃ + G_k ⊙ skip)     [BT, out_ch, H, W]
+
+    Args:
+        in_channels: Channels of the upsampled temporal stream.
+        skip_channels: Channels of the DINOv2 skip connection.
+        out_channels: Output channels after refinement conv.
+        return_gate: If ``True``, the raw gate tensor ``G_k`` is cached in
+            :attr:`_last_gate` after every forward pass (detached from the
+            computation graph). Used by ablation analysis scripts.
     """
 
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        return_gate: bool = False,
+    ):
         super().__init__()
+        self.return_gate = return_gate
+        # Caches the spatial gate G_k: [BT, skip_ch, H, W] ∈ [0,1]
+        self._last_gate: Optional[torch.Tensor] = None
         # Step 0 — upsample temporal stream (preserves in_channels so proj can see full dim)
         self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
 
@@ -235,6 +271,10 @@ class KANSpatialGatingUpBlock(nn.Module):
         x_flat = x_tilde.permute(0, 2, 3, 1).reshape(BT * H * W, C)  # [N, C]
         gate_flat = torch.sigmoid(self.gate_kan(x_flat))              # [N, C] ∈ [0,1]
         gate = gate_flat.reshape(BT, H, W, C).permute(0, 3, 1, 2)    # [BT, C, H, W]
+
+        if self.return_gate:
+            # Detach so analysis scripts never accumulate graph memory.
+            self._last_gate = gate.detach()                           # [BT, C, H, W]
 
         # --- Step 3: Modulated Fusion ---
         fused = x_tilde + gate * skip                                 # [BT, skip_ch, H, W]
