@@ -3,6 +3,7 @@ import torch.nn as nn
 from jaxtyping import Float
 import torchvision.ops
 import numpy as np
+from .fast_kan_layer import FastKANLayer
 
 class ConcatUpBlock(nn.Module):
     """Original upsampling block with naive concatenation."""
@@ -171,6 +172,76 @@ class CombinedUpBlock(nn.Module):
         
         return self.conv(x + aligned_skip)
 
+
+class KANSpatialGatingUpBlock(nn.Module):
+    """KAN-Modulated Spatial Alignment decoder block.
+
+    Fuses temporal (SSM) context with high-resolution DINOv2 skip features at
+    strictly O(N·D) cost — no N×N pixel-to-pixel similarity matrix is computed.
+
+    Three operations per pyramid level
+    -----------------------------------
+    1. Contextual Projection  (1×1 conv):
+       x̃ = Conv_1x1(upsample(x))          [BT, skip_ch, H, W]
+
+    2. KAN Spatial Gating (FastKANLayer applied pixel-wise):
+       G = σ(FastKAN(x̃))                  [BT, skip_ch, H, W]   ∈ [0,1]
+
+    3. Modulated Fusion (Hadamard product + residual):
+       out = out_conv(x̃ + G ⊙ skip)       [BT, out_ch, H, W]
+    """
+
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        super().__init__()
+        # Step 0 — upsample temporal stream (preserves in_channels so proj can see full dim)
+        self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
+
+        # Step 1 — lightweight 1×1 contextual projection
+        self.proj = nn.Conv2d(in_channels, skip_channels, kernel_size=1, bias=False)
+        self.proj_bn = nn.BatchNorm2d(skip_channels)
+
+        # Step 2 — FastKAN gate (pixel-wise, O(N·D))
+        # Input/output: [N_pixels, skip_channels] — no spatial pair interactions
+        self.gate_kan = FastKANLayer(skip_channels, skip_channels)
+
+        # Step 3 — lightweight output refinement (single 3×3 conv instead of two)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
+            skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
+        Returns:
+            [BT, out_channels, H, W]
+        """
+        # --- Upsample temporal stream ×2 spatially ---
+        x_up = self.upsample(x)                                      # [BT, in_ch, H, W]
+        if x_up.shape[-2:] != skip.shape[-2:]:
+            x_up = nn.functional.interpolate(
+                x_up, size=skip.shape[-2:], mode='bilinear', align_corners=False
+            )
+
+        # --- Step 1: Contextual Projection ---
+        x_tilde = self.proj_bn(self.proj(x_up))                     # [BT, skip_ch, H, W]
+
+        # --- Step 2: KAN Spatial Gating (pixel-wise, O(N·D)) ---
+        BT, C, H, W = x_tilde.shape
+        # Reshape to [BT*H*W, C] so FastKAN operates per-pixel (no cross-pixel attention)
+        x_flat = x_tilde.permute(0, 2, 3, 1).reshape(BT * H * W, C)  # [N, C]
+        gate_flat = torch.sigmoid(self.gate_kan(x_flat))              # [N, C] ∈ [0,1]
+        gate = gate_flat.reshape(BT, H, W, C).permute(0, 3, 1, 2)    # [BT, C, H, W]
+
+        # --- Step 3: Modulated Fusion ---
+        fused = x_tilde + gate * skip                                 # [BT, skip_ch, H, W]
+
+        return self.out_conv(fused)                                   # [BT, out_ch, H, W]
+
+
 class SegmentationDecoder(nn.Module):
     """
     Hierarchical Feature Fusion Decoder.
@@ -196,7 +267,8 @@ class SegmentationDecoder(nn.Module):
             "fpn": FPNUpBlock,
             "cross_attn": CrossAttentionUpBlock,
             "deformable": DeformableUpBlock,
-            "combined": CombinedUpBlock
+            "combined": CombinedUpBlock,
+            "kan_spatial": KANSpatialGatingUpBlock,
         }.get(self.fusion_mode, ConcatUpBlock)
 
         # Top-down hierarchy: Layer 11 (SSM) -> 9 -> 6 -> 3

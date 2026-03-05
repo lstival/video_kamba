@@ -12,7 +12,7 @@ target_size: 224
 learning_rate: 1e-4
 # Weight for BCE in hybrid VOS loss (1 - vos_loss_beta = SoftDice weight)
 vos_loss_beta: 0.5
-fusion_mode: 'concat'
+fusion_mode: 'kan_spatial'
 # Propagation mode for recurrent mask feedback
 # Options: 'soft_mask', 'direct_feature', 'teacher_forcing'
 propagation_mode: 'soft_mask'
