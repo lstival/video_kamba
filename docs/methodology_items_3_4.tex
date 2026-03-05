@@ -1,0 +1,44 @@
+\section{Methodology: KAN-Modulated State Space Models and Hierarchical Segmentation}
+
+\subsection{Temporal Modeling: KAN-Modulated SSM}
+\label{sec:kan_ssm}
+State Space Models (SSMs), particularly those inspired by the Mamba architecture, rely on continuous-time linear state transitions discretized into recurrence or convolution. Given a continuous-time state $h(t) \in \mathbb{R}^N$ and input $u(t) \in \mathbb{R}^D$, standard SSMs are formulated as:
+\begin{align}
+    \dot{h}(t) &= \mathbf{A}h(t) + \mathbf{B}u(t) \\
+    y(t) &= \mathbf{C}h(t)
+\end{align}
+where $\mathbf{A} \in \mathbb{R}^{N \times N}$, $\mathbf{B} \in \mathbb{R}^{N \times D}$, and $\mathbf{C} \in \mathbb{R}^{D \times N}$. Discretizing these equations with a step size $\Delta$ yields the discrete-time recurrence:
+\begin{equation}
+    h_t = \bar{\mathbf{A}}h_{t-1} + \bar{\mathbf{B}}u_t, \quad y_t = \mathbf{C}h_t
+\end{equation}
+where $\bar{\mathbf{A}} = \exp(\mathbf{A}\Delta)$ and $\bar{\mathbf{B}} = (\exp(\mathbf{A}\Delta) - \mathbf{I})\mathbf{A}^{-1}\mathbf{B}$.
+
+In the standard formulation, $\mathbf{B}$ and $\mathbf{C}$ are either fixed or linearly projected from the input. VideoKamba introduces the \textbf{IntricateKANSSMCore}, which replaces these linear projections with dynamic modulation derived from Kolmogorov-Arnold Networks (KANs). Instead of shallowly replacing multi-layer perceptrons, our architecture employs learned B-spline polynomials to expressively control the input-to-state and state-to-output mappings. Mappings $\alpha(\cdot)$ and $\beta(\cdot)$ parameterize the dynamic matrices:
+\begin{align}
+    h_t &= \bar{\mathbf{A}}h_{t-1} + (\bar{\mathbf{B}} \odot \alpha(u_t))u_t \\
+    y_t &= (\mathbf{C} \odot \beta(u_t))h_t
+\end{align}
+where $\odot$ denotes element-wise or factor-wise scaling, depending on the chosen configuration (e.g., scalar element modulation, feature-specific factor modulation, or mixture-of-experts). The modulation functions are defined via KAN layers:
+\begin{equation}
+    \alpha(u_t) = \sigma\left(\sum_{i,k} c_i^{(\mathbf{B})} \mathcal{N}_{i,k}(u_t)\right), \quad \beta(u_t) = \sigma\left(\sum_{i,k} c_i^{(\mathbf{C})} \mathcal{N}_{i,k}(u_t)\right)
+\end{equation}
+Here, $\mathcal{N}_{i,k}(\cdot)$ are basis functions and $c_i$ are learnable coefficients. To accelerate training computation---traditionally dominated by the recursive Cox-de Boor B-spline evaluation---we employ \textbf{FastKAN} using Gaussian Radial Basis Functions (RBFs) $\exp(-((x-\mu)/s)^2)$. This formulation achieves comparable nonlinear expressivity with highly optimized vectorized execution, effectively marrying the extensive sequence modeling capacity of SSMs with the intricate function approximation capabilities of KANs.
+
+\subsection{Hierarchical Feature Fusion: Segmentation Decoder}
+\label{sec:seg_decoder}
+While the deep KAN-SSM layer accurately propagates object identity temporally, aggressive semantic pooling limits the spatial resolution necessary for precise mask prediction. To resolve this, VideoKamba incorporates a Hierarchical Segmentation Decoder that incrementally fuses deep temporal semantics with high-resolution spatial priors extracted from early layers of a frozen DinoV3 feature extractor.
+
+Let $\mathbf{S}_{L} \in \mathbb{R}^{B \times T \times D_{SSM} \times \frac{H}{16} \times \frac{W}{16}}$ denote the deep contextualized sequence emitted by the SSM, and $\mathbf{F}_\ell$ denote intermediate DinoV3 multi-scale features for layers $\ell \in \{3, 6, 9\}$. The decoder applies recursive upsampling blocks:
+\begin{equation}
+    \mathbf{X}_k = \text{UpBlock}(\mathbf{X}_{k-1},\, \mathbf{F}_{\ell_k})
+\end{equation}
+where $\mathbf{X}_0 = \mathbf{S}_{L}$, progressing hierarchically from deep to shallow representations. We support multiple UpBlock fusion strategies:
+\begin{itemize}
+    \item \textbf{Feature Pyramid Network (FPN) Addition}: Simple transposed convolutional upsampling followed by element-wise addition with projection-aligned skip features.
+    \item \textbf{Cross-Attention Alignment}: The semantic temporal output serves as Queries ($\mathbf{Q}$), while high-resolution skip features serve as Keys and Values ($\mathbf{K}, \mathbf{V}$). This allows the network to attentively select the precise spatial details required:
+    \begin{equation}
+        \mathbf{X}_{att} = \text{LayerNorm}\left(\mathbf{Q} + \text{Softmax}\left(\frac{\mathbf{Q}\mathbf{K}^T}{\sqrt{d_k}}\right)\mathbf{V}\right)
+    \end{equation}
+    \item \textbf{Deformable Convolution (v2) Fusion}: Given the propensity for spatial misalignment between deep temporally-propagated features and static shallow features, deformable convolutions predict spatial offsets $\Delta \mathbf{p}_k$ and modulation scalars $\Delta \mathbf{m}_k$ from the concatenated features. The skip features are dynamically sampled prior to fusion, resolving spatial phase discrepancies.
+\end{itemize}
+After cascading the upsampling blocks, the resulting features are refined via convolutional layers, interpolated back to the target spatial resolution using bilinear upsampling, and projected to predict $C$ class logits (foreground objects and background). This yields dense, high-fidelity segmentation maps that maintain temporal consistency through the SSM feedback loops.

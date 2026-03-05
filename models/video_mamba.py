@@ -55,6 +55,8 @@ class VideoMambaSystem(L.LightningModule):
         compress_skip: bool = False,
         use_checkpointing: bool = False,
         fusion_mode: str = "concat",
+        propagation_mode: str = "soft_mask", # "soft_mask", "direct_feature", "teacher_forcing"
+        scheduled_sampling_rate: float = 0.0, # 0.0 = always use GT (teacher forcing), 1.0 = always use prediction
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -77,6 +79,10 @@ class VideoMambaSystem(L.LightningModule):
 
         # Object Memory: one embedding per segmentation channel (bg + objects)
         self.mask_embedding = nn.Embedding(num_seg_classes, dim_in)
+
+        # Projection for direct feature feedback: maps SSM output back to mask embedding space
+        if propagation_mode == "direct_feature":
+            self.feat_proj = nn.Linear(self.dim_infused, dim_in)
 
         # Hybrid VOS loss
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
@@ -115,22 +121,37 @@ class VideoMambaSystem(L.LightningModule):
     # ------------------------------------------------------------------
 
     def _get_mask_embedding(self, mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        """Helper to embed a mask into the patch grid."""
+        """Helper to embed a mask into the patch grid. 
+        Supports both hard label masks [B, H, W] and soft probability masks [B, C, H, W].
+        """
         B = mask.shape[0]
-        # Interpolate mask to patch grid
-        mask_small = F.interpolate(
-            mask.unsqueeze(1).float(), 
-            size=(h, w), 
-            mode="nearest"
-        ).long() # [B, 1, h, w]
         
-        mask_safe = mask_small.clone()
-        mask_safe[mask_small == 255] = 0
-        
-        # Embed mask patches -> [B, h*w, D]
-        # self.mask_embedding is [num_classes, dim_in]
-        emb = self.mask_embedding(mask_safe.squeeze(1)) 
-        return emb.reshape(B, h * w, -1)
+        if mask.ndim == 3: # Hard mask [B, H, W]
+            mask_small = F.interpolate(
+                mask.unsqueeze(1).float(), 
+                size=(h, w), 
+                mode="nearest"
+            ).long() # [B, 1, h, w]
+            
+            mask_safe = mask_small.clone()
+            mask_safe[mask_small == 255] = 0
+            
+            # Embed mask patches -> [B, h*w, D]
+            emb = self.mask_embedding(mask_safe.squeeze(1)) 
+            return emb.reshape(B, h * w, -1)
+        else: # Soft probabilities [B, C, H, W]
+            mask_small = F.interpolate(
+                mask.float(), 
+                size=(h, w), 
+                mode="area"
+            ) # [B, C, h, w]
+            
+            # [B, h*w, C]
+            mask_flat = mask_small.view(B, mask.shape[1], h * w).transpose(1, 2)
+            
+            # Multiply by embedding weights: [B, h*w, C] @ [C, D] -> [B, h*w, D]
+            emb = torch.matmul(mask_flat, self.mask_embedding.weight)
+            return emb
 
     def _infuse_identity(self, patch: torch.Tensor, mask_emb: torch.Tensor) -> torch.Tensor:
         """Helper to infuse identity information into patches based on identity_mode."""
@@ -222,10 +243,33 @@ class VideoMambaSystem(L.LightningModule):
                 logits_t = self.seg_decoder(last_feat, frame_ms) # [B, 1, C, H, W]
                 all_preds_seg.append(logits_t)
                 
-                # 5. Update Recursive Mask for next step
-                # Pick the most likely class to feed back
-                pred_mask_t = torch.argmax(logits_t.squeeze(1), dim=1) # [B, H, W]
-                prev_mask_emb = self._get_mask_embedding(pred_mask_t, h, w)
+                # 5. Update Recursive Mask for next step (based on propagation_mode)
+                prop_mode = self.hparams.propagation_mode
+                sr = self.hparams.scheduled_sampling_rate
+
+                if prop_mode == "direct_feature":
+                    # Pass raw SSM features directly - no mask bottleneck
+                    # last_feat is [B, 1, D, P] -> reshape to [B, P, D]
+                    prev_mask_emb = self.feat_proj(
+                        last_feat.squeeze(1).permute(0, 2, 1)  # [B, P, D_infused]
+                    )  # [B, P, dim_in]
+
+                elif prop_mode == "teacher_forcing" and self.training:
+                    # Use ground truth mask embedding during training (sampled by scheduled_sampling_rate)
+                    # Note: gt_mask_t is the query mask at timestep t (passed in during training)
+                    # Fallback to soft_mask if no GT available
+                    use_pred = (torch.rand(1).item() < sr)
+                    if use_pred:
+                        pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
+                        prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
+                    else:
+                        # For teacher forcing we use prev soft mask as no GT access in forward
+                        pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
+                        prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
+
+                else: # soft_mask (default)
+                    pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1) # [B, C, H, W]
+                    prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
             
             logits_seg = torch.cat(all_preds_seg, dim=1)
             ssm_cls = query_cls # Simplification for classification heads in VOS mode
