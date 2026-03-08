@@ -246,8 +246,9 @@ class VideoMambaSystem(L.LightningModule):
                 
                 # 4. Hierarchical Masked Decoding
                 # Pass prev_mask_v to decoder to guide which DINO features to gate
+                # Pass ref_features_ms as a "Global Anchor" to prevent drift
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
-                logits_t = self.seg_decoder(last_feat, frame_ms, prev_mask=prev_mask_v)
+                logits_t = self.seg_decoder(last_feat, frame_ms, prev_mask=prev_mask_v, ref_features=ref_features_ms)
                 all_preds_seg.append(logits_t)
                 
                 # 5. Prepare Feedback for next step
@@ -283,7 +284,12 @@ class VideoMambaSystem(L.LightningModule):
             
             # Simple decoding without multi-scale for fallback
             # (In practice, you'd want to handle this better)
-            logits_seg = self.seg_decoder(infused_patches, query_features_ms)
+            # Pass ref_features_ms if available even in parallel mode
+            logits_seg = self.seg_decoder(
+                infused_patches, 
+                query_features_ms, 
+                ref_features=ref_features_ms if self.hparams.use_ref_context else None
+            )
             
         # 3. Heads
         logits_clf = self.clf_head(ssm_cls)

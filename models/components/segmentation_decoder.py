@@ -259,14 +259,21 @@ class KANSpatialGatingUpBlock(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, prev_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        skip: torch.Tensor, 
+        prev_mask: Optional[torch.Tensor] = None,
+        ref_skip: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
-            x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
-            skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
-            prev_mask: [BT, 1, H, W] — Binary or soft mask from previous frame
+           x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
+           skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
+           prev_mask: [BT, 1, H, W] — Binary or soft mask from previous frame
+           ref_skip: [BT, skip_channels, H, W] — DINOv2 features from the reference frame
         Returns:
-            [BT, out_channels, H, W]
+           [BT, out_channels, H, W]
         """
         # --- Upsample temporal stream ×2 spatially ---
         x_up = self.upsample(x)                                      # [BT, in_ch, H, W]
@@ -297,7 +304,13 @@ class KANSpatialGatingUpBlock(nn.Module):
             # Fuse mask guidance into the gate
             gate = gate * mask_feat
 
-        # --- Step 4: Modulated Fusion ---
+        # --- Step 4: Reference Anchor (Global Context) ---
+        if ref_skip is not None:
+            # Simple additive fusion to anchor current skip to reference
+            # This helps maintain identity if the SSM state drifts
+            skip = skip + ref_skip
+
+        # --- Step 5: Modulated Fusion ---
         fused = x_tilde + gate * skip                                 # [BT, skip_ch, H, W]
 
         return self.out_conv(fused)                                   # [BT, out_ch, H, W]
@@ -349,13 +362,15 @@ class SegmentationDecoder(nn.Module):
         self, 
         ssm_output: Float[torch.Tensor, "B T D P"], 
         dino_features: dict,
-        prev_mask: Optional[torch.Tensor] = None
+        prev_mask: Optional[torch.Tensor] = None,
+        ref_features: Optional[dict] = None
     ) -> Float[torch.Tensor, "B T num_classes H W"]:
         """
         Args:
             ssm_output: Temporal context from Mamba [B, T, D, P]
             dino_features: Multi-scale dictionary from DinoV3Wrapper
             prev_mask: Optional previous frame mask [B, 1, H_orig, W_orig] or [B, T, 1, H, W]
+            ref_features: Optional reference frame multi-scale dictionary
         """
         B, T, D_ssm, P = ssm_output.shape
         h = w = int(P ** 0.5)
@@ -369,6 +384,14 @@ class SegmentationDecoder(nn.Module):
         l9 = dino_features["layer_9"].reshape(B * T, D_dino, h, w)
         l6 = dino_features["layer_6"].reshape(B * T, D_dino, h, w)
         l3 = dino_features["layer_3"].reshape(B * T, D_dino, h, w)
+
+        # Reference anchors
+        ref_l9 = ref_l6 = ref_l3 = None
+        if ref_features is not None:
+            # Broadcast reference features across all time steps in the batch
+            ref_l9 = ref_features["layer_9"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
+            ref_l6 = ref_features["layer_6"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
+            ref_l3 = ref_features["layer_3"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
         
         if self.compress_skip:
             l9 = self.skip_conv1(l9)
@@ -383,19 +406,19 @@ class SegmentationDecoder(nn.Module):
             m_guidance = m_guidance.reshape(B * T, 1, *m_guidance.shape[-2:])
 
         # Recursive fusion
-        # Only KANSpatialGatingUpBlock currenty supports prev_mask
+        # Only KANSpatialGatingUpBlock currently supports prev_mask and ref_anchor
         if isinstance(self.up1, KANSpatialGatingUpBlock):
-            x = self.up1(x, l9, prev_mask=m_guidance)
+            x = self.up1(x, l9, prev_mask=m_guidance, ref_skip=ref_l9)
         else:
             x = self.up1(x, l9)
 
         if isinstance(self.up2, KANSpatialGatingUpBlock):
-            x = self.up2(x, l6, prev_mask=m_guidance)
+            x = self.up2(x, l6, prev_mask=m_guidance, ref_skip=ref_l6)
         else:
             x = self.up2(x, l6)
 
         if isinstance(self.up3, KANSpatialGatingUpBlock):
-            x = self.up3(x, l3, prev_mask=m_guidance)
+            x = self.up3(x, l3, prev_mask=m_guidance, ref_skip=ref_l3)
         else:
             x = self.up3(x, l3)
         
