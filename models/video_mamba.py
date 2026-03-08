@@ -91,6 +91,17 @@ class VideoMambaSystem(L.LightningModule):
         if propagation_mode == "direct_feature":
             self.feat_proj = nn.Linear(self.dim_infused, dim_in)
 
+        # Pixel-level matching attention (Experiment 1)
+        if propagation_mode == "pixel_matching":
+            self.pixel_matching_attn = nn.MultiheadAttention(
+                embed_dim=dim_in, 
+                num_heads=8, 
+                kdim=self.dim_infused,
+                vdim=self.dim_infused,
+                batch_first=True
+            )
+            self.matching_norm = nn.LayerNorm(dim_in)
+
         # Hybrid VOS loss
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
         
@@ -256,16 +267,37 @@ class VideoMambaSystem(L.LightningModule):
                 mask_emb = self._get_mask_embedding(feed_mask, h, w)
                 curr_infused = self._infuse_identity(curr_patch, mask_emb)
                 
-                # SSM temporal update (Linear O(T))
-                curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
-                last_feat_flattened, ssm_states = self.temporal_model(
-                    curr_flattened, 
-                    prev_states=ssm_states, 
-                    return_last_state=True
-                )
-                
-                # Reshape for decoding
-                last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
+                # --- SSM vs Pixel Matching ---
+                if self.hparams.propagation_mode == "pixel_matching":
+                    # Experiment 1: Direct Pixel Matching (No SSM)
+                    # Query attends to reference patches modulated by reference identity
+                    # ref_patch_infused is [B, 1, P, D] (if identity_mode=="add/mod") 
+                    # but if "concat" it's 2*D. We assume same dim for now or handle accordingly.
+                    
+                    q = curr_patch.squeeze(1) # [B, P, D]
+                    # ref_patch_infused: [B, 1, P, D_infused]
+                    kv = ref_patch_infused.squeeze(1) # [B, P, D_infused]
+                    
+                    # Ensure dimensions match if using concat
+                    if kv.shape[-1] != q.shape[-1]:
+                        # Projection to query dim if needed, but for add/mod they match
+                        pass 
+
+                    # Attention Matching
+                    attn_out, _ = self.pixel_matching_attn(query=q, key=kv, value=kv)
+                    last_feat_p = self.matching_norm(q + attn_out) # [B, P, D]
+                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) # [B, 1, D, P] -> [B, 1, D, P] (wait, decoder expects [B, 1, D, P])
+                else:
+                    # Original SSM temporal update (Linear O(T))
+                    curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
+                    last_feat_flattened, ssm_states = self.temporal_model(
+                        curr_flattened, 
+                        prev_states=ssm_states, 
+                        return_last_state=True
+                    )
+                    
+                    # Reshape for decoding
+                    last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
                 
                 # --- 4. Hierarchical Masked Decoding (Cross-Attention Bridge) ---
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}

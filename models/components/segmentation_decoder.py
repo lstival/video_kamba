@@ -190,33 +190,80 @@ class CombinedUpBlock(nn.Module):
 
 
 class KANSpatialGatingUpBlock(nn.Module):
-    """KAN-Modulated Spatial Alignment decoder block (G_k).
+    """KAN-Modulated Spatial Alignment decoder block.
 
     Fuses temporal (SSM) context with high-resolution DINOv2 skip features at
     strictly O(N·D) cost — no N×N pixel-to-pixel similarity matrix is computed.
 
     Three operations per pyramid level
     -----------------------------------
-    1. Contextual Projection  (1×1 conv)::
-
+    1. Contextual Projection  (1×1 conv):
        x̃ = Conv_1x1(upsample(x))          [BT, skip_ch, H, W]
 
-    2. KAN Spatial Gating (FastKANLayer applied pixel-wise)::
+    2. KAN Spatial Gating (FastKANLayer applied pixel-wise):
+       G = σ(FastKAN(x̃))                  [BT, skip_ch, H, W]   ∈ [0,1]
 
-       G_k = σ(FastKAN(x̃))               [BT, skip_ch, H, W]   ∈ [0,1]
-
-    3. Modulated Fusion (Hadamard product + residual)::
-
-       out = out_conv(x̃ + G_k ⊙ skip)     [BT, out_ch, H, W]
-
-    Args:
-        in_channels: Channels of the upsampled temporal stream.
-        skip_channels: Channels of the DINOv2 skip connection.
-        out_channels: Output channels after refinement conv.
-        return_gate: If ``True``, the raw gate tensor ``G_k`` is cached in
-            :attr:`_last_gate` after every forward pass (detached from the
-            computation graph). Used by ablation analysis scripts.
+    3. Modulated Fusion (Hadamard product + residual):
+       out = out_conv(x̃ + G ⊙ skip)       [BT, out_ch, H, W]
     """
+
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, return_gate: bool = False):
+        super().__init__()
+        self.return_gate = return_gate
+        self._last_gate: Optional[torch.Tensor] = None
+
+        # Step 0 — upsample temporal stream (preserves in_channels so proj can see full dim)
+        self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
+
+        # Step 1 — lightweight 1×1 contextual projection
+        self.proj = nn.Conv2d(in_channels, skip_channels, kernel_size=1, bias=False)
+        self.proj_bn = nn.BatchNorm2d(skip_channels)
+
+        # Step 2 — FastKAN gate (pixel-wise, O(N·D))
+        # Input/output: [N_pixels, skip_channels] — no spatial pair interactions
+        self.gate_kan = FastKANLayer(skip_channels, skip_channels)
+
+        # Step 3 — lightweight output refinement (single 3×3 conv instead of two)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, prev_mask: Optional[torch.Tensor] = None, ref_skip: Optional[torch.Tensor] = None, ref_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
+            skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
+            prev_mask: Not used by this block, kept for API consistency.
+            ref_skip: Not used by this block, kept for API consistency.
+        Returns:
+            [BT, out_channels, H, W]
+        """
+        # --- Upsample temporal stream ×2 spatially ---
+        x_up = self.upsample(x)                                      # [BT, in_ch, H, W]
+        if x_up.shape[-2:] != skip.shape[-2:]:
+            x_up = nn.functional.interpolate(
+                x_up, size=skip.shape[-2:], mode='bilinear', align_corners=False
+            )
+
+        # --- Contextual Projection ---
+        x_proj = self.proj_bn(self.proj(x_up))                       # [BT, skip_ch, H, W]
+
+        # --- FastKAN Spatial Gating ---
+        BT, C_s, H, W = x_proj.shape
+        flat_proj = x_proj.permute(0, 2, 3, 1).reshape(BT * H * W, C_s)
+        flat_gate = torch.sigmoid(self.gate_kan(flat_proj))
+        gate = flat_gate.reshape(BT, H, W, C_s).permute(0, 3, 1, 2)   # [BT, skip_ch, H, W]
+
+        if self.return_gate:
+            self._last_gate = gate.detach()
+
+        # --- Modulated Fusion ---
+        # Hadamard product gates the DINOv2 skip features
+        fused = x_proj + (gate * skip)
+
+        return self.out_conv(fused)
 
 class KANRefinedCrossAttentionUpBlock(nn.Module):
     """

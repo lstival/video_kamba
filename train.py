@@ -12,7 +12,7 @@ def main(cfg: DictConfig):
     
     # Initialize logger
     logger = hydra.utils.instantiate(cfg.logger) if "logger" in cfg else None
-    if logger and hasattr(logger, "experiment"):
+    if logger and hasattr(logger, "experiment") and hasattr(logger.experiment, "url"):
         print(f"Comet Logger initialized. Experiment: {logger.experiment.url}")
     
     # Initialize trainer
