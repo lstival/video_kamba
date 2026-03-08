@@ -1,0 +1,33 @@
+[2026-03-06 13:56:22,399][__main__][INFO] - Device: cuda
+[2026-03-06 13:56:22,414][__main__][INFO] - --- Evaluating kan model ---
+[2026-03-06 13:56:23,480][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:56:24,771][__main__][INFO] - Gate caching enabled on decoder up-blocks.
+[2026-03-06 13:56:27,238][__main__][INFO] -   [kan] processed 20 batches
+[2026-03-06 13:56:29,070][__main__][INFO] -   [kan] processed 40 batches
+[2026-03-06 13:56:30,901][__main__][INFO] -   [kan] processed 60 batches
+[2026-03-06 13:56:32,730][__main__][INFO] -   [kan] processed 80 batches
+[2026-03-06 13:56:34,557][__main__][INFO] -   [kan] processed 100 batches
+[2026-03-06 13:56:36,388][__main__][INFO] -   [kan] processed 120 batches
+[2026-03-06 13:56:38,218][__main__][INFO] -   [kan] processed 140 batches
+[2026-03-06 13:56:40,047][__main__][INFO] -   [kan] processed 160 batches
+[2026-03-06 13:56:41,876][__main__][INFO] -   [kan] processed 180 batches
+[2026-03-06 13:56:43,707][__main__][INFO] -   [kan] processed 200 batches
+[2026-03-06 13:56:45,540][__main__][INFO] -   [kan] processed 220 batches
+[2026-03-06 13:56:47,363][__main__][INFO] -   [kan] processed 240 batches
+[2026-03-06 13:56:47,431][__main__][INFO] - --- Evaluating xattn model ---
+[2026-03-06 13:56:47,702][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:56:48,793][__main__][INFO] - Gate caching enabled on decoder up-blocks.
+[2026-03-06 13:56:52,846][__main__][INFO] -   [xattn] processed 20 batches
+[2026-03-06 13:56:54,490][__main__][INFO] -   [xattn] processed 40 batches
+[2026-03-06 13:56:56,138][__main__][INFO] -   [xattn] processed 60 batches
+[2026-03-06 13:56:57,792][__main__][INFO] -   [xattn] processed 80 batches
+[2026-03-06 13:56:59,446][__main__][INFO] -   [xattn] processed 100 batches
+[2026-03-06 13:57:01,101][__main__][INFO] -   [xattn] processed 120 batches
+[2026-03-06 13:57:02,751][__main__][INFO] -   [xattn] processed 140 batches
+[2026-03-06 13:57:04,395][__main__][INFO] -   [xattn] processed 160 batches
+[2026-03-06 13:57:06,046][__main__][INFO] -   [xattn] processed 180 batches
+[2026-03-06 13:57:07,692][__main__][INFO] -   [xattn] processed 200 batches
+[2026-03-06 13:57:09,340][__main__][INFO] -   [xattn] processed 220 batches
+[2026-03-06 13:57:10,980][__main__][INFO] -   [xattn] processed 240 batches
+[2026-03-06 13:57:11,415][__main__][INFO] - Saved per-frame IoU CSV to results/exp2/exp2_iou_gate.csv
+[2026-03-06 13:57:12,103][__main__][INFO] - Experiment 2 complete.  Results written to: results/exp2

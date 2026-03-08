@@ -1,0 +1,13 @@
+============================================================
+Experiment 1 — Activation Entropy Summary
+============================================================
+KAN    n=1126400  mean=6.1794  std=0.0099  median=6.1801
+MLP    n=1126400  mean=6.5856  std=0.1295  median=6.6306
+
+Welch t-test:       t=-3320.7212, p=0.000000
+Mann-Whitney U:     U=54967271424.0, p=0.000000  (H1: KAN < MLP)
+
+Interpretation:
+  KAN entropy < MLP entropy  →  sparser, more disentangled KAN gate
+  Significant p-value (<0.05) supports Principle of Simplicity claim.
+============================================================

@@ -445,7 +445,7 @@ def main(cfg: DictConfig) -> None:  # noqa: D103
     data_to_plot = [kan_vals, xattn_vals]
     bp = ax.boxplot(
         data_to_plot,
-        labels=["KAN (ours)", "Cross-Attention"],
+        tick_labels=["KAN (ours)", "Cross-Attention"],
         patch_artist=True,
         notch=False,
         medianprops=dict(color="black", linewidth=2),

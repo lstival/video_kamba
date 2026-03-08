@@ -1,0 +1,15 @@
+Mamba SSM kernels found! 🎉
+
+--- Smoke Test: Gradient Flow (soft_mask) ---
+Loss: 1.2569
+Temporal Model B-matrix grad norm: 0.000000
+Initial Mask Embedding grad norm: 0.000000
+✅ Gradient is flowing through time!
+✅ Gradient is reaching initial mask embedding!
+
+--- Smoke Test: Gradient Flow (direct_feature) ---
+Loss: 1.2019
+Temporal Model B-matrix grad norm: 0.000000
+Initial Mask Embedding grad norm: 0.000000
+✅ Gradient is flowing through time!
+✅ Gradient is reaching initial mask embedding!

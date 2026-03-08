@@ -1,0 +1,13 @@
+============================================================
+Experiment 2 — Spatial Gate Fidelity Summary
+============================================================
+model    n  mean_iou_gate  std_iou_gate  median_iou_gate
+  kan 5760       0.228287      0.130706         0.210321
+xattn 5760       0.124768      0.147325         0.069967
+
+Mann-Whitney U (KAN > xattn):  U=24428662.5, p=0.000000
+
+Interpretation:
+  KAN IoU_gate > xattn IoU_gate  →  KAN gate aligns better
+  with object boundaries (significant p-value < 0.05).
+============================================================

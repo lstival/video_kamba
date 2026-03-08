@@ -223,16 +223,23 @@ def reconstruct_1d_function(
     return x, y
 
 
-def relu_reference(x: np.ndarray) -> np.ndarray:
-    """ReLU activation as a reference for MLP-style gating.
+def leaky_relu_reference(x: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    """Leaky ReLU activation as a reference for MLP-style gating.
 
     Args:
         x: Input array.
+        alpha: Slope for negative values.
 
     Returns:
-        ReLU(x) = max(0, x).
+        LeakyRelu(x) = max(alpha * x, x).
     """
-    return np.maximum(0.0, x)
+    return np.where(x > 0, x, alpha * x)
+
+
+def gelu_reference(x: np.ndarray) -> np.ndarray:
+    """GELU activation as a reference for MLP-style gating."""
+    from scipy.special import erf
+    return 0.5 * x * (1 + erf(x / np.sqrt(2)))
 
 
 # ---------------------------------------------------------------------------
@@ -244,49 +251,82 @@ def plot_rbf_profiles(
     x_range: Tuple[float, float],
     output_path: Path,
 ) -> None:
-    """Multi-panel figure of learned KAN edge functions vs ReLU.
+    """Multi-panel figure of learned KAN edge functions vs ReLU/GELU.
 
-    Each panel corresponds to one top-K channel.  The KAN learned curve
-    (solid blue) is contrasted with a ReLU reference (dashed red).
-
-    Args:
-        profiles: List of (channel_in, channel_out, x_grid, y_values).
-        x_range: (x_min, x_max) for the x-axis.
-        output_path: Destination PDF file path.
+    Uses dual y-axes (twinx) to ensure the KAN RBF shape is visible even if
+    its magnitude is much smaller than the MLP references.
     """
     n = len(profiles)
     cols = min(n, 3)
     rows = (n + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
 
     for idx, (ch_in, ch_out, x_grid, y_kan) in enumerate(profiles):
         ax = axes[idx // cols][idx % cols]
 
-        y_relu = relu_reference(x_grid)
+        # 1. Plot KAN Profile (Left Axis)
+        l1, = ax.plot(x_grid, y_kan, color="#1565C0", linewidth=2.5,
+                      label="KAN edge (learned RBF)")
+        ax.set_ylabel("KAN Gate Contribution", color="#1565C0", fontsize=9)
+        ax.tick_params(axis='y', labelcolor="#1565C0")
 
-        ax.plot(x_grid, y_kan, color="#1565C0", linewidth=2.0,
-                label="KAN edge (learned RBF)")
-        ax.plot(x_grid, y_relu, color="#B71C1C", linewidth=1.5,
-                linestyle="--", label="ReLU reference")
+        # 2. Plot MLP References (Right Axis)
+        ax_ref = ax.twinx()
+        y_lrelu = leaky_relu_reference(x_grid)
+        y_gelu = gelu_reference(x_grid)
 
-        ax.axhline(0, color="gray", linewidth=0.7, linestyle=":")
-        ax.axvline(0, color="gray", linewidth=0.7, linestyle=":")
+        l2, = ax_ref.plot(x_grid, y_lrelu, color="#B71C1C", linewidth=1.5,
+                          linestyle="--", alpha=0.6, label="Leaky ReLU ref")
+        l3, = ax_ref.plot(x_grid, y_gelu, color="#2E7D32", linewidth=1.5,
+                          linestyle=":", alpha=0.6, label="GELU ref")
+        
+        ax_ref.set_ylabel("MLP Ref Activation", color="gray", fontsize=8)
+        ax_ref.tick_params(axis='y', labelcolor="gray")
 
-        ax.set_title(f"Channel in={ch_in}, out={ch_out}", fontsize=10)
+        # --- Align Zeros ---
+        # Get limits
+        y1_min, y1_max = ax.get_ylim()
+        y2_min, y2_max = ax_ref.get_ylim()
+        
+        # Calculate scaling to align zeros
+        # We want y1=0 and y2=0 to be at the same vertical position.
+        # This keeps the horizontal grid line consistent.
+        if y1_min < 0 < y1_max and y2_min < 0 < y2_max:
+             # Align them by adjusting limits to maintain common ratio
+             ratio1 = y1_max / (y1_max - y1_min)
+             ratio2 = y2_max / (y2_max - y2_min)
+             # Adjust whichever one is "narrower" around 0
+             if ratio1 > ratio2: # max1 is relatively larger
+                  new_y2_max = y2_min * ratio1 / (ratio1 - 1)
+                  ax_ref.set_ylim(y2_min, new_y2_max)
+             else:
+                  new_y1_max = y1_min * ratio2 / (ratio2 - 1)
+                  ax.set_ylim(y1_min, new_y1_max)
+
+        ax.axhline(0, color="black", linewidth=1.0, linestyle="-", alpha=0.5)
+        ax.axvline(0, color="black", linewidth=1.0, linestyle="-", alpha=0.5)
+
+        ax.set_title(f"Channel in={ch_in}, out={ch_out}", fontsize=11, fontweight='bold')
         ax.set_xlabel("Normalised DINOv2 feature value", fontsize=9)
-        ax.set_ylabel("Gate contribution", fontsize=9)
-        ax.legend(fontsize=8, loc="upper left")
+        
+        # Combine legends from both axes
+        lns = [l1, l2, l3]
+        labs = [l.get_label() for l in lns]
+        ax.legend(lns, labs, fontsize=8, loc="upper left", frameon=True, framealpha=0.8)
+        
         ax.set_xlim(x_range)
+        ax.grid(True, linestyle=':', alpha=0.4)
 
     # Hide unused axes
     for extra_idx in range(n, rows * cols):
         axes[extra_idx // cols][extra_idx % cols].set_visible(False)
 
     fig.suptitle(
-        "Learned FastKAN RBF Edge Functions vs ReLU Baseline\n"
+        "Learned FastKAN RBF Edge Functions vs MLP Baselines (Leaky ReLU/GELU)\n"
         r"$f_{o,i}(x)=\sum_g w_{o,i,g}\,e^{-((x-\mu_g)/h)^2}+b_i\,\mathrm{SiLU}(x)$",
-        fontsize=12,
-        y=1.01,
+        fontsize=14,
+        fontweight='bold',
+        y=1.02,
     )
     fig.tight_layout()
     fig.savefig(output_path, format="pdf", bbox_inches="tight")

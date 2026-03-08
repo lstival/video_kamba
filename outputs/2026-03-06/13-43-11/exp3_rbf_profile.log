@@ -1,0 +1,14 @@
+[2026-03-06 13:43:12,036][__main__][INFO] - Output directory: results/exp3
+[2026-03-06 13:43:12,076][__main__][INFO] - Device: cuda
+[2026-03-06 13:43:12,679][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:43:13,950][__main__][INFO] - Loaded KAN checkpoint: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772800979.ckpt
+[2026-03-06 13:43:19,033][__main__][INFO] - Top 5 channels (by mean |input|): [np.int64(184), np.int64(216), np.int64(595), np.int64(688), np.int64(561)]
+[2026-03-06 13:43:19,146][__main__][INFO] - Top channels saved to exp3_top_channels.csv
+[2026-03-06 13:43:19,184][__main__][INFO] -   Channel 184: y_range=[-0.0693, 0.0014]
+[2026-03-06 13:43:19,186][__main__][INFO] -   Channel 216: y_range=[-0.0227, 0.0567]
+[2026-03-06 13:43:19,188][__main__][INFO] -   Channel 595: y_range=[-0.0493, -0.0017]
+[2026-03-06 13:43:19,190][__main__][INFO] -   Channel 688: y_range=[-0.0990, 0.0105]
+[2026-03-06 13:43:19,191][__main__][INFO] -   Channel 561: y_range=[-0.0470, 0.0016]
+[2026-03-06 13:43:20,761][__main__][INFO] - Saved RBF profile figure to results/exp3/exp3_rbf_profiles.pdf
+[2026-03-06 13:43:21,227][__main__][INFO] - Saved weight heatmap to results/exp3/exp3_weight_heatmap.pdf
+[2026-03-06 13:43:21,228][__main__][INFO] - Experiment 3 complete.  Results written to: results/exp3

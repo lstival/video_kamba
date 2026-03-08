@@ -1,0 +1,17 @@
+kan_ckpt: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772801008.ckpt
+xattn_ckpt: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_xattn_ckpt_1772801008.ckpt
+data_dir: data/DAVIS/DAVIS
+output_dir: results/exp2
+tau: 0.5
+pyramid_levels:
+- 0
+- 1
+- 2
+save_visualizations: true
+vis_max_seqs: 10
+batch_size: 1
+num_workers: 4
+img_size: 224
+seq_len: 8
+max_batches: -1
+seed: 42

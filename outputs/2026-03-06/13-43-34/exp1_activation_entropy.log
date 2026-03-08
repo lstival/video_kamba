@@ -1,0 +1,28 @@
+[2026-03-06 13:43:35,029][__main__][INFO] - Output directory: results/exp1
+[2026-03-06 13:43:35,063][__main__][INFO] - Device: cuda
+[2026-03-06 13:43:35,070][__main__][INFO] - --- Processing KAN model ---
+[2026-03-06 13:43:35,744][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:43:37,060][__main__][INFO] - Loaded checkpoint: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772801008.ckpt
+[2026-03-06 13:43:37,060][__main__][INFO] - Registered forward hook on: temporal_model.layers[0].B_modulator
+[2026-03-06 13:43:38,906][__main__][INFO] -   processed 10 / 50 batches
+[2026-03-06 13:43:40,148][__main__][INFO] -   processed 20 / 50 batches
+[2026-03-06 13:43:41,393][__main__][INFO] -   processed 30 / 50 batches
+[2026-03-06 13:43:42,643][__main__][INFO] -   processed 40 / 50 batches
+[2026-03-06 13:43:43,889][__main__][INFO] -   processed 50 / 50 batches
+[2026-03-06 13:43:44,413][__main__][INFO] - Collected activations: (1126400, 768)
+[2026-03-06 13:43:46,935][__main__][INFO] - KAN entropy: mean=6.1794  std=0.0099
+[2026-03-06 13:43:46,943][__main__][INFO] - --- Processing MLP model ---
+[2026-03-06 13:43:50,964][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:43:51,962][__main__][INFO] - Loaded checkpoint: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_mlp_ckpt_1772801008.ckpt
+[2026-03-06 13:43:51,962][__main__][INFO] - Registered forward hook on: temporal_model.layers[0].B_modulator
+[2026-03-06 13:43:53,772][__main__][INFO] -   processed 10 / 50 batches
+[2026-03-06 13:43:54,904][__main__][INFO] -   processed 20 / 50 batches
+[2026-03-06 13:43:56,060][__main__][INFO] -   processed 30 / 50 batches
+[2026-03-06 13:43:57,188][__main__][INFO] -   processed 40 / 50 batches
+[2026-03-06 13:43:58,291][__main__][INFO] -   processed 50 / 50 batches
+[2026-03-06 13:43:59,008][__main__][INFO] - Collected activations: (1126400, 768)
+[2026-03-06 13:44:01,669][__main__][INFO] - MLP entropy: mean=6.5856  std=0.1295
+[2026-03-06 13:44:09,929][__main__][INFO] - Saved entropy histogram to results/exp1/exp1_entropy.pdf
+[2026-03-06 13:44:12,347][__main__][INFO] - Saved per-sample entropy CSV to results/exp1/exp1_entropy.csv
+[2026-03-06 13:44:12,712][__main__][INFO] - Saved summary to results/exp1/exp1_summary.txt
+[2026-03-06 13:44:12,742][__main__][INFO] - Experiment 1 complete.  Results written to: results/exp1

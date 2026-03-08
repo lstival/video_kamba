@@ -1,0 +1,36 @@
+Comet Logger initialized. Experiment: https://www.comet.com/lstival/video-mamba/54dc84b0c0044da6b8fbbdbb1e51d038
+Mamba SSM kernels found! 🎉
+[2026-03-07 21:06:57,329][dinov2][INFO] - using MLP layer as FFN
+┏━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃    ┃ Name              ┃ Type                   ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0  │ feature_extractor │ DinoV3Wrapper          │ 86.6 M │ train │     0 │
+│ 1  │ temporal_model    │ KangaSSM               │  7.7 M │ train │     0 │
+│ 2  │ clf_head          │ ClassificationHead     │  316 K │ train │     0 │
+│ 3  │ detection_head    │ DetectionHead          │  535 K │ train │     0 │
+│ 4  │ seg_decoder       │ SegmentationDecoder    │ 22.7 M │ train │     0 │
+│ 5  │ mask_embedding    │ Embedding              │  8.4 K │ train │     0 │
+│ 6  │ vos_loss_fn       │ HybridVOSLoss          │      0 │ train │     0 │
+│ 7  │ test_acc          │ MulticlassAccuracy     │      0 │ train │     0 │
+│ 8  │ test_f1           │ MulticlassF1Score      │      0 │ train │     0 │
+│ 9  │ test_recall       │ MulticlassRecall       │      0 │ train │     0 │
+│ 10 │ test_miou         │ MulticlassJaccardIndex │      0 │ train │     0 │
+│ 11 │ davis_metric      │ DAVISMetric            │      0 │ train │     0 │
+│ 12 │ vos_val_metric    │ DAVISMetric            │      0 │ train │     0 │
+└────┴───────────────────┴────────────────────────┴────────┴───────┴───────┘
+Trainable params: 31.2 M                                                        
+Non-trainable params: 86.6 M                                                    
+Total params: 117 M                                                             
+Total estimated model params size (MB): 471                                     
+Modules in train mode: 282                                                      
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+Epoch 1/1  ━━━━━━━━━━━━━━━━ 1735/1735 0:04:25 •       6.56it/s v_num: d038      
+                                      0:00:00                  train_loss_step: 
+                                                               0.317            
+                                                               val_loss_vos:    
+                                                               0.467 val_loss:  
+                                                               0.467            
+                                                               train_loss_epoch:
+                                                               0.389            
+Project initialized successfully.

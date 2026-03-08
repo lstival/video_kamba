@@ -1,0 +1,11 @@
+kan_ckpt: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772801008.ckpt
+mlp_ckpt: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_mlp_ckpt_1772801008.ckpt
+data_dir: data/DAVIS/DAVIS
+output_dir: results/exp1
+max_batches: 50
+batch_size: 1
+num_workers: 4
+img_size: 224
+seq_len: 8
+seed: 42
+b_mod_layer_idx: 0

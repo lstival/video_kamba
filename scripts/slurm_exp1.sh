@@ -32,12 +32,45 @@ export PYTHONPATH=.
 #       kan_ckpt=lightning_logs/version_kan/checkpoints/best.ckpt \
 #       mlp_ckpt=lightning_logs/version_mlp/checkpoints/best.ckpt
 
+# Workaround for Hydra parsing '=' in paths
+CLEAN_ARGS=()
+for arg in "$@"; do
+    if [[ $arg == *_ckpt=* ]]; then
+        KEY="${arg%%=*}"
+        VALUE="${arg#*=}"
+        # Strip literal single or double quotes if present
+        VALUE="${VALUE#\'}"
+        VALUE="${VALUE%\'}"
+        VALUE="${VALUE#\"}"
+        VALUE="${VALUE%\"}"
+        
+        if [[ $VALUE == *"="* ]]; then
+            echo "Detected '=' in $KEY path. Creating symlink workaround..."
+            TEMP_CKPT="eval_tmp_${KEY}_$(date +%s).ckpt"
+            ln -sf "$(realpath "$VALUE")" "$TEMP_CKPT"
+            CLEAN_ARGS+=("$KEY=$PROJECT_ROOT/$TEMP_CKPT")
+        else
+            CLEAN_ARGS+=("$KEY=$(realpath "$VALUE")")
+        fi
+    else
+        CLEAN_ARGS+=("$arg")
+    fi
+done
+
 python scripts/exp1_activation_entropy.py \
     data_dir=data/DAVIS/DAVIS \
     output_dir=results/exp1 \
     max_batches=50 \
     seed=42 \
-    "$@"
+    "${CLEAN_ARGS[@]}"
+
+# Cleanup temporary symlinks
+for arg in "${CLEAN_ARGS[@]}"; do
+    if [[ $arg == *=*/eval_tmp_*_*.ckpt ]]; then
+        VAL="${arg#*=}"
+        rm "$VAL"
+    fi
+done
 
 echo ""
 echo "Experiment 1 complete at $(date)."

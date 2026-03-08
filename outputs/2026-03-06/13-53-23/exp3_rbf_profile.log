@@ -1,0 +1,11 @@
+[2026-03-06 13:53:23,225][__main__][INFO] - Output directory: results/exp3
+[2026-03-06 13:53:23,278][__main__][INFO] - Device: cuda
+[2026-03-06 13:53:23,851][dinov2][INFO] - using MLP layer as FFN
+[2026-03-06 13:53:25,117][__main__][INFO] - Loaded KAN checkpoint: /home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772801588.ckpt
+[2026-03-06 13:53:30,050][__main__][INFO] - Top 5 channels (by mean |input|): [np.int64(184), np.int64(216), np.int64(595), np.int64(688), np.int64(561)]
+[2026-03-06 13:53:30,197][__main__][INFO] - Top channels saved to exp3_top_channels.csv
+[2026-03-06 13:53:30,200][__main__][INFO] -   Channel 184: y_range=[-0.0693, 0.0014]
+[2026-03-06 13:53:30,202][__main__][INFO] -   Channel 216: y_range=[-0.0227, 0.0567]
+[2026-03-06 13:53:30,203][__main__][INFO] -   Channel 595: y_range=[-0.0493, -0.0017]
+[2026-03-06 13:53:30,205][__main__][INFO] -   Channel 688: y_range=[-0.0990, 0.0105]
+[2026-03-06 13:53:30,207][__main__][INFO] -   Channel 561: y_range=[-0.0470, 0.0016]

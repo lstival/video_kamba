@@ -218,43 +218,44 @@ class KANSpatialGatingUpBlock(nn.Module):
             computation graph). Used by ablation analysis scripts.
     """
 
+class KANRefinedCrossAttentionUpBlock(nn.Module):
+    """
+    Advanced Cross-Attention Bridge with KAN-based Refinement.
+    Uses reference mask-weighted attention to retrieve global identity context.
+    
+    1. Cross-Attention: Current (Q) attends to [Ref * RefMask] (K, V).
+    2. KAN Gate: Learns spatial mixing between Attention (Global) and Skip (Local).
+    """
+
     def __init__(
         self,
         in_channels: int,
         skip_channels: int,
         out_channels: int,
+        num_heads: int = 4,
         return_gate: bool = False,
-        use_mask_guidance: bool = True,
     ):
         super().__init__()
         self.return_gate = return_gate
-        self.use_mask_guidance = use_mask_guidance
-        # Caches the spatial gate G_k: [BT, skip_ch, H, W] ∈ [0,1]
-        self._last_gate: Optional[torch.Tensor] = None
-        # Step 0 — upsample temporal stream
-        self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
-
-        # Step 1 — lightweight 1×1 contextual projection
-        self.proj = nn.Conv2d(in_channels, skip_channels, kernel_size=1, bias=False)
-        self.proj_bn = nn.BatchNorm2d(skip_channels)
-
-        # Step 2 — FastKAN gate (pixel-wise, O(N·D))
-        self.gate_kan = FastKANLayer(skip_channels, skip_channels)
-
-        # Step 3 — Mask Guided Fusion (if enabled)
-        if use_mask_guidance:
-            # Simple 3x3 conv to embed the single-channel mask (or probabilities)
-            # We assume num_classes channels if it's a soft mask from previous step.
-            # For simplicity, we'll handle 1-channel or multi-channel masks.
-            self.mask_conv = nn.Sequential(
-                nn.Conv2d(1, 16, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(16, skip_channels, kernel_size=1)
-            )
-
-        # Step 4 — lightweight output refinement
+        self._last_attn = None
+        
+        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.skip_proj = nn.Conv2d(skip_channels, out_channels, kernel_size=1)
+        
+        # Attention components
+        self.attn = nn.MultiheadAttention(embed_dim=out_channels, num_heads=num_heads, batch_first=True)
+        self.mask_proj = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # KAN-based Fusion Gate (Mixing Local and Global)
+        self.fusion_kan = FastKANLayer(out_channels * 2, out_channels)
+        
         self.out_conv = nn.Sequential(
-            nn.Conv2d(skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -264,56 +265,60 @@ class KANSpatialGatingUpBlock(nn.Module):
         x: torch.Tensor, 
         skip: torch.Tensor, 
         prev_mask: Optional[torch.Tensor] = None,
-        ref_skip: Optional[torch.Tensor] = None
+        ref_skip: Optional[torch.Tensor] = None,
+        ref_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
-           x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
-           skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
-           prev_mask: [BT, 1, H, W] — Binary or soft mask from previous frame
-           ref_skip: [BT, skip_channels, H, W] — DINOv2 features from the reference frame
-        Returns:
-           [BT, out_channels, H, W]
+           x: Current temporal features [BT, in, H/2, W/2]
+           skip: Current high-res skip [BT, skip, H, W]
+           ref_skip: Reference high-res features [B, skip, H, W] (broadcasted to BT)
+           ref_mask: Reference ground-truth mask [B, 1, H, W] (broadcasted to BT)
         """
-        # --- Upsample temporal stream ×2 spatially ---
-        x_up = self.upsample(x)                                      # [BT, in_ch, H, W]
+        # 1. Upsample and project
+        x_up = self.upsample(x)
         if x_up.shape[-2:] != skip.shape[-2:]:
-            x_up = nn.functional.interpolate(
-                x_up, size=skip.shape[-2:], mode='bilinear', align_corners=False
-            )
-
-        # --- Step 1: Contextual Projection ---
-        x_tilde = self.proj_bn(self.proj(x_up))                     # [BT, skip_ch, H, W]
-
-        # --- Step 2: KAN Spatial Gating (pixel-wise, O(N·D)) ---
-        BT, C, H, W = x_tilde.shape
-        x_flat = x_tilde.permute(0, 2, 3, 1).reshape(BT * H * W, C)  # [N, C]
-        gate_flat = torch.sigmoid(self.gate_kan(x_flat))              # [N, C] ∈ [0,1]
-        gate = gate_flat.reshape(BT, H, W, C).permute(0, 3, 1, 2)    # [BT, C, H, W]
-
-        if self.return_gate:
-            self._last_gate = gate.detach()                           # [BT, C, H, W]
-
-        # --- Step 3: Combined Mask + Signal Gating ---
-        if self.use_mask_guidance and prev_mask is not None:
-            # Ensure prev_mask is [BT, 1, H, W]
-            if prev_mask.shape[-2:] != (H, W):
-                prev_mask = nn.functional.interpolate(prev_mask, size=(H, W), mode='bilinear', align_corners=False)
+            x_up = nn.functional.interpolate(x_up, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        
+        skip_p = self.skip_proj(skip)
+        
+        # 2. Cross-Attention Matching (Global Identity)
+        if ref_skip is not None and ref_mask is not None:
+            B_T, C, H, W = x_up.shape
             
-            mask_feat = torch.sigmoid(self.mask_conv(prev_mask))
-            # Fuse mask guidance into the gate
-            gate = gate * mask_feat
-
-        # --- Step 4: Reference Anchor (Global Context) ---
-        if ref_skip is not None:
-            # Simple additive fusion to anchor current skip to reference
-            # This helps maintain identity if the SSM state drifts
-            skip = skip + ref_skip
-
-        # --- Step 5: Modulated Fusion ---
-        fused = x_tilde + gate * skip                                 # [BT, skip_ch, H, W]
-
-        return self.out_conv(fused)                                   # [BT, out_ch, H, W]
+            # Modulate Reference Features with Mask
+            # This makes the Key/Value "object-aware"
+            if ref_mask.shape[-2:] != (H, W):
+                ref_mask = nn.functional.interpolate(ref_mask, size=(H, W), mode='bilinear', align_corners=False)
+            
+            m_weight = self.mask_proj(ref_mask)
+            ref_feat = self.skip_proj(ref_skip) * m_weight
+            
+            # Prepare for MultiheadAttention [B, Seq, Dim]
+            q = x_up.reshape(B_T, C, -1).permute(0, 2, 1)
+            kv = ref_feat.reshape(B_T, C, -1).permute(0, 2, 1)
+            
+            global_context, attn_weights = self.attn(q, kv, kv)
+            global_context = global_context.permute(0, 2, 1).reshape(B_T, C, H, W)
+            
+            if self.return_gate:
+                self._last_attn = attn_weights.detach()
+                
+            # 3. KAN-based Hybrid Fusion (Global Context + Local Detail)
+            # Concatenate Global (Attention) and Local (Current Skip)
+            combined = torch.cat([global_context, skip_p], dim=1)
+            BT_HW, C2 = B_T * H * W, C * 2
+            
+            fused_flat = self.fusion_kan(combined.permute(0, 2, 3, 1).reshape(BT_HW, C2))
+            fused = fused_flat.reshape(B_T, H, W, C).permute(0, 3, 1, 2)
+            
+            # Final mixing with current features
+            x_out = x_up + fused
+        else:
+            # Fallback to simple fusion
+            x_out = x_up + skip_p
+            
+        return self.out_conv(x_out)
 
 
 class SegmentationDecoder(nn.Module):
@@ -343,6 +348,7 @@ class SegmentationDecoder(nn.Module):
             "deformable": DeformableUpBlock,
             "combined": CombinedUpBlock,
             "kan_spatial": KANSpatialGatingUpBlock,
+            "kan_cross_attn": KANRefinedCrossAttentionUpBlock,
         }.get(self.fusion_mode, ConcatUpBlock)
 
         # Top-down hierarchy: Layer 11 (SSM) -> 9 -> 6 -> 3
@@ -363,7 +369,8 @@ class SegmentationDecoder(nn.Module):
         ssm_output: Float[torch.Tensor, "B T D P"], 
         dino_features: dict,
         prev_mask: Optional[torch.Tensor] = None,
-        ref_features: Optional[dict] = None
+        ref_features: Optional[dict] = None,
+        ref_mask: Optional[torch.Tensor] = None
     ) -> Float[torch.Tensor, "B T num_classes H W"]:
         """
         Args:
@@ -371,6 +378,7 @@ class SegmentationDecoder(nn.Module):
             dino_features: Multi-scale dictionary from DinoV3Wrapper
             prev_mask: Optional previous frame mask [B, 1, H_orig, W_orig] or [B, T, 1, H, W]
             ref_features: Optional reference frame multi-scale dictionary
+            ref_mask: Optional reference ground-truth mask [B, 1, H_orig, W_orig]
         """
         B, T, D_ssm, P = ssm_output.shape
         h = w = int(P ** 0.5)
@@ -398,29 +406,42 @@ class SegmentationDecoder(nn.Module):
             l6 = self.skip_conv2(l6)
             l3 = self.skip_conv3(l3)
         
-        # Prepare mask guidance for upblocks
-        # If T > 1 (parallel training), we might need to shift/manage prev_mask?
-        # For simplicity, we'll assume prev_mask is provided for the CURRENT step(s).
+        # Prepare auxiliary masks
         m_guidance = prev_mask
-        if m_guidance is not None and m_guidance.ndim == 5: # [B, T, 1, H, W]
-            m_guidance = m_guidance.reshape(B * T, 1, *m_guidance.shape[-2:])
+        if m_guidance is not None:
+            # Ensure 4D [BT, 1, H, W]
+            if m_guidance.ndim == 5:
+                # Could be [B, T, C, H, W] or [B, T, 1, H, W]
+                m_guidance = m_guidance.reshape(B * T, -1, *m_guidance.shape[-2:])
+                if m_guidance.shape[1] > 1: # multi-channel prob mask
+                    m_guidance = m_guidance[:, 1:2] # take first object channel
+            elif m_guidance.ndim == 3:
+                m_guidance = m_guidance.unsqueeze(1).repeat_interleave(T, dim=0)
+            m_guidance = m_guidance.float()
+            
+        r_mask = ref_mask
+        if r_mask is not None:
+            # Ensure 4D [N, 1, H, W]
+            if r_mask.ndim == 5: # [B, 1, 1, H, W]
+                r_mask = r_mask.reshape(B, 1, *r_mask.shape[-2:])
+            elif r_mask.ndim == 3: # [B, H, W]
+                r_mask = r_mask.unsqueeze(1)
+            r_mask = r_mask.float()
+            r_mask = r_mask.repeat_interleave(T, dim=0) # [B*T, 1, H, W]
 
         # Recursive fusion
-        # Only KANSpatialGatingUpBlock currently supports prev_mask and ref_anchor
-        if isinstance(self.up1, KANSpatialGatingUpBlock):
-            x = self.up1(x, l9, prev_mask=m_guidance, ref_skip=ref_l9)
-        else:
-            x = self.up1(x, l9)
+        # Only KANSpatialGatingUpBlock and KANRefinedCrossAttentionUpBlock currently support ref_context
+        def execute_up(block, current_x, skip_feat, r_skip, r_mask_g):
+            if isinstance(block, KANRefinedCrossAttentionUpBlock):
+                return block(current_x, skip_feat, prev_mask=m_guidance, ref_skip=r_skip, ref_mask=r_mask_g)
+            elif isinstance(block, KANSpatialGatingUpBlock):
+                return block(current_x, skip_feat, prev_mask=m_guidance, ref_skip=r_skip)
+            else:
+                return block(current_x, skip_feat)
 
-        if isinstance(self.up2, KANSpatialGatingUpBlock):
-            x = self.up2(x, l6, prev_mask=m_guidance, ref_skip=ref_l6)
-        else:
-            x = self.up2(x, l6)
-
-        if isinstance(self.up3, KANSpatialGatingUpBlock):
-            x = self.up3(x, l3, prev_mask=m_guidance, ref_skip=ref_l3)
-        else:
-            x = self.up3(x, l3)
+        x = execute_up(self.up1, x, l9, ref_l9, r_mask)
+        x = execute_up(self.up2, x, l6, ref_l6, r_mask)
+        x = execute_up(self.up3, x, l3, ref_l3, r_mask)
         
         logits = self.final_head(x) # [BT, num_classes, 112, 112]
         

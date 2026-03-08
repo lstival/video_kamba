@@ -1,0 +1,8 @@
+- data_dir=data/DAVIS/DAVIS
+- output_dir=results/exp2
+- tau=0.5
+- save_visualizations=true
+- vis_max_seqs=10
+- seed=42
+- kan_ckpt=/home/WUR/stiva001/WUR/video_kamba/eval_tmp_kan_ckpt_1772801770.ckpt
+- xattn_ckpt=/home/WUR/stiva001/WUR/video_kamba/eval_tmp_xattn_ckpt_1772801770.ckpt

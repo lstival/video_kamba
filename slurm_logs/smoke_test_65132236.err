@@ -1,0 +1,9 @@
+/shared/apps/slurm/var/spool/node301/job65132236/slurm_script: line 14: source: venv/bin/python: cannot execute binary file
+Using cache found in /home/WUR/stiva001/.cache/torch/hub/facebookresearch_dinov2_main
+/home/WUR/stiva001/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/home/WUR/stiva001/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/home/WUR/stiva001/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+Using cache found in /home/WUR/stiva001/.cache/torch/hub/facebookresearch_dinov2_main

@@ -179,9 +179,13 @@ class VideoMambaSystem(L.LightningModule):
                 mask_emb = mask_emb.unsqueeze(1)
             return patch + mask_emb
 
-    def forward(self, x: torch.Tensor, ref_frame: torch.Tensor = None, ref_mask: torch.Tensor = None) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        ref_frame: torch.Tensor = None, 
+        ref_mask: torch.Tensor = None,
+        query_masks: torch.Tensor = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Recursive inference for VOS with mask feedback and multi-scale fusion."""
         B, T, C, H, W = x.shape
         # 1. Spatial feature extraction (DinoV3 - Multi-scale)
@@ -211,11 +215,6 @@ class VideoMambaSystem(L.LightningModule):
             # Initialize SSM hidden states for each layer 
             ssm_states = None 
             
-            # Initial prediction for "previous mask" starts with the reference mask
-            if ref_mask.ndim == 3: # [B, H_orig, W_orig]
-                prev_mask_v = ref_mask.unsqueeze(1).float() / (self.hparams.num_seg_classes - 1)
-            else: # probabilities [B, C, H, W]
-                prev_mask_v = torch.max(ref_mask, dim=1, keepdim=True)[0]
             
             # We process query frames one by one to allow mask feedback
             # Note: During training, we can parallelize if we don't have feedback, 
@@ -225,13 +224,37 @@ class VideoMambaSystem(L.LightningModule):
             ref_flattened = ref_patch_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
             _, ssm_states = self.temporal_model(ref_flattened, return_last_state=True)
             
+            # Initial prediction for "previous mask" starts with the reference mask
+            # We scale it to match the expected probability range if it's a hard mask
+            if ref_mask.ndim == 3: # [B, H, W]
+                # Convert to [B, 1, H, W] soft-style
+                prev_mask_v = F.one_hot(ref_mask.long(), num_classes=self.hparams.num_seg_classes).permute(0, 3, 1, 2).float()[:, 1:2]
+            else: # [B, C, H, W]
+                prev_mask_v = ref_mask[:, 1:2]
+
             # Step 2: Recurrent processing of query frames
             for t in range(T):
                 # t-th query frame patches
                 curr_patch = query_patch[:, t:t+1].transpose(2, 3) # [B, 1, P, D]
                 
-                # Feedback the previous mask information into the patches
-                curr_infused = self._infuse_identity(curr_patch, ref_mask_emb if t==0 else prev_mask_emb)
+                # --- 3. Choose Feed Mask (Scheduled Sampling) ---
+                gt_mask_t = query_masks[:, t:t+1]
+                if gt_mask_t.ndim == 5: # [B, 1, 1, H, W]
+                    gt_mask_t = gt_mask_t.squeeze(2)
+                elif gt_mask_t.ndim == 3: # [B, H, W] -> [B, 1, H, W]
+                    gt_mask_t = gt_mask_t.unsqueeze(1)
+                
+                if self.training and self.hparams.scheduled_sampling_rate > 0:
+                    use_gt = torch.rand(1).item() > self.hparams.scheduled_sampling_rate
+                    # If using prediction, we take the soft mask from previous step (or ref at t=0)
+                    feed_mask = gt_mask_t if use_gt else prev_mask_v
+                else:
+                    # In eval, always use previous prediction (pure autoregressive)
+                    feed_mask = prev_mask_v
+
+                # Feedback the mask information into the patches (SSM input)
+                mask_emb = self._get_mask_embedding(feed_mask, h, w)
+                curr_infused = self._infuse_identity(curr_patch, mask_emb)
                 
                 # SSM temporal update (Linear O(T))
                 curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
@@ -241,24 +264,24 @@ class VideoMambaSystem(L.LightningModule):
                     return_last_state=True
                 )
                 
-                # Reshape to [B, 1, D, P] for decoding
+                # Reshape for decoding
                 last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
                 
-                # 4. Hierarchical Masked Decoding
-                # Pass prev_mask_v to decoder to guide which DINO features to gate
-                # Pass ref_features_ms as a "Global Anchor" to prevent drift
+                # --- 4. Hierarchical Masked Decoding (Cross-Attention Bridge) ---
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
-                logits_t = self.seg_decoder(last_feat, frame_ms, prev_mask=prev_mask_v, ref_features=ref_features_ms)
+                logits_t = self.seg_decoder(
+                    last_feat, 
+                    frame_ms, 
+                    prev_mask=feed_mask, # Feed the SAME mask to the decoder spatial prior
+                    ref_features=ref_features_ms,
+                    ref_mask=ref_mask  # Global Anchor for Cross-Attention
+                )
                 all_preds_seg.append(logits_t)
                 
-                # 5. Prepare Feedback for next step
-                pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
-                
-                # Update visual mask guidance for decoder
-                prev_mask_v = torch.max(pred_probs_t[:, 1:], dim=1, keepdim=True)[0]
-                
-                # Update embedding for patch infusion
-                prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
+                # --- 5. Prepare Prediction for next step ---
+                # Extract soft-mask for next recursive step [B, 1, H, W]
+                # We assume channel 1 is the foreground object (DAVIS/seen splits)
+                prev_mask_v = torch.softmax(logits_t, dim=2)[:, :, 1:2].detach()
             
             logits_seg = torch.cat(all_preds_seg, dim=1)
             ssm_cls = query_cls # Simplification for classification heads in VOS mode
@@ -284,11 +307,12 @@ class VideoMambaSystem(L.LightningModule):
             
             # Simple decoding without multi-scale for fallback
             # (In practice, you'd want to handle this better)
-            # Pass ref_features_ms if available even in parallel mode
+            # Pass ref_features_ms and ref_mask if available even in parallel mode
             logits_seg = self.seg_decoder(
                 infused_patches, 
                 query_features_ms, 
-                ref_features=ref_features_ms if self.hparams.use_ref_context else None
+                ref_features=ref_features_ms if self.hparams.use_ref_context else None,
+                ref_mask=ref_mask if self.hparams.use_ref_context else None
             )
             
         # 3. Heads
@@ -336,9 +360,9 @@ class VideoMambaSystem(L.LightningModule):
         """
         ref_img, ref_mask, query_images, query_masks, obj_present, _meta = batch
 
-        # Forward pass with reference memory
+        # Forward pass with reference memory and ground truth masks (for scheduled sampling)
         _logits_clf, _pred_boxes, _pred_box_logits, logits_seg = self(
-            query_images, ref_frame=ref_img, ref_mask=ref_mask
+            query_images, ref_frame=ref_img, ref_mask=ref_mask, query_masks=query_masks
         )
         # logits_seg: [B, T, num_seg_classes, H, W]
 
@@ -384,7 +408,9 @@ class VideoMambaSystem(L.LightningModule):
         if len(batch) == 4 and batch[0].dim() == 4 and batch[1].dim() == 3 and batch[2].dim() == 5:
             ref_img, ref_mask, query_images, query_masks = batch
             bs = ref_img.shape[0]
-            logits_clf, pred_boxes, pred_box_logits, logits_seg = self(query_images, ref_frame=ref_img, ref_mask=ref_mask)
+            logits_clf, pred_boxes, pred_box_logits, logits_seg = self(
+                query_images, ref_frame=ref_img, ref_mask=ref_mask, query_masks=query_masks
+            )
             
             BT, C, H, W = logits_seg.shape[0] * logits_seg.shape[1], logits_seg.shape[2], logits_seg.shape[3], logits_seg.shape[4]
             loss_seg = F.cross_entropy(
@@ -525,3 +551,49 @@ class VideoMambaSystem(L.LightningModule):
             weight_decay=1e-2
         )
         return optimizer
+
+    def _get_mask_embedding(self, mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """
+        Converts a mask (hard or soft) into a patch-level identity embedding [B, P, D].
+        mask: [B, 1, H, W], [B, H, W], or [B, 1, 1, H, W]
+        """
+        # Ensure 4D [N, 1, H, W]
+        if mask.ndim == 5:
+            mask = mask.view(-1, 1, mask.shape[-2], mask.shape[-1])
+        elif mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        mask = mask.float()
+            
+        # Downsample to patch resolution (e.g. 14x14)
+        if mask.shape[-2:] != (h, w):
+            mask = F.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False)
+        
+        # mask is [B, 1, h, w]. Flatten to [B, 1, P]
+        B, _, h_p, w_p = mask.shape
+        mask_flat = mask.reshape(B, 1, h_p * w_p).transpose(1, 2) # [B, P, 1]
+        
+        # Map foreground (channel 1) to "Object" embedding (index 1)
+        # and background to "BG" embedding (index 0).
+        # We use a linear interpolation between BG and OBJ embeddings for soft masks.
+        bg_emb = self.mask_embedding(torch.zeros(B, h_p * w_p, device=mask.device).long()) # [B, P, D]
+        obj_emb = self.mask_embedding(torch.ones(B, h_p * w_p, device=mask.device).long())  # [B, P, D]
+        
+        return (1.0 - mask_flat) * bg_emb + mask_flat * obj_emb
+
+    def _infuse_identity(self, patch: torch.Tensor, mask_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Mixes frame patches and identity embeddings.
+        patch: [B, 1, P, D] or [B, T, P, D]
+        mask_emb: [B, P, D]
+        """
+        if patch.ndim == 4:
+            mask_emb = mask_emb.unsqueeze(1) # [B, 1, P, D]
+            
+        if self.hparams.identity_mode == "add":
+            return patch + mask_emb
+        elif self.hparams.identity_mode == "concat":
+            # [B, T, P, 2*D]
+            return torch.cat([patch, mask_emb.expand_as(patch)], dim=-1)
+        elif self.hparams.identity_mode == "modulate":
+            return patch * torch.sigmoid(mask_emb)
+        return patch
