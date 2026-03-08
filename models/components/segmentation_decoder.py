@@ -224,12 +224,14 @@ class KANSpatialGatingUpBlock(nn.Module):
         skip_channels: int,
         out_channels: int,
         return_gate: bool = False,
+        use_mask_guidance: bool = True,
     ):
         super().__init__()
         self.return_gate = return_gate
+        self.use_mask_guidance = use_mask_guidance
         # Caches the spatial gate G_k: [BT, skip_ch, H, W] ∈ [0,1]
         self._last_gate: Optional[torch.Tensor] = None
-        # Step 0 — upsample temporal stream (preserves in_channels so proj can see full dim)
+        # Step 0 — upsample temporal stream
         self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
 
         # Step 1 — lightweight 1×1 contextual projection
@@ -237,21 +239,32 @@ class KANSpatialGatingUpBlock(nn.Module):
         self.proj_bn = nn.BatchNorm2d(skip_channels)
 
         # Step 2 — FastKAN gate (pixel-wise, O(N·D))
-        # Input/output: [N_pixels, skip_channels] — no spatial pair interactions
         self.gate_kan = FastKANLayer(skip_channels, skip_channels)
 
-        # Step 3 — lightweight output refinement (single 3×3 conv instead of two)
+        # Step 3 — Mask Guided Fusion (if enabled)
+        if use_mask_guidance:
+            # Simple 3x3 conv to embed the single-channel mask (or probabilities)
+            # We assume num_classes channels if it's a soft mask from previous step.
+            # For simplicity, we'll handle 1-channel or multi-channel masks.
+            self.mask_conv = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, skip_channels, kernel_size=1)
+            )
+
+        # Step 4 — lightweight output refinement
         self.out_conv = nn.Sequential(
             nn.Conv2d(skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, prev_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
             skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
+            prev_mask: [BT, 1, H, W] — Binary or soft mask from previous frame
         Returns:
             [BT, out_channels, H, W]
         """
@@ -267,16 +280,24 @@ class KANSpatialGatingUpBlock(nn.Module):
 
         # --- Step 2: KAN Spatial Gating (pixel-wise, O(N·D)) ---
         BT, C, H, W = x_tilde.shape
-        # Reshape to [BT*H*W, C] so FastKAN operates per-pixel (no cross-pixel attention)
         x_flat = x_tilde.permute(0, 2, 3, 1).reshape(BT * H * W, C)  # [N, C]
         gate_flat = torch.sigmoid(self.gate_kan(x_flat))              # [N, C] ∈ [0,1]
         gate = gate_flat.reshape(BT, H, W, C).permute(0, 3, 1, 2)    # [BT, C, H, W]
 
         if self.return_gate:
-            # Detach so analysis scripts never accumulate graph memory.
             self._last_gate = gate.detach()                           # [BT, C, H, W]
 
-        # --- Step 3: Modulated Fusion ---
+        # --- Step 3: Combined Mask + Signal Gating ---
+        if self.use_mask_guidance and prev_mask is not None:
+            # Ensure prev_mask is [BT, 1, H, W]
+            if prev_mask.shape[-2:] != (H, W):
+                prev_mask = nn.functional.interpolate(prev_mask, size=(H, W), mode='bilinear', align_corners=False)
+            
+            mask_feat = torch.sigmoid(self.mask_conv(prev_mask))
+            # Fuse mask guidance into the gate
+            gate = gate * mask_feat
+
+        # --- Step 4: Modulated Fusion ---
         fused = x_tilde + gate * skip                                 # [BT, skip_ch, H, W]
 
         return self.out_conv(fused)                                   # [BT, out_ch, H, W]
@@ -327,12 +348,14 @@ class SegmentationDecoder(nn.Module):
     def forward(
         self, 
         ssm_output: Float[torch.Tensor, "B T D P"], 
-        dino_features: dict
+        dino_features: dict,
+        prev_mask: Optional[torch.Tensor] = None
     ) -> Float[torch.Tensor, "B T num_classes H W"]:
         """
         Args:
             ssm_output: Temporal context from Mamba [B, T, D, P]
             dino_features: Multi-scale dictionary from DinoV3Wrapper
+            prev_mask: Optional previous frame mask [B, 1, H_orig, W_orig] or [B, T, 1, H, W]
         """
         B, T, D_ssm, P = ssm_output.shape
         h = w = int(P ** 0.5)
@@ -352,10 +375,29 @@ class SegmentationDecoder(nn.Module):
             l6 = self.skip_conv2(l6)
             l3 = self.skip_conv3(l3)
         
+        # Prepare mask guidance for upblocks
+        # If T > 1 (parallel training), we might need to shift/manage prev_mask?
+        # For simplicity, we'll assume prev_mask is provided for the CURRENT step(s).
+        m_guidance = prev_mask
+        if m_guidance is not None and m_guidance.ndim == 5: # [B, T, 1, H, W]
+            m_guidance = m_guidance.reshape(B * T, 1, *m_guidance.shape[-2:])
+
         # Recursive fusion
-        x = self.up1(x, l9) # -> [BT, 256, 28, 28] roughly (Dino patches are 14x14)
-        x = self.up2(x, l6) # -> [BT, 128, 56, 56]
-        x = self.up3(x, l3) # -> [BT, 64, 112, 112]
+        # Only KANSpatialGatingUpBlock currenty supports prev_mask
+        if isinstance(self.up1, KANSpatialGatingUpBlock):
+            x = self.up1(x, l9, prev_mask=m_guidance)
+        else:
+            x = self.up1(x, l9)
+
+        if isinstance(self.up2, KANSpatialGatingUpBlock):
+            x = self.up2(x, l6, prev_mask=m_guidance)
+        else:
+            x = self.up2(x, l6)
+
+        if isinstance(self.up3, KANSpatialGatingUpBlock):
+            x = self.up3(x, l3, prev_mask=m_guidance)
+        else:
+            x = self.up3(x, l3)
         
         logits = self.final_head(x) # [BT, num_classes, 112, 112]
         

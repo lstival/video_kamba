@@ -1,3 +1,4 @@
+from typing import Optional, List, Tuple
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
@@ -58,7 +59,12 @@ class KangaSSM(nn.Module):
         # Projection mixing layer standard in Mamba block architectures (out_proj)
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x: Float[torch.Tensor, "B T C"]) -> Float[torch.Tensor, "B T C"]:
+    def forward(
+        self,
+        x: Float[torch.Tensor, "B T C"],
+        prev_states: Optional[list[torch.Tensor]] = None,
+        return_last_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Input: [B, T, C] from DINO sequence.
         Output: Contextualized [B, T, C].
@@ -67,17 +73,37 @@ class KangaSSM(nn.Module):
         residual = x
         x = self.norm(x)
         
-        # Assuming a constant delta value for discretization, typical in simplified SSM wrappers 
-        # (Alternatively, could be a learned parameter per channel, keeping it simple here)
         delta = torch.full((B, T, 1), 0.1, device=x.device, dtype=x.dtype)
         
+        next_states = []
         # Sequence processing via Intricate Modulated SSM
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            p_state = prev_states[i] if prev_states is not None else None
+            
             if self.use_checkpointing and x.requires_grad:
-                x = cp.checkpoint(layer, x, delta, use_reentrant=False)
+                # Checkpointing usually doesn't play well with returning extra values 
+                # unless handled specifically. For simplicity in VOS loop, we might 
+                # disable it or handle the state return.
+                x, n_state = cp.checkpoint(
+                    lambda _x, _d, _ps: layer(_x, _d, initial_state=_ps, return_last_state=True),
+                    x, delta, p_state, use_reentrant=False
+                )
             else:
-                x = layer(x, delta) 
+                res = layer(x, delta, initial_state=p_state, return_last_state=return_last_state)
+                if return_last_state:
+                    x, n_state = res
+                else:
+                    x = res
+                    n_state = p_state # dummy
+            
+            if return_last_state:
+                next_states.append(n_state)
+                
         x = self.dropout(x)
         x = self.out_proj(x)
         
-        return x + residual
+        out = x + residual
+        
+        if return_last_state:
+            return out, next_states
+        return out

@@ -205,78 +205,59 @@ class VideoMambaSystem(L.LightningModule):
             ref_patch_p = ref_patch.transpose(2, 3) # [B, 1, P, D]
             ref_patch_infused = self._infuse_identity(ref_patch_p, ref_mask_emb)
             
-            # 3. Recursive Sequence Processing
-            # For 80% potential, we feed the PREVIOUS mask back into the CURRENT frame
-            # This turns the SSM into a stateful tracker
-            
+            # 3. State-Aware Recurrent Sequence Processing (O(T))
             all_preds_seg = []
-            # Initialize recursive mask with the reference mask
-            prev_mask_emb = ref_mask_emb # [B, P, D]
+            
+            # Initialize SSM hidden states for each layer 
+            ssm_states = None 
+            
+            # Initial prediction for "previous mask" starts with the reference mask
+            if ref_mask.ndim == 3: # [B, H_orig, W_orig]
+                prev_mask_v = ref_mask.unsqueeze(1).float() / (self.hparams.num_seg_classes - 1)
+            else: # probabilities [B, C, H, W]
+                prev_mask_v = torch.max(ref_mask, dim=1, keepdim=True)[0]
             
             # We process query frames one by one to allow mask feedback
             # Note: During training, we can parallelize if we don't have feedback, 
             # but for "Memory Bank" we need recursion.
             
-            # Initial sequence state: Start with reference
-            current_seq = ref_patch_infused # [B, 1, P, D]
+            # Step 1: "Warm up" the SSM with the reference frame
+            ref_flattened = ref_patch_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
+            _, ssm_states = self.temporal_model(ref_flattened, return_last_state=True)
             
+            # Step 2: Recurrent processing of query frames
             for t in range(T):
-                # Current frame patches
+                # t-th query frame patches
                 curr_patch = query_patch[:, t:t+1].transpose(2, 3) # [B, 1, P, D]
                 
-                # INFUSE PREVIOUS MASK into CURRENT FRAME
-                # This is the "Memory Bank" feedback loop
-                curr_infused = self._infuse_identity(curr_patch, prev_mask_emb)
+                # Feedback the previous mask information into the patches
+                curr_infused = self._infuse_identity(curr_patch, ref_mask_emb if t==0 else prev_mask_emb)
                 
-                # Update sequence
-                current_seq = torch.cat([current_seq, curr_infused], dim=1)
+                # SSM temporal update (Linear O(T))
+                curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
+                last_feat_flattened, ssm_states = self.temporal_model(
+                    curr_flattened, 
+                    prev_states=ssm_states, 
+                    return_last_state=True
+                )
                 
-                # Apply SSM to the whole sequence so far (or just the step)
-                # For efficiency we group patches: [B*P, len, D]
-                seq_len = current_seq.shape[1]
-                seq_flattened = current_seq.permute(0, 2, 1, 3).reshape(B * P, seq_len, -1)
+                # Reshape to [B, 1, D, P] for decoding
+                last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
                 
-                # SSM temporal update
-                ssm_out = self.temporal_model(seq_flattened) # [B*P, len, D]
-                
-                # Get the latest frame's features
-                last_feat = ssm_out[:, -1:, :].reshape(B, P, 1, -1).permute(0, 2, 3, 1) # [B, 1, D, P]
-                
-                # 4. Hierarchical Decoding (using all scale features for frame t)
-                # Extract frame-specific ms features
+                # 4. Hierarchical Masked Decoding
+                # Pass prev_mask_v to decoder to guide which DINO features to gate
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
-                
-                # Decode mask
-                logits_t = self.seg_decoder(last_feat, frame_ms) # [B, 1, C, H, W]
+                logits_t = self.seg_decoder(last_feat, frame_ms, prev_mask=prev_mask_v)
                 all_preds_seg.append(logits_t)
                 
-                # 5. Update Recursive Mask for next step (based on propagation_mode)
-                prop_mode = self.hparams.propagation_mode
-                sr = self.hparams.scheduled_sampling_rate
-
-                if prop_mode == "direct_feature":
-                    # Pass raw SSM features directly - no mask bottleneck
-                    # last_feat is [B, 1, D, P] -> reshape to [B, P, D]
-                    prev_mask_emb = self.feat_proj(
-                        last_feat.squeeze(1).permute(0, 2, 1)  # [B, P, D_infused]
-                    )  # [B, P, dim_in]
-
-                elif prop_mode == "teacher_forcing" and self.training:
-                    # Use ground truth mask embedding during training (sampled by scheduled_sampling_rate)
-                    # Note: gt_mask_t is the query mask at timestep t (passed in during training)
-                    # Fallback to soft_mask if no GT available
-                    use_pred = (torch.rand(1).item() < sr)
-                    if use_pred:
-                        pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
-                        prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
-                    else:
-                        # For teacher forcing we use prev soft mask as no GT access in forward
-                        pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
-                        prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
-
-                else: # soft_mask (default)
-                    pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1) # [B, C, H, W]
-                    prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
+                # 5. Prepare Feedback for next step
+                pred_probs_t = torch.softmax(logits_t.squeeze(1), dim=1)
+                
+                # Update visual mask guidance for decoder
+                prev_mask_v = torch.max(pred_probs_t[:, 1:], dim=1, keepdim=True)[0]
+                
+                # Update embedding for patch infusion
+                prev_mask_emb = self._get_mask_embedding(pred_probs_t, h, w)
             
             logits_seg = torch.cat(all_preds_seg, dim=1)
             ssm_cls = query_cls # Simplification for classification heads in VOS mode

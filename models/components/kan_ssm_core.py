@@ -652,7 +652,9 @@ class IntricateKANSSMCore(nn.Module):
         self,
         x: Float[torch.Tensor, "B T D"],
         delta: Float[torch.Tensor, "B T 1"],
-    ) -> Float[torch.Tensor, "B T D"]:
+        initial_state: Optional[Float[torch.Tensor, "B N 1"]] = None,
+        return_last_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Selective scan with KAN-modulated B and C matrices (fully optimized).
         
         This method implements the core 'Temporal Modeling' step of the Training/Inference processes.
@@ -661,91 +663,19 @@ class IntricateKANSSMCore(nn.Module):
         Args:
             x: Input sequence [batch, seq_len, inner_dim].
             delta: Step sizes [batch, seq_len, 1].
+            initial_state: Optional initial hidden state [batch, state_dim, 1].
+            return_last_state: Whether to return the final hidden state.
             
         Returns:
-            Output sequence [batch, seq_len, inner_dim].
+            Output sequence [batch, seq_len, inner_dim] or 
+            tuple (output, final_state).
         """
         batch, seq_len, _ = x.shape
         device = x.device
         dtype = x.dtype
         
-        # === OPTIMIZED KERNEL PATH (Mamba SSM) ===
-        if self.use_mamba_kernels:
-            # Prepare inputs for selective_scan_fn
-            # Expected shapes:
-            # u: [B, D, L]
-            # delta: [B, D, L]
-            # A: [D, N]
-            # B: [B, N, L] 
-            # C: [B, N, L] 
-            
-            # 1. Transpose x and delta to [B, D, L]
-            u_ssm = x.transpose(1, 2)
-            delta_ssm = delta.transpose(1, 2)
-            
-            # 2. Compute Modulated B and C
-            x_flat = x.reshape(batch * seq_len, -1)
-            
-            # B Modulation
-            if self.modulate_B:
-                # [B*T, N, D] -> [B, T, N, D] -> [B, D, N, T] ? 
-                # Mamba expects B matrix of shape [B, N, L] (typically input-independent B per channel means G=1)
-                # KAN-Mamba modulates B per 'timestep'.
-                # selective_scan_fn supports variable B if it has shape [B, G, N, L] or [B, N, L].
-                
-                # Let's assume standard mamba mode where we produce B_t per step
-                B_mod_flat = self._compute_B_modulation_batched(x_flat) # [B*T, N, D]
-                # We need to reduce D. Standard Mamba projects to N directly (D->N).
-                # Here we have [N, D] full matrix.
-                # optimized kernels often assume B is [B, G, N, L].
-                # Our intricate design allows full B matrix [N, D].
-                # Making this compatible with standard selective_scan is TRICKY because 
-                # standard scan assumes diagonal or low-rank structure usually implicitly.
-                # Actually, selective_scan_fn takes B: (batch, d_state, seqlen) !!!
-                # This implies B is shared across channels D, or we have groups.
-                
-                # CRITICAL: If we want to use mamba_ssm kernels, we must conform to its constraints.
-                # Typically B is (B, N, L). This means B projects u_t (D) -> state (N) using a rank-1 projection u_t * B_t?
-                # No, standard Mamba: dx/dt = A x + B u. A is diagonal (D, N). B is (B, N, L).
-                # u is (B, D, L).
-                # Wait, standard Mamba B is (B, N, L). This means B is NOT a matrix [N, D]. 
-                # It effectively broadcasts or dots?
-                # In Mamba paper: B_t is (N,). So u_t * B_t is not possible if u_t is (D,)
-                # Actually in Mamba, B_projection outputs (B, G, N, L).
-                # Then x = A x + B * u.
-                # If u is (B, D, L) and B is (B, N, L), how does it multiply?
-                # It's usually elementwise broadcast over D (input channels) if N=N and we just scale?
-                pass
-                
-                # For now, to be safe and fast, if we are using the 'Intricate' dense B [N, D] concept,
-                # it is NOT compatible with standard `selective_scan_fn` which expects simpler B structure.
-                # HOWEVER, if our modulation is "element" or "factor", maybe we can adapt.
-                
-                # Fallback: If we can't map to selective_scan_fn easily, we must use the manual path.
-                # Given 'Intricate' KAN-SSM defined B as matrix [N, D], this is fully general SSM.
-                # Mamba's selective_scan is for Diagonal/Structured SSM.
-                # A is diagonal in our init (HiPPO).
-                
-                # A is [N, N] in our code, but `selective_scan_fn` expects A to be [D, N] (diagonal per channel).
-                # Our A is full matrix [N, N].
-                # selective_scan_fn ONLY supports Diagonal A.
-                
-                # CONCLUSION: We CANNOT use `selective_scan_fn` directly with full matrix A!
-                # Our code uses `A_expm = torch.matrix_exp`. This implies A is dense.
-                # Mamba relies on A being diagonal for speed.
-                
-                # Optimization Strategy Update:
-                # We can only use `mamba_ssm` if we Diagonalize A.
-                # HiPPO A is NOT diagonal. However, it can be approximated or we can diagonalize it.
-                # But for this specific task, keeping the "Intricate" design (Dense A) means we are bound to Python loops or custom CUDA.
-                
-                # FORCE FALLBACK to Python Loop if A is not diagonal?
-                # Actually, let's keep Python loop for correctness but implement optimizations:
-                # 1. Batched modulation (already done).
-                # 2. FastKAN (done).
-                # 3. Use JIT compilation?
-                
-                pass
+        # === OPTIMIZED KERNEL PATH (NOT COMPATIBLE WITH INTENSE B DISCRETIZATION) ===
+        # (Keeping the infrastructure but following the Python path for full SSM)
 
         # === PRECOMPUTE ALL MODULATIONS FOR ALL TIMESTEPS ===
         x_flat = x.reshape(batch * seq_len, -1)  # [B*T, D]
@@ -775,36 +705,25 @@ class IntricateKANSSMCore(nn.Module):
         eye = self.eye_state.to(device=device, dtype=dtype)
         
         # We use a robust discretization for the integral: (exp(A*delta) - I) * A^-1
-        # For better stability, especially if A is learnable, we use a Taylor approximation
-        # for cases where A might be singular or poorly conditioned.
-        # Fallback to Euler discretization (B_disc = delta * B) if solve fails or is unstable.
-        
         A_expand = self.A.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1, -1)
         A_flat = A_expand.reshape(batch * seq_len, self.state_dim, self.state_dim)
         diff_flat = (A_expm_flat - eye)
         
         try:
             # Try to solve the ZOH integral: A * integral = exp(A*delta) - I
-            # Add small epsilon to diagonal for stability
             A_stable = A_flat + 1e-6 * eye.unsqueeze(0)
             integral_flat = torch.linalg.solve(A_stable, diff_flat)
-            
-            # Sanity check for NaNs in solve
             if torch.isnan(integral_flat).any():
-                # Fallback to first-order approximation
                 integral_flat = delta_expanded.view(-1, 1, 1) * (eye.unsqueeze(0) + 0.5 * A_scaled_flat)
         except RuntimeError:
-            # Fallback to first-order approximation
             integral_flat = delta_expanded.view(-1, 1, 1) * (eye.unsqueeze(0) + 0.5 * A_scaled_flat)
             
         integral_all = integral_flat.view(batch, seq_len, self.state_dim, self.state_dim)
-        
         B_disc_all = torch.einsum('btij,btjd->btid', integral_all, B_mod_all)  # [B, T, N, D]
         
         # === SEQUENTIAL STATE UPDATES (fundamental RNN constraint) ===
-        # Collect all states for vectorized output computation
         states_all = x.new_zeros(batch, seq_len, self.state_dim, 1)  # [B, T, N, 1]
-        state = x.new_zeros(batch, self.state_dim, 1)
+        state = initial_state if initial_state is not None else x.new_zeros(batch, self.state_dim, 1)
         
         for t in range(seq_len):
             u_t = x[:, t, :]  # [B, D]
@@ -817,10 +736,10 @@ class IntricateKANSSMCore(nn.Module):
             states_all[:, t, :, :] = state
         
         # === VECTORIZED OUTPUT COMPUTATION ===
-        # outputs[b, t] = C_mod[b, t] @ states[b, t]
-        # C_mod_all: [B, T, D, N], states_all: [B, T, N, 1]
         outputs = torch.einsum('btdn,btn->btd', C_mod_all, states_all.squeeze(-1))  # [B, T, D]
         
+        if return_last_state:
+            return outputs, state
         return outputs
     
     def _compute_B_modulation_batched(
