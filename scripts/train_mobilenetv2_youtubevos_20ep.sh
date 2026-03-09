@@ -45,6 +45,7 @@ python train.py \
     model=mobilenetv2 \
     datamodule=youtubevos \
     ++model.target_size=480 \
+    ++model.max_epochs=20 \
     ++trainer.max_epochs=20 \
     ++trainer.precision="16-mixed" \
     ++logger.name="mobilenetv2_ytvos_20ep" \

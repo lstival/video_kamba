@@ -683,7 +683,13 @@ class VideoMambaSystem(L.LightningModule):
         # CosineAnnealingLR decays LR every epoch regardless of any metric,
         # preventing the overshot that occurs when ReduceLROnPlateau never fires
         # because val_loss keeps monotonically decreasing even as J&F collapses.
-        t_max = self.trainer.max_epochs if self.trainer is not None else 20
+        # Read T_max robustly: prefer trainer.max_epochs if already bound, else
+        # fall back to the hparam (pass max_epochs=20 via ++model.max_epochs=20)
+        # or a hardcoded default so the schedule is always well-defined.
+        if self.trainer is not None and getattr(self.trainer, "max_epochs", None):
+            t_max = self.trainer.max_epochs
+        else:
+            t_max = getattr(self.hparams, "max_epochs", 20)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=t_max,
