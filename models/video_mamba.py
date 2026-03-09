@@ -169,20 +169,25 @@ class VideoMambaSystem(L.LightningModule):
     # ------------------------------------------------------------------
 
     def _map_ms_features(self, raw: dict) -> dict:
-        """Map raw encoder output to the canonical stage keys used internally.
+        """Map raw encoder output to the canonical stage keys used for SSM/memory-bank input.
 
         Returns a dict with keys ``"stage_3"``, ``"stage_2"``, ``"stage_1"``
-        containing the primary, secondary and tertiary spatial feature tensors
-        respectively, **at the resolutions expected by downstream modules**.
+        representing the primary, secondary and tertiary features **for SSM /
+        reference-memory purposes**.  Decoder skip connections use
+        ``_build_dec_ms()`` instead, which routes the encoder-native multi-scale
+        features to the correct decoder levels.
 
-        For DINOv2 all three are at 14×14 (768-ch each).
-        For MobileNetV2 they are at 14×14 (256ch), 28×28 (32ch), 56×56 (24ch).
+        For DINOv2 all three are at 14×14 (768-ch each) — same skip and SSM features.
+        For MobileNetV2 ``stage_3`` is the projected 256-ch SSM input; ``stage_2``
+        and ``stage_1`` are the stride-8/stride-4 features used internally but
+        **not** as decoder up1/up2/up3 skips (those have different channel widths
+        handled by ``_build_dec_ms``).
         """
         if self.hparams.encoder_type == "mobilenetv2":
             return {
-                "stage_3": raw["stage_3"],  # 256-ch, stride-16 (SSM + up1 self-skip)
-                "stage_2": raw["stage_1"],  # 32-ch,  stride-8  (decoder up2 genuine ↑)
-                "stage_1": raw["stage_0"],  # 24-ch,  stride-4  (decoder up3 genuine ↑)
+                "stage_3": raw["stage_3"],  # 256-ch, stride-16 — projected SSM/memory-bank input
+                "stage_2": raw["stage_1"],  # 32-ch,  stride-8  — NOT used in VOS path (see _build_dec_ms)
+                "stage_1": raw["stage_0"],  # 24-ch,  stride-4  — NOT used in VOS path (see _build_dec_ms)
             }
         # DINOv2 (default)
         return {
@@ -401,7 +406,19 @@ class VideoMambaSystem(L.LightningModule):
             # [B*P, T, D] → [B, P, T, D] → [B, T, D, P]
             infused_patches = ssm_out_raw.reshape(B, P, T, D).permute(0, 2, 3, 1)
             ssm_cls = ssm_out_raw.reshape(B, P, T, D).mean(dim=1)  # [B, T, D]
-            logits_seg = self.seg_decoder(infused_patches, query_features_ms)
+            # For MobileNetV2 the decoder skips differ from the SSM input:
+            #   query_features_ms["stage_3"] = 256-ch (SSM input), but
+            #   the decoder's up1 block expects 96-ch (raw stage_2, same spatial).
+            # query_features_ms is only correct for DINOv2 (all stages 768-ch, same spatial).
+            if self.hparams.encoder_type == "mobilenetv2":
+                dec_ms_full = {
+                    "stage_3": query_features_raw["stage_2"],  # 96-ch, 14×14 — up1 skip
+                    "stage_2": query_features_raw["stage_1"],  # 32-ch, 28×28 — up2 skip
+                    "stage_1": query_features_raw["stage_0"],  # 24-ch, 56×56 — up3 skip
+                }
+            else:
+                dec_ms_full = query_features_ms
+            logits_seg = self.seg_decoder(infused_patches, dec_ms_full)
 
         # ── 8. Classification and detection heads ───────────────────────
         logits_clf = self.clf_head(ssm_cls)
@@ -635,17 +652,31 @@ class VideoMambaSystem(L.LightningModule):
         lr = self.hparams.learning_rate
 
         # Separate propagation parameters — they need a higher LR because
-        # the decoder's frozen-backbone skip connections provide a gradient
-        # shortcut that prevents Q-K alignment in the attention path.
+        # the attention Q-K alignment starts from random init while the backbone
+        # features are already informative.
         # Diagnostic: attention entropy = 0.978 (near-uniform) confirmed this.
         prop_params = list(self.memory_bank.parameters()) + list(self.propagation_attention.parameters())
         prop_ids = {id(p) for p in prop_params}
-        base_params = [p for p in self.parameters() if id(p) not in prop_ids]
+
+        # For a trainable encoder (MobileNetV2) the backbone must use a much
+        # lower LR than the randomly-initialised heads to preserve the pretrained
+        # ImageNet features.  Applying the full lr=1e-4 corrupts the backbone
+        # early in training and causes the characteristic val-J&F plateau.
+        backbone_params = list(self.feature_extractor.parameters())
+        backbone_ids = {id(p) for p in backbone_params}
+
+        base_params = [
+            p for p in self.parameters()
+            if id(p) not in prop_ids and id(p) not in backbone_ids
+        ]
+
+        backbone_lr = lr * 0.1 if self.hparams.encoder_type == "mobilenetv2" else lr * 0.01
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": prop_params, "lr": lr * 10},
-                {"params": base_params, "lr": lr},
+                {"params": prop_params,    "lr": lr * 10},
+                {"params": base_params,    "lr": lr},
+                {"params": backbone_params, "lr": backbone_lr},
             ],
             weight_decay=1e-2,
         )
