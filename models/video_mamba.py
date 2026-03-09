@@ -8,6 +8,7 @@ from utils.davis_metrics import DAVISMetric
 from utils.vos_loss import HybridVOSLoss
 
 from models.components.dinov3_wrapper import DinoV3Wrapper
+from models.components.mobilenetv2_wrapper import MobileNetV2Wrapper
 from models.components.kanga_ssm import KangaSSM
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
@@ -44,7 +45,7 @@ class VideoMambaSystem(L.LightningModule):
 
     def __init__(
         self,
-        dim_in: int = 768,             # DINOv2 ViT-B/14 dim (was 384 Hiera)
+        dim_in: int = 768,             # DINOv2 ViT-B/14 dim; 256 for MobileNetV2
         dim_out: int = 256,
         num_clf_classes: int = 51,
         num_seg_classes: int = 11,
@@ -53,6 +54,19 @@ class VideoMambaSystem(L.LightningModule):
         learning_rate: float = 1e-4,
         vos_loss_beta: float = 0.5,
         use_ref_context: bool = True,
+        # ── Encoder ────────────────────────────────────────────────────────
+        # "dino"        : DINOv2 ViT-B/14 (frozen), 768-dim, single-scale 14×14
+        # "mobilenetv2" : AOT-style MobileNetV2 (trainable), 256-dim, multi-scale
+        encoder_type: str = "dino",
+        # Fine-scale dim fed into MemoryBank dual-scale key (-1 → same as dim_in).
+        # MobileNetV2: 96 (pre-projection 16× features at same spatial as stage_3).
+        dim_in_fine: int = -1,
+        # Decoder up2 skip dim (-1 → same as dim_in).
+        # MobileNetV2: 32 (stride-8 features, genuine 28×28 spatial level).
+        dim_in_s2: int = -1,
+        # Decoder up3 skip dim (-1 → same as dim_in).
+        # MobileNetV2: 24 (stride-4 features, genuine 56×56 spatial level).
+        dim_in_s1: int = -1,
         # Memory-attention propagation
         prop_d_key: int = 256,
         prop_d_value: int = 256,
@@ -73,18 +87,31 @@ class VideoMambaSystem(L.LightningModule):
         consistency_weight: float = 0.0,
         # Phase 2: dual-scale memory keys (Stage 3 semantic + Stage 2 fine-grained)
         prop_use_dual_scale: bool = True,
+        # MobileNetV2-specific
+        mv2_output_stride: int = 16,
+        mv2_freeze_at: int = 0,
+        mv2_pretrained: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        # DINO layers mapped to hierarchical stages:
-        # stage_3 (semantic)   <- layer_11 (768)
-        # stage_2 (fine)       <- layer_9  (768)
-        # stage_1 (spatial)    <- layer_6  (768)
-        dim_fine = dim_in  # Layer 9: 768
-        dim_s1   = dim_in  # Layer 6: 768
+        # ── Resolve per-encoder skip dims ───────────────────────────────
+        # dim_in_fine : fine-scale dim for MemoryBank dual-scale key
+        # dim_in_s2   : decoder up2 skip (one level coarser than stage_3 spatially)
+        # dim_in_s1   : decoder up3 skip (two levels coarser)
+        _dim_fine = dim_in if dim_in_fine < 0 else dim_in_fine
+        _dim_s2   = dim_in if dim_in_s2   < 0 else dim_in_s2
+        _dim_s1   = dim_in if dim_in_s1   < 0 else dim_in_s1
 
-        self.feature_extractor = DinoV3Wrapper(freeze=True)
+        # ── Encoder ────────────────────────────────────────────────────
+        if encoder_type == "mobilenetv2":
+            self.feature_extractor = MobileNetV2Wrapper(
+                output_stride=mv2_output_stride,
+                freeze_at=mv2_freeze_at,
+                pretrained=mv2_pretrained,
+            )
+        else:  # "dino" (default — backward compatible)
+            self.feature_extractor = DinoV3Wrapper(freeze=True)
         self.temporal_model = KangaSSM(
             d_model=dim_in,
             d_state=ssm_d_state,
@@ -94,9 +121,16 @@ class VideoMambaSystem(L.LightningModule):
         )
         self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
+        # For MobileNetV2 the decoder skips use the pre-projection stage_2 (96ch)
+        # as up1 skip (same spatial), stage_1 (32ch) for up2, stage_0 (24ch) for up3.
+        # For DINO all three stages are at the same 14×14 resolution (768ch each).
+        _dec_up1_skip = _dim_fine  # up1: semantic refinement at same spatial as SSM
+        _dec_up2_skip = _dim_s2   # up2: first genuine upsample level
+        _dec_up3_skip = _dim_s1   # up3: second genuine upsample level
+
         self.seg_decoder = SegmentationDecoder(
             dim_ssm=dim_in,
-            skip_dims=(dim_in, dim_fine, dim_s1),  # Stage 3 / 2 / 1 channels
+            skip_dims=(_dec_up1_skip, _dec_up2_skip, _dec_up3_skip),
             num_classes=num_seg_classes,
             target_size=target_size,
             fusion_mode=fusion_mode,
@@ -105,7 +139,7 @@ class VideoMambaSystem(L.LightningModule):
         # PropagationAttention cross-attends query patches to the bank.
         self.memory_bank = MemoryBank(
             d_model=dim_in,
-            d_model_fine=dim_fine,
+            d_model_fine=_dim_fine,
             d_key=prop_d_key,
             d_value=prop_d_value,
             n_objects=num_seg_classes - 1,
@@ -129,7 +163,72 @@ class VideoMambaSystem(L.LightningModule):
         self.test_miou = JaccardIndex(task="multiclass", num_classes=num_seg_classes)
         self.davis_metric = DAVISMetric()
         self.vos_val_metric = DAVISMetric()  # reused for YouTube-VOS / MOSE val
-        
+
+    # ------------------------------------------------------------------
+    # Encoder-agnostic feature helpers
+    # ------------------------------------------------------------------
+
+    def _map_ms_features(self, raw: dict) -> dict:
+        """Map raw encoder output to the canonical stage keys used internally.
+
+        Returns a dict with keys ``"stage_3"``, ``"stage_2"``, ``"stage_1"``
+        containing the primary, secondary and tertiary spatial feature tensors
+        respectively, **at the resolutions expected by downstream modules**.
+
+        For DINOv2 all three are at 14×14 (768-ch each).
+        For MobileNetV2 they are at 14×14 (256ch), 28×28 (32ch), 56×56 (24ch).
+        """
+        if self.hparams.encoder_type == "mobilenetv2":
+            return {
+                "stage_3": raw["stage_3"],  # 256-ch, stride-16 (SSM + up1 self-skip)
+                "stage_2": raw["stage_1"],  # 32-ch,  stride-8  (decoder up2 genuine ↑)
+                "stage_1": raw["stage_0"],  # 24-ch,  stride-4  (decoder up3 genuine ↑)
+            }
+        # DINOv2 (default)
+        return {
+            "stage_3": raw["layer_11"],
+            "stage_2": raw["layer_9"],
+            "stage_1": raw["layer_6"],
+        }
+
+    def _get_fine_features(self, raw: dict, t: int | None = None) -> torch.Tensor:
+        """Return fine-scale patch tokens for dual-scale MemoryBank updates.
+
+        For DINOv2  → layer_9  (768-ch, 14×14 — deeper semantic than layer_11).
+        For MobileNetV2 → stage_2 (96-ch, 14×14 — pre-projection 16× features).
+
+        If ``t`` is given, selects frame ``t`` and permutes to ``[B, P, Ch]``.
+        Otherwise returns ``[B, T, Ch, P]`` without permuting.
+        """
+        key = "stage_2" if self.hparams.encoder_type == "mobilenetv2" else "layer_9"
+        feat = raw[key]
+        if t is not None:
+            return feat[:, t].permute(0, 2, 1)  # [B, P, Ch]
+        return feat  # [B, T, Ch, P]
+
+    def _build_dec_ms(self, raw: dict, t: int) -> dict:
+        """Build the decoder skip-connection dict for frame ``t``.
+
+        The SegmentationDecoder expects keys ``"stage_3"`` / ``"stage_2"`` /
+        ``"stage_1"`` as up1 / up2 / up3 skip features.
+
+        For DINOv2 these are the same multi-scale features used internally.
+        For MobileNetV2 the decoder skips are the *pre-projection* and lower
+        stride features, giving genuine multi-scale skip connections:
+
+            up1 skip  "stage_3"  ← MV2 stage_2  96-ch  14×14  (same-scale refinement)
+            up2 skip  "stage_2"  ← MV2 stage_1  32-ch  28×28  (first genuine upsample)
+            up3 skip  "stage_1"  ← MV2 stage_0  24-ch  56×56  (second genuine upsample)
+        """
+        if self.hparams.encoder_type == "mobilenetv2":
+            return {
+                "stage_3": raw["stage_2"][:, t:t+1],  # 96-ch, 14×14
+                "stage_2": raw["stage_1"][:, t:t+1],  # 32-ch, 28×28
+                "stage_1": raw["stage_0"][:, t:t+1],  # 24-ch, 56×56
+            }
+        ms = self._map_ms_features(raw)
+        return {k: v[:, t:t+1] for k, v in ms.items()}
+
     # ------------------------------------------------------------------
     # Batch type detection
     # ------------------------------------------------------------------
@@ -166,7 +265,7 @@ class VideoMambaSystem(L.LightningModule):
 
         For VOS (with ``ref_frame``/``ref_mask``):
 
-        1. Extract DINOv2 features for all query frames (backbone frozen).
+        1. Extract backbone features for all query frames.
         2. Encode the reference frame into the ``MemoryBank`` (K/V pairs with
            object ID embeddings injected into the values).
         3. For each query frame *t*:
@@ -195,29 +294,22 @@ class VideoMambaSystem(L.LightningModule):
 
         # ── 1. Spatial feature extraction ──────────────────────────────
         query_cls, query_features_raw = self.feature_extractor(x)
-        # Map DINO layers to the stage keys expected by downstream modules
-        query_features_ms = {
-            "stage_3": query_features_raw["layer_11"],
-            "stage_2": query_features_raw["layer_9"],
-            "stage_1": query_features_raw["layer_6"],
-        }
-        query_patch = query_features_ms["stage_3"]  # [B, T, 768, 196]
+        # Map raw encoder output → canonical stage keys for SSM / decoder
+        query_features_ms = self._map_ms_features(query_features_raw)
+        query_patch = query_features_ms["stage_3"]  # [B, T, dim_in, P]
         D, P = query_patch.shape[2], query_patch.shape[3]
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
             # ── 2. Reference feature extraction ────────────────────────
             _ref_cls, _ref_features_raw = self.feature_extractor(ref_frame.unsqueeze(1))
-            _ref_features_ms = {
-                "stage_3": _ref_features_raw["layer_11"],
-                "stage_2": _ref_features_raw["layer_9"],
-                "stage_1": _ref_features_raw["layer_6"],
-            }
-            ref_patch = _ref_features_ms["stage_3"]                 # [B, 1, 768, 196]
+            _ref_features_ms = self._map_ms_features(_ref_features_raw)
+            ref_patch = _ref_features_ms["stage_3"]  # [B, 1, dim_in, P]
             # [B, 1, D, P] → [B, P, D]
             ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
             # Fine-scale reference features for dual-scale memory key.
-            ref_patch_fine = _ref_features_ms["stage_2"].squeeze(1).permute(0, 2, 1)  # [B, P2, 768]
+            # DINOv2: layer_9 (768-ch, 14×14) | MobileNetV2: stage_2 (96-ch, 14×14)
+            ref_patch_fine = self._get_fine_features(_ref_features_raw, t=0)  # [B, P2, Ch]
 
             # ── 3. Initialise memory bank with reference frame ──────────
             self.memory_bank.encode_reference(ref_patch_p, ref_mask, ref_patch_fine)
@@ -232,9 +324,10 @@ class VideoMambaSystem(L.LightningModule):
 
             for t in range(T):
                 # Current frame patches: [B, D, P] → [B, P, D]
-                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, 384]
+                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, dim_in]
                 # Fine-scale patches for dual-scale memory update.
-                curr_patch_fine = query_features_ms["stage_2"][:, t].permute(0, 2, 1)  # [B, P2, 192]
+                # DINOv2: layer_9 (768-ch) | MobileNetV2: stage_2 (96-ch, 14×14)
+                curr_patch_fine = self._get_fine_features(query_features_raw, t=t)  # [B, P2, Ch]
 
                 # ── 4. Propagation: cross-attend to memory bank ─────────
                 K_mem, V_mem = self.memory_bank.get_memory()
@@ -258,8 +351,10 @@ class VideoMambaSystem(L.LightningModule):
                 )
 
                 # ── 6. Hierarchical decoding ────────────────────────────
-                # frame_ms passes all Hiera stages to the decoder (stage_1/2/3).
-                frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
+                # Decoder skip connections differ by encoder type:
+                # DINOv2: all stages at 14×14 (same resolution)
+                # MobileNetV2: stage_2(14×14), stage_1(28×28), stage_0(56×56) → genuine multi-scale
+                frame_ms = self._build_dec_ms(query_features_raw, t)
                 logits_t = self.seg_decoder(
                     last_feat, frame_ms, prev_mask=prev_guide_mask
                 )  # [B, 1, num_classes, H, W]

@@ -1,0 +1,61 @@
+# MobileNetV2 encoder configuration — AOT-style backbone
+# Replaces the frozen DINOv2 with a trainable MobileNetV2 (matching AOT's encoder).
+#
+# Key architecture differences vs default.yaml (DINOv2):
+#   Backbone     : MobileNetV2 (trainable) vs DINOv2 ViT-B/14 (frozen)
+#   dim_in       : 256  (after encoder_projector) vs 768
+#   dim_in_fine  : 96   (pre-projection 16× features, same spatial as stage_3)
+#   dim_in_s2    : 32   (stride-8 features, genuine 28×28 spatial level)
+#   dim_in_s1    : 24   (stride-4 features, genuine 56×56 spatial level)
+#   Token grids  : 14×14 (224p) / 28×28 (448p) / 30×30 (480p)
+#   Decoder skip : genuine multi-scale (vs same-scale 14×14 for DINOv2)
+_target_: models.video_mamba.VideoMambaSystem
+
+# ── Encoder ───────────────────────────────────────────────────────────────────
+encoder_type: mobilenetv2
+dim_in: 256               # stage_3 projected dim (matches AOT MODEL_ENCODER_EMBEDDING_DIM)
+dim_out: 256
+
+# Fine-scale dim for dual-scale MemoryBank key (pre-projection 16× features)
+dim_in_fine: 96           # MobileNetV2 stage_2 channels (96-ch at stride-16)
+# Decoder skip dims at genuinely different spatial resolutions
+dim_in_s2: 32             # stride-8  features → 28×28 tokens  (up2 skip)
+dim_in_s1: 24             # stride-4  features → 56×56 tokens  (up3 skip)
+
+# MobileNetV2-specific backbone settings
+mv2_output_stride: 16     # keep main features at stride 16 via dilation (AOT default)
+mv2_freeze_at: 0          # 0 = fully trainable; 1 = freeze 4× stage; etc.
+mv2_pretrained: true      # initialise from torchvision ImageNet-1K weights
+
+# ── Task heads ────────────────────────────────────────────────────────────────
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+
+# Input / output resolution
+# • 224×224 → 14×14 tokens  (fast, debug)
+# • 448×448 → 28×28 tokens  (recommended — matches DINOv2 quality range)
+# • 480×480 → 30×30 tokens  (AOT native — highest quality / most memory)
+target_size: 480
+learning_rate: 1e-4
+vos_loss_beta: 0.5
+fusion_mode: 'kan_spatial'
+modulator_type: 'kan'
+
+# ── Memory-Attention Propagation ──────────────────────────────────────────────
+prop_d_key: 256
+prop_d_value: 256
+prop_n_heads: 8
+prop_dropout: 0.1
+max_mem_frames: 5
+memory_update_freq: 1
+scheduled_sampling_rate: 0.0
+# Dual-scale memory: coarse (stage_3, 256-ch) + fine (stage_2, 96-ch pre-proj)
+prop_use_dual_scale: true
+
+# ── KAN-SSM ───────────────────────────────────────────────────────────────────
+ssm_d_state: 16
+ssm_layers: 1
+use_checkpointing: false
+use_ref_context: true
+consistency_weight: 0.0
