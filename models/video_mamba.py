@@ -537,9 +537,21 @@ class VideoMambaSystem(L.LightningModule):
         self.vos_val_metric.reset()
 
     def configure_optimizers(self):
+        lr = self.hparams.learning_rate
+
+        # Separate propagation parameters — they need a higher LR because
+        # the decoder's frozen-backbone skip connections provide a gradient
+        # shortcut that prevents Q-K alignment in the attention path.
+        # Diagnostic: attention entropy = 0.978 (near-uniform) confirmed this.
+        prop_params = list(self.memory_bank.parameters()) + list(self.propagation_attention.parameters())
+        prop_ids = {id(p) for p in prop_params}
+        base_params = [p for p in self.parameters() if id(p) not in prop_ids]
+
         optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.learning_rate,
+            [
+                {"params": prop_params, "lr": lr * 10},
+                {"params": base_params, "lr": lr},
+            ],
             weight_decay=1e-2,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

@@ -17,8 +17,10 @@
 #   2. MemoryBank void-pixel fix: void patches zeroed before ID embedding
 #   3. Gradient clipping (norm, val=1.0) via trainer default config
 #      (prevents gradient explosions through the T=16 propagation loop)
-#   4. ReduceLROnPlateau scheduler (patience=5, factor=0.5, min_lr=1e-6)
-#      (reduces LR when val_loss stalls → avoids overshooting minima)
+#   5. Differential LR: memory_bank + prop_attention get 10× LR (1e-3 vs 1e-4)
+#      Diagnostic showed attention entropy = 0.978 (near-uniform) — Q-K projections
+#      never learned to align because decoder skip connections (frozen Hiera) provided
+#      a gradient shortcut. Higher LR forces Q-K to become discriminative faster.
 #
 # Compare on Comet: train_loss_epoch curve slope vs baseline.
 # Target: smooth monotonic decrease in train_loss, lower val_loss by ep 15.
@@ -59,7 +61,7 @@ python train.py \
     ++model.fusion_mode="kan_spatial" \
     ++model.modulator_type="kan" \
     ++model.vos_loss_beta=0.5 \
-    ++logger.name="propagation_v2_20ep" \
+    ++logger.name="propagation_v3_20ep" \
     "$@"
 
 echo ""
