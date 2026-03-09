@@ -7,7 +7,7 @@ from torchmetrics import Accuracy, F1Score, Recall, JaccardIndex
 from utils.davis_metrics import DAVISMetric
 from utils.vos_loss import HybridVOSLoss
 
-from models.components.hiera_wrapper import HieraWrapper
+from models.components.dinov3_wrapper import DinoV3Wrapper
 from models.components.kanga_ssm import KangaSSM
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
@@ -25,11 +25,10 @@ class VideoMambaSystem(L.LightningModule):
     * **Multi-object VOS** – YouTube-VOS / MOSE style 6-element batches
       ``(ref_img, ref_mask, query_imgs, query_masks, obj_present, meta)``.
 
-    Phase 2 changes vs Phase 1:
-    - Backbone: Hiera-Base-Plus (MAE, ImageNet-1K) replaces DINOv2 ViT-B/14.
-    - ``dim_in`` defaults to 384 (Hiera Stage 3 channel width vs 768 DINOv2).
-    - MemoryBank dual-scale keys: Stage 3 (semantic) + Stage 2 (fine-grained).
-    - SegmentationDecoder: genuine FPN with native Stage 1/2/3 skip connections.
+    Phase 2 changes vs Phase 1 (Reverted to DINO):
+    - Backbone: DINOv2 ViT-B/14 (768-dim).
+    - MemoryBank dual-scale keys: Layer 11 (semantic) + Layer 9 (fine-grained).
+    - SegmentationDecoder: hierarchical fusion with DINO Layer 6/9/11 skip connections.
 
     Args:
         dim_in:              Primary feature dimension — Stage 3 channels (384).
@@ -45,7 +44,7 @@ class VideoMambaSystem(L.LightningModule):
 
     def __init__(
         self,
-        dim_in: int = 384,             # Hiera Stage 3 channels (was 768 DINOv2 ViT-B)
+        dim_in: int = 768,             # DINOv2 ViT-B/14 dim (was 384 Hiera)
         dim_out: int = 256,
         num_clf_classes: int = 51,
         num_seg_classes: int = 11,
@@ -78,12 +77,14 @@ class VideoMambaSystem(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Hiera stage channel widths inferred from dim_in (Stage 3).
-        # For hiera-base-plus-224: dim_in=384  → dim_fine=192, dim_s1=96.
-        dim_fine = dim_in // 2   # Stage 2: 192
-        dim_s1   = dim_in // 4   # Stage 1:  96
+        # DINO layers mapped to hierarchical stages:
+        # stage_3 (semantic)   <- layer_11 (768)
+        # stage_2 (fine)       <- layer_9  (768)
+        # stage_1 (spatial)    <- layer_6  (768)
+        dim_fine = dim_in  # Layer 9: 768
+        dim_s1   = dim_in  # Layer 6: 768
 
-        self.feature_extractor = HieraWrapper(freeze=True)
+        self.feature_extractor = DinoV3Wrapper(freeze=True)
         self.temporal_model = KangaSSM(
             d_model=dim_in,
             d_state=ssm_d_state,
@@ -193,20 +194,30 @@ class VideoMambaSystem(L.LightningModule):
         B, T, C, H, W = x.shape
 
         # ── 1. Spatial feature extraction ──────────────────────────────
-        query_cls, query_features_ms = self.feature_extractor(x)
-        # query_features_ms: {"stage_3": [B,T,384,196], "stage_2": [B,T,192,784], "stage_1": [B,T,96,3136]}
-        query_patch = query_features_ms["stage_3"]  # [B, T, 384, 196]
+        query_cls, query_features_raw = self.feature_extractor(x)
+        # Map DINO layers to the stage keys expected by downstream modules
+        query_features_ms = {
+            "stage_3": query_features_raw["layer_11"],
+            "stage_2": query_features_raw["layer_9"],
+            "stage_1": query_features_raw["layer_6"],
+        }
+        query_patch = query_features_ms["stage_3"]  # [B, T, 768, 196]
         D, P = query_patch.shape[2], query_patch.shape[3]
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
             # ── 2. Reference feature extraction ────────────────────────
-            _ref_cls, _ref_features_ms = self.feature_extractor(ref_frame.unsqueeze(1))
-            ref_patch = _ref_features_ms["stage_3"]                 # [B, 1, 384, 196]
+            _ref_cls, _ref_features_raw = self.feature_extractor(ref_frame.unsqueeze(1))
+            _ref_features_ms = {
+                "stage_3": _ref_features_raw["layer_11"],
+                "stage_2": _ref_features_raw["layer_9"],
+                "stage_1": _ref_features_raw["layer_6"],
+            }
+            ref_patch = _ref_features_ms["stage_3"]                 # [B, 1, 768, 196]
             # [B, 1, D, P] → [B, P, D]
             ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
             # Fine-scale reference features for dual-scale memory key.
-            ref_patch_fine = _ref_features_ms["stage_2"].squeeze(1).permute(0, 2, 1)  # [B, P2, 192]
+            ref_patch_fine = _ref_features_ms["stage_2"].squeeze(1).permute(0, 2, 1)  # [B, P2, 768]
 
             # ── 3. Initialise memory bank with reference frame ──────────
             self.memory_bank.encode_reference(ref_patch_p, ref_mask, ref_patch_fine)
