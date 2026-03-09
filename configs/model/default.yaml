@@ -2,10 +2,10 @@
 _target_: models.video_mamba.VideoMambaSystem
 
 # ── Backbone ─────────────────────────────────────────────────────────────────
-# facebook/hiera-base-plus-224 (MAE, ImageNet-1K) replaces DINOv2 ViT-B/14.
-# Stage dims: Stage1=96 Stage2=192 Stage3=384 Stage4=768.
+# hiera_base_plus_224 from facebookresearch/hiera (pip: hiera-transformer), MAE ImageNet-1K.
+# Stage dims: Stage1=112 Stage2=224 Stage3=448 Stage4=896.
 # dim_in drives all downstream modules (SSM, MemoryBank, ClassHead, etc.).
-dim_in: 384        # Stage 3 primary dim (was 768 with DINOv2 ViT-B/14)
+dim_in: 448        # Stage 3 primary dim for hiera_base_plus_224 (was 768 DINOv2 ViT-B/14)
 dim_out: 256
 # Classification head output classes (e.g. HMDB51 = 51)
 num_clf_classes: 51

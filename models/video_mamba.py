@@ -26,13 +26,13 @@ class VideoMambaSystem(L.LightningModule):
       ``(ref_img, ref_mask, query_imgs, query_masks, obj_present, meta)``.
 
     Phase 2 changes vs Phase 1:
-    - Backbone: Hiera-Base-Plus (MAE, ImageNet-1K) replaces DINOv2 ViT-B/14.
-    - ``dim_in`` defaults to 384 (Hiera Stage 3 channel width vs 768 DINOv2).
+    - Backbone: Hiera-Base-Plus (facebookresearch/hiera) replaces DINOv2 ViT-B/14.
+    - ``dim_in`` defaults to 448 (Hiera Stage 3, hiera_base_plus_224, vs 768 DINOv2).
     - MemoryBank dual-scale keys: Stage 3 (semantic) + Stage 2 (fine-grained).
     - SegmentationDecoder: genuine FPN with native Stage 1/2/3 skip connections.
 
     Args:
-        dim_in:              Primary feature dimension — Stage 3 channels (384).
+        dim_in:              Primary feature dimension — Stage 3 channels (448).
         dim_out:             Reserved projection dimension.
         num_clf_classes:     Action-classification output classes.
         num_seg_classes:     Segmentation channels (background + n_id).
@@ -45,7 +45,7 @@ class VideoMambaSystem(L.LightningModule):
 
     def __init__(
         self,
-        dim_in: int = 384,             # Hiera Stage 3 channels (was 768 DINOv2 ViT-B)
+        dim_in: int = 448,             # Hiera Stage 3 channels for hiera_base_plus_224
         dim_out: int = 256,
         num_clf_classes: int = 51,
         num_seg_classes: int = 11,
@@ -79,9 +79,9 @@ class VideoMambaSystem(L.LightningModule):
         self.save_hyperparameters()
 
         # Hiera stage channel widths inferred from dim_in (Stage 3).
-        # For hiera-base-plus-224: dim_in=384  → dim_fine=192, dim_s1=96.
-        dim_fine = dim_in // 2   # Stage 2: 192
-        dim_s1   = dim_in // 4   # Stage 1:  96
+        # For hiera_base_plus_224: dim_in=448 → dim_fine=224, dim_s1=112.
+        dim_fine = dim_in // 2   # Stage 2: 224
+        dim_s1   = dim_in // 4   # Stage 1: 112
 
         self.feature_extractor = HieraWrapper(freeze=True)
         self.temporal_model = KangaSSM(
