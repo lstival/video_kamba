@@ -68,9 +68,10 @@ class FastKANLayer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize RBF weights with small random values
-        nn.init.normal_(self.rbf_weight, mean=0.0, std=0.02)
-        
+        # std=0.1: gates start with meaningful activation rather than collapsing to
+        # sigmoid(≈0) ≈ 0.5 for the entire early training phase (Bug fix: previously 0.02).
+        nn.init.normal_(self.rbf_weight, mean=0.0, std=0.1)
+
         # Initialize base weights
         nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
 

@@ -278,10 +278,12 @@ class MemoryBank(nn.Module):
             mask_small = F.interpolate(
                 mask.unsqueeze(1).float(), size=(h, w), mode="nearest"
             ).long().squeeze(1)                          # [B, h, w]
-            mask_small[mask_small == 255] = 0            # void → background
+            void_mask = (mask_small == 255)              # [B, h, w] — track void before zeroing
+            mask_small[mask_small == 255] = 0            # void → bg index (for one-hot only)
             mask_small = mask_small.clamp(0, n_cls - 1)
             soft = F.one_hot(mask_small, num_classes=n_cls).float()  # [B, h, w, n_cls]
             soft = soft.reshape(B, P, n_cls)
+            soft[void_mask.reshape(B, P)] = 0.0          # suppress ID signal for void patches
         else:
             # Soft probability mask [B, C, H, W]
             C = mask.shape[1]
