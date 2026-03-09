@@ -207,12 +207,13 @@ class KANSpatialGatingUpBlock(nn.Module):
        out = out_conv(x̃ + G ⊙ skip)       [BT, out_ch, H, W]
     """
 
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, return_gate: bool = False):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, return_gate: bool = False, use_mask_guidance: bool = True):
         super().__init__()
         self.return_gate = return_gate
+        self.use_mask_guidance = use_mask_guidance
         self._last_gate: Optional[torch.Tensor] = None
 
-        # Step 0 — upsample temporal stream (preserves in_channels so proj can see full dim)
+        # Step 0 — upsample temporal stream
         self.upsample = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
 
         # Step 1 — lightweight 1×1 contextual projection
@@ -220,10 +221,11 @@ class KANSpatialGatingUpBlock(nn.Module):
         self.proj_bn = nn.BatchNorm2d(skip_channels)
 
         # Step 2 — FastKAN gate (pixel-wise, O(N·D))
-        # Input/output: [N_pixels, skip_channels] — no spatial pair interactions
-        self.gate_kan = FastKANLayer(skip_channels, skip_channels)
+        # If mask-guided, we add 1 channel for the previous mask
+        kan_in = skip_channels + 1 if use_mask_guidance else skip_channels
+        self.gate_kan = FastKANLayer(kan_in, skip_channels)
 
-        # Step 3 — lightweight output refinement (single 3×3 conv instead of two)
+        # Step 3 — output refinement
         self.out_conv = nn.Sequential(
             nn.Conv2d(skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -235,10 +237,7 @@ class KANSpatialGatingUpBlock(nn.Module):
         Args:
             x:    [BT, in_channels,   H/2, W/2]  — upsampled temporal feature
             skip: [BT, skip_channels, H,   W  ]  — DINOv2 high-res skip connection
-            prev_mask: Not used by this block, kept for API consistency.
-            ref_skip: Not used by this block, kept for API consistency.
-        Returns:
-            [BT, out_channels, H, W]
+            prev_mask: [BT, 1, H, W] — previous soft-mask guidance
         """
         # --- Upsample temporal stream ×2 spatially ---
         x_up = self.upsample(x)                                      # [BT, in_ch, H, W]
@@ -252,15 +251,27 @@ class KANSpatialGatingUpBlock(nn.Module):
 
         # --- FastKAN Spatial Gating ---
         BT, C_s, H, W = x_proj.shape
-        flat_proj = x_proj.permute(0, 2, 3, 1).reshape(BT * H * W, C_s)
-        flat_gate = torch.sigmoid(self.gate_kan(flat_proj))
+        
+        if self.use_mask_guidance and prev_mask is not None:
+            # Resize mask to current resolution if needed
+            if prev_mask.shape[-2:] != (H, W):
+                m_guide = nn.functional.interpolate(prev_mask, size=(H, W), mode='bilinear', align_corners=False)
+            else:
+                m_guide = prev_mask
+            
+            # Concatenate mask as an extra feature channel for the KAN gate
+            kan_input = torch.cat([x_proj, m_guide], dim=1) # [BT, C_s+1, H, W]
+        else:
+            kan_input = x_proj
+
+        flat_in = kan_input.permute(0, 2, 3, 1).reshape(-1, kan_input.shape[1])
+        flat_gate = torch.sigmoid(self.gate_kan(flat_in))
         gate = flat_gate.reshape(BT, H, W, C_s).permute(0, 3, 1, 2)   # [BT, skip_ch, H, W]
 
         if self.return_gate:
             self._last_gate = gate.detach()
 
         # --- Modulated Fusion ---
-        # Hadamard product gates the DINOv2 skip features
         fused = x_proj + (gate * skip)
 
         return self.out_conv(fused)
@@ -401,9 +412,10 @@ class SegmentationDecoder(nn.Module):
         # Top-down hierarchy: Layer 11 (SSM) -> 9 -> 6 -> 3
         # dim_ssm: Input from SSM (e.g., 1536 in concat mode)
         # dim_dinov2: Input from Dino skip connections (e.g., 768)
-        self.up1 = BlockClass(dim_ssm, skip_channels, 256) # From SSM/L11 to L9
-        self.up2 = BlockClass(256, skip_channels, 128) # From L9 to L6
-        self.up3 = BlockClass(128, skip_channels, 64)  # From L6 to L3
+        use_g = (self.fusion_mode in ["kan_spatial", "kan_cross_attn"])
+        self.up1 = BlockClass(dim_ssm, skip_channels, 256, use_mask_guidance=use_g) 
+        self.up2 = BlockClass(256, skip_channels, 128, use_mask_guidance=use_g) 
+        self.up3 = BlockClass(128, skip_channels, 64, use_mask_guidance=use_g)  
         
         self.final_head = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),

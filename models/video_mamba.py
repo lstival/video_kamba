@@ -91,8 +91,8 @@ class VideoMambaSystem(L.LightningModule):
         if propagation_mode == "direct_feature":
             self.feat_proj = nn.Linear(self.dim_infused, dim_in)
 
-        # Pixel-level matching attention (Experiment 1)
-        if propagation_mode == "pixel_matching":
+        # Pixel-level matching attention (Global Identity)
+        if propagation_mode in ["pixel_matching", "hybrid_flow"]:
             self.pixel_matching_attn = nn.MultiheadAttention(
                 embed_dim=dim_in, 
                 num_heads=8, 
@@ -100,7 +100,20 @@ class VideoMambaSystem(L.LightningModule):
                 vdim=self.dim_infused,
                 batch_first=True
             )
-            self.matching_norm = nn.LayerNorm(dim_in)
+            self.identity_norm = nn.LayerNorm(dim_in)
+
+        # Flow SSM (Local Motion)
+        if propagation_mode == "hybrid_flow":
+            # We use a smaller SSM for flow guidance
+            self.flow_ssm = KangaSSM(
+                d_model=self.dim_infused,
+                d_state=ssm_d_state // 2, # Half state for efficiency
+                num_layers=1,
+                modulator_type=modulator_type
+            )
+            # Projection to fuse matching + flow before decoder
+            self.flow_fusion = nn.Linear(dim_in + self.dim_infused, self.dim_infused)
+            self.flow_norm = nn.LayerNorm(self.dim_infused)
 
         # Hybrid VOS loss
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
@@ -225,6 +238,7 @@ class VideoMambaSystem(L.LightningModule):
             
             # Initialize SSM hidden states for each layer 
             ssm_states = None 
+            flow_states = None
             
             
             # We process query frames one by one to allow mask feedback
@@ -234,6 +248,14 @@ class VideoMambaSystem(L.LightningModule):
             # Step 1: "Warm up" the SSM with the reference frame
             ref_flattened = ref_patch_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
             _, ssm_states = self.temporal_model(ref_flattened, return_last_state=True)
+
+            if self.hparams.propagation_mode == "hybrid_flow":
+                # Warm up Flow SSM with shallow reference patches
+                # Use Layer 3 for texture-based motion initialization
+                shallow_ref = ref_features_ms["layer_3"].permute(0, 1, 3, 2)
+                shallow_ref_infused = self._infuse_identity(shallow_ref, ref_mask_emb)
+                shallow_ref_flat = shallow_ref_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
+                _, flow_states = self.flow_ssm(shallow_ref_flat, return_last_state=True)
             
             # Initial prediction for "previous mask" starts with the reference mask
             # We scale it to match the expected probability range if it's a hard mask
@@ -267,36 +289,47 @@ class VideoMambaSystem(L.LightningModule):
                 mask_emb = self._get_mask_embedding(feed_mask, h, w)
                 curr_infused = self._infuse_identity(curr_patch, mask_emb)
                 
-                # --- SSM vs Pixel Matching ---
+                # --- 3. Feature Propagation (SSM / Pixel Matching / Hybrid) ---
                 if self.hparams.propagation_mode == "pixel_matching":
-                    # Experiment 1: Direct Pixel Matching (No SSM)
-                    # Query attends to reference patches modulated by reference identity
-                    # ref_patch_infused is [B, 1, P, D] (if identity_mode=="add/mod") 
-                    # but if "concat" it's 2*D. We assume same dim for now or handle accordingly.
-                    
                     q = curr_patch.squeeze(1) # [B, P, D]
-                    # ref_patch_infused: [B, 1, P, D_infused]
-                    kv = ref_patch_infused.squeeze(1) # [B, P, D_infused]
-                    
-                    # Ensure dimensions match if using concat
-                    if kv.shape[-1] != q.shape[-1]:
-                        # Projection to query dim if needed, but for add/mod they match
-                        pass 
-
-                    # Attention Matching
+                    kv = ref_patch_infused.squeeze(1) # [B, P, D_inf]
                     attn_out, _ = self.pixel_matching_attn(query=q, key=kv, value=kv)
-                    last_feat_p = self.matching_norm(q + attn_out) # [B, P, D]
-                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) # [B, 1, D, P] -> [B, 1, D, P] (wait, decoder expects [B, 1, D, P])
+                    last_feat_p = self.identity_norm(q + attn_out)
+                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) 
+
+                elif self.hparams.propagation_mode == "hybrid_flow":
+                    # --- Stream A: Global Identity matching (Deep Layer) ---
+                    q_deep = curr_patch.squeeze(1) 
+                    kv_deep = ref_patch_infused.squeeze(1)
+                    target_identity, _ = self.pixel_matching_attn(query=q_deep, key=kv_deep, value=kv_deep)
+                    target_identity = self.identity_norm(target_identity)
+
+                    # --- Stream B: Local Motion Flow (Shallow Layer) ---
+                    # Use Layer 3 for texture-based motion
+                    shallow_patch = query_features_ms["layer_3"][:, t:t+1].permute(0, 1, 3, 2)
+                    shallow_infused = self._infuse_identity(shallow_patch, mask_emb)
+                    shallow_flat = shallow_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
+                    
+                    flow_out_flat, flow_states = self.flow_ssm(
+                        shallow_flat, 
+                        prev_states=flow_states, 
+                        return_last_state=True
+                    )
+                    flow_out = flow_out_flat.reshape(B, P, -1) # [B, P, D_inf]
+                    
+                    # --- Fusion: Identity + Flow ---
+                    combined = torch.cat([target_identity, flow_out], dim=-1)
+                    last_feat_p = self.flow_norm(self.flow_fusion(combined))
+                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) # [B, 1, D_inf, P]
+
                 else:
-                    # Original SSM temporal update (Linear O(T))
+                    # Original SSM temporal update
                     curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
                     last_feat_flattened, ssm_states = self.temporal_model(
                         curr_flattened, 
                         prev_states=ssm_states, 
                         return_last_state=True
                     )
-                    
-                    # Reshape for decoding
                     last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
                 
                 # --- 4. Hierarchical Masked Decoding (Cross-Attention Bridge) ---
