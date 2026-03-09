@@ -674,7 +674,7 @@ class VideoMambaSystem(L.LightningModule):
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": prop_params,    "lr": lr * 10},
+                {"params": prop_params,    "lr": lr * 5},   # 10→5: was overfitting to GT references
                 {"params": base_params,    "lr": lr},
                 {"params": backbone_params, "lr": backbone_lr},
             ],

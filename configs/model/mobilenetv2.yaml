@@ -49,7 +49,10 @@ prop_n_heads: 8
 prop_dropout: 0.1
 max_mem_frames: 5
 memory_update_freq: 1
-scheduled_sampling_rate: 0.0
+# 0.3 = use model's own predicted masks as memory 30% of the time during training.
+# This closes the train (GT reference) / val (predicted reference) distribution gap
+# that causes the J&F collapse at epoch 7-9 (exposure bias).
+scheduled_sampling_rate: 0.3
 # Dual-scale memory: coarse (stage_3, 256-ch) + fine (stage_2, 96-ch pre-proj)
 prop_use_dual_scale: true
 
