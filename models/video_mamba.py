@@ -58,6 +58,10 @@ class VideoMambaSystem(L.LightningModule):
         modulator_type: str = "kan",
         propagation_mode: str = "soft_mask", # "soft_mask", "direct_feature", "teacher_forcing"
         scheduled_sampling_rate: float = 0.0, # 0.0 = always use GT (teacher forcing), 1.0 = always use prediction
+        # Encoder fine-tuning: 0.0 = frozen, >0.0 = backbone LR multiplier (e.g. 0.1 → 1/10th of base LR)
+        encoder_lr_scale: float = 0.0,
+        # LR scheduler: "none", "cosine", "cosine_warmup"
+        lr_scheduler: str = "cosine_warmup",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -65,7 +69,7 @@ class VideoMambaSystem(L.LightningModule):
         # Adjusted dimension for identity injection
         self.dim_infused = dim_in * 2 if identity_mode == "concat" else dim_in
         
-        self.feature_extractor = DinoV3Wrapper(freeze=True)
+        self.feature_extractor = DinoV3Wrapper(freeze=(encoder_lr_scale == 0.0))
         self.temporal_model = KangaSSM(
             d_model=self.dim_infused,
             d_state=ssm_d_state,
@@ -532,9 +536,43 @@ class VideoMambaSystem(L.LightningModule):
         self.vos_val_metric.reset()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(), 
-            lr=self.hparams.learning_rate,
-            weight_decay=1e-2
-        )
-        return optimizer
+        lr = self.hparams.learning_rate
+        encoder_lr_scale = self.hparams.encoder_lr_scale
+
+        # Build parameter groups: optionally fine-tune encoder at a much smaller LR
+        encoder_params = list(self.feature_extractor.parameters())
+        encoder_param_ids = {id(p) for p in encoder_params}
+        decoder_params = [p for p in self.parameters() if id(p) not in encoder_param_ids]
+
+        if encoder_lr_scale > 0.0:
+            param_groups = [
+                {"params": decoder_params, "lr": lr, "name": "decoder"},
+                {"params": encoder_params, "lr": lr * encoder_lr_scale, "name": "encoder"},
+            ]
+        else:
+            # Encoder is fully frozen — only pass trainable (decoder) params
+            param_groups = [{"params": decoder_params, "lr": lr, "name": "decoder"}]
+
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-2)
+
+        scheduler_name = self.hparams.lr_scheduler
+        if scheduler_name == "none":
+            return optimizer
+
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = max(1, int(0.05 * total_steps))  # 5% warmup
+
+        if scheduler_name == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_steps, eta_min=lr * 1e-2
+            )
+        else:  # "cosine_warmup" (default)
+            from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+            warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+            cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=lr * 1e-2)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }

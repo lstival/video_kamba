@@ -22,3 +22,9 @@ modulator_type: 'kan'
 propagation_mode: 'soft_mask'
 # Scheduled sampling rate: 0.0=always use GT, 1.0=always use prediction
 scheduled_sampling_rate: 0.0
+# Encoder fine-tuning: 0.0=fully frozen (default), e.g. 0.1 unfreezes backbone at 1/10th base LR
+encoder_lr_scale: 0.0
+# LR scheduler: 'none', 'cosine', 'cosine_warmup'
+lr_scheduler: 'cosine_warmup'
+# Gradient checkpointing: reduces activation memory ~60% at cost of ~20% slower backward
+use_checkpointing: false
