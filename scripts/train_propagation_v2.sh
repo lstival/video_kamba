@@ -13,12 +13,15 @@
 #
 # Fixes applied vs propagation_fix_davis_50ep:
 #   1. KAN RBF weight init std: 0.02 → 0.1
-#      (gates start with meaningful activations; avoids 0.5-neutral collapse)
-#   2. MemoryBank void-pixel fix: void patches no longer inject background
-#      ID embedding signal (soft assignment zeroed for void regions)
+#      (gates start with meaningful activations; avoids 0.5-neutral phase)
+#   2. MemoryBank void-pixel fix: void patches zeroed before ID embedding
+#   3. Gradient clipping (norm, val=1.0) via trainer default config
+#      (prevents gradient explosions through the T=16 propagation loop)
+#   4. ReduceLROnPlateau scheduler (patience=5, factor=0.5, min_lr=1e-6)
+#      (reduces LR when val_loss stalls → avoids overshooting minima)
 #
-# Compare on Comet: val_vos_J_and_F at epoch 10 vs baseline.
-# Target: faster early learning → lower loss by epoch 10.
+# Compare on Comet: train_loss_epoch curve slope vs baseline.
+# Target: smooth monotonic decrease in train_loss, lower val_loss by ep 15.
 # ============================================================
 
 set -euo pipefail
