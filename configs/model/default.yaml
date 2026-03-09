@@ -1,7 +1,11 @@
-# Default model configuration
+# Default model configuration — Phase 2 (Hiera backbone)
 _target_: models.video_mamba.VideoMambaSystem
 
-dim_in: 768
+# ── Backbone ─────────────────────────────────────────────────────────────────
+# facebook/hiera-base-plus-224 (MAE, ImageNet-1K) replaces DINOv2 ViT-B/14.
+# Stage dims: Stage1=96 Stage2=192 Stage3=384 Stage4=768.
+# dim_in drives all downstream modules (SSM, MemoryBank, ClassHead, etc.).
+dim_in: 384        # Stage 3 primary dim (was 768 with DINOv2 ViT-B/14)
 dim_out: 256
 # Classification head output classes (e.g. HMDB51 = 51)
 num_clf_classes: 51
@@ -32,3 +36,6 @@ memory_update_freq: 1
 # Scheduled sampling for memory updates:
 # 0.0 = always use GT mask (teacher forcing), 1.0 = always use prediction
 scheduled_sampling_rate: 0.0
+# Phase 2: dual-scale memory keys (Stage 3 semantic + Stage 2 fine-grained).
+# Ablation: set prop_use_dual_scale=false to isolate the benefit of Stage 2 keys.
+prop_use_dual_scale: true

@@ -380,25 +380,48 @@ class KANRefinedCrossAttentionUpBlock(nn.Module):
 
 
 class SegmentationDecoder(nn.Module):
+    """Hierarchical Feature Fusion Decoder — genuine FPN with Hiera skip connections.
+
+    Fuses SSM temporal semantics with native multi-scale Hiera features:
+
+    +---------+------------------+------------------+
+    | Level   | Input resolution | Skip source      |
+    +=========+==================+==================+
+    | up1     | 14×14 → 14×14*   | Stage 3, 384-dim |
+    +---------+------------------+------------------+
+    | up2     | 14×14 → 28×28    | Stage 2, 192-dim |
+    +---------+------------------+------------------+
+    | up3     | 28×28 → 56×56    | Stage 1,  96-dim |
+    +---------+------------------+------------------+
+    | head    | 56×56 → 224×224  | —                |
+    +---------+------------------+------------------+
+
+    (*) up1 upsample ×2 then resizes back to skip's resolution; this acts as
+    a semantic refinement step at the same 14×14 scale.
+
+    Args:
+        dim_ssm:    SSM output channel dimension (384 for Hiera-B+).
+        skip_dims:  Tuple of (skip1, skip2, skip3) channel dims for up1/up2/up3.
+                    Defaults to Hiera-B+ native dims ``(384, 192, 96)``.
+        num_classes: Segmentation output channels (background + n_id).
+        target_size: Final spatial output resolution (default 224).
+        fusion_mode: Up-block variant — see block class map below.
     """
-    Hierarchical Feature Fusion Decoder.
-    Fuses deep SSM semantics with high-res intermediate DinoV2 features.
-    """
-    def __init__(self, dim_ssm: int = 768, dim_dinov2: int = 768, num_classes: int = 11, target_size: int = 224, compress_skip: bool = False, fusion_mode: str = "concat"):
+    def __init__(
+        self,
+        dim_ssm: int = 384,
+        skip_dims: tuple[int, int, int] = (384, 192, 96),
+        num_classes: int = 11,
+        target_size: int = 224,
+        fusion_mode: str = "kan_spatial",
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.target_size = target_size
-        self.compress_skip = compress_skip
         self.fusion_mode = fusion_mode
-        
-        skip_channels = 128 if compress_skip else dim_dinov2
-        
-        if compress_skip:
-            self.skip_conv1 = nn.Conv2d(dim_dinov2, 128, kernel_size=1)
-            self.skip_conv2 = nn.Conv2d(dim_dinov2, 128, kernel_size=1)
-            self.skip_conv3 = nn.Conv2d(dim_dinov2, 128, kernel_size=1)
 
-        # Allow dynamic selection of UpBlock
+        skip1, skip2, skip3 = skip_dims  # per-level channel dims
+
         BlockClass = {
             "concat": ConcatUpBlock,
             "fpn": FPNUpBlock,
@@ -409,87 +432,103 @@ class SegmentationDecoder(nn.Module):
             "kan_cross_attn": KANRefinedCrossAttentionUpBlock,
         }.get(self.fusion_mode, ConcatUpBlock)
 
-        # Top-down hierarchy: Layer 11 (SSM) -> 9 -> 6 -> 3
-        # dim_ssm: Input from SSM (e.g., 1536 in concat mode)
-        # dim_dinov2: Input from Dino skip connections (e.g., 768)
-        use_g = (self.fusion_mode in ["kan_spatial", "kan_cross_attn"])
-        self.up1 = BlockClass(dim_ssm, skip_channels, 256, use_mask_guidance=use_g) 
-        self.up2 = BlockClass(256, skip_channels, 128, use_mask_guidance=use_g) 
-        self.up3 = BlockClass(128, skip_channels, 64, use_mask_guidance=use_g)  
-        
+        use_g = self.fusion_mode in ("kan_spatial", "kan_cross_attn")
+
+        # Genuine top-down pyramid — each skip has a different spatial resolution.
+        # up1: SSM (14×14) fused with Stage 3 (14×14)  → 256-ch  (semantic refinement)
+        # up2: 256 (14×14) fused with Stage 2 (28×28)  → 128-ch  (first real upsample)
+        # up3: 128 (28×28) fused with Stage 1 (56×56)  →  64-ch  (second real upsample)
+        self.up1 = BlockClass(dim_ssm, skip1, 256, use_mask_guidance=use_g)
+        self.up2 = BlockClass(256,     skip2, 128, use_mask_guidance=use_g)
+        self.up3 = BlockClass(128,     skip3,  64, use_mask_guidance=use_g)
+
         self.final_head = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, num_classes, kernel_size=1)
+            nn.Conv2d(32, num_classes, kernel_size=1),
         )
-        
+
     def forward(
-        self, 
-        ssm_output: Float[torch.Tensor, "B T D P"], 
-        dino_features: dict,
+        self,
+        ssm_output: Float[torch.Tensor, "B T D P"],
+        skip_features: dict,
         prev_mask: Optional[torch.Tensor] = None,
         ref_features: Optional[dict] = None,
-        ref_mask: Optional[torch.Tensor] = None
+        ref_mask: Optional[torch.Tensor] = None,
     ) -> Float[torch.Tensor, "B T num_classes H W"]:
-        """
+        """Decode SSM temporal features into segmentation logits.
+
         Args:
-            ssm_output: Temporal context from Mamba [B, T, D, P]
-            dino_features: Multi-scale dictionary from DinoV3Wrapper
-            prev_mask: Optional previous frame mask [B, 1, H_orig, W_orig] or [B, T, 1, H, W]
-            ref_features: Optional reference frame multi-scale dictionary
-            ref_mask: Optional reference ground-truth mask [B, 1, H_orig, W_orig]
+            ssm_output:    Temporal context ``[B, T, D, P]`` from KangaSSM.
+                           P = 196 (14×14) for Hiera-B+.
+            skip_features: Multi-scale feature dict from HieraWrapper::
+
+                               "stage_3": [B, T, 384, 196]   # 14×14
+                               "stage_2": [B, T, 192, 784]   # 28×28
+                               "stage_1": [B, T,  96, 3136]  # 56×56
+
+            prev_mask:     Optional objectness prior ``[B, 1, H, W]``.
+            ref_features:  Optional reference multi-scale dict (same keys).
+            ref_mask:      Optional reference GT mask ``[B, 1, H, W]``.
+
+        Returns:
+            ``[B, T, num_classes, H, W]`` segmentation logits at *target_size*.
         """
         B, T, D_ssm, P = ssm_output.shape
-        h = w = int(P ** 0.5)
-        
-        # Flatten time for spatial ops
-        x = ssm_output.reshape(B * T, D_ssm, h, w)
-        
-        # Intermediate Dino features
-        # dino_features: {"layer_9": [B, T, D_dino, P], ...}
-        D_dino = dino_features["layer_9"].shape[2]
-        l9 = dino_features["layer_9"].reshape(B * T, D_dino, h, w)
-        l6 = dino_features["layer_6"].reshape(B * T, D_dino, h, w)
-        l3 = dino_features["layer_3"].reshape(B * T, D_dino, h, w)
+        h3 = w3 = int(P ** 0.5)  # 14 for Hiera Stage 3
 
-        # Reference anchors
-        ref_l9 = ref_l6 = ref_l3 = None
+        # ── Flatten time for 2-D spatial ops ────────────────────────────
+        x = ssm_output.reshape(B * T, D_ssm, h3, w3)  # [BT, 384, 14, 14]
+
+        # ── Hiera skip features ─────────────────────────────────────────
+        # Stage 3  14×14  384-ch  (same resolution as SSM output → semantic refinement)
+        s3_feat = skip_features["stage_3"]
+        h_s3 = w_s3 = int(s3_feat.shape[3] ** 0.5)        # 14
+        s3 = s3_feat.reshape(B * T, s3_feat.shape[2], h_s3, w_s3)  # [BT, 384, 14, 14]
+
+        # Stage 2  28×28  192-ch  (genuine upsample target for up2)
+        s2_feat = skip_features["stage_2"]
+        h_s2 = w_s2 = int(s2_feat.shape[3] ** 0.5)        # 28
+        s2 = s2_feat.reshape(B * T, s2_feat.shape[2], h_s2, w_s2)  # [BT, 192, 28, 28]
+
+        # Stage 1  56×56   96-ch  (genuine upsample target for up3)
+        s1_feat = skip_features["stage_1"]
+        h_s1 = w_s1 = int(s1_feat.shape[3] ** 0.5)        # 56
+        s1 = s1_feat.reshape(B * T, s1_feat.shape[2], h_s1, w_s1)  # [BT,  96, 56, 56]
+
+        # ── Reference anchors (optional, broadcast over T) ────────────────
+        ref_s3 = ref_s2 = ref_s1 = None
         if ref_features is not None:
-            # Broadcast reference features across all time steps in the batch
-            ref_l9 = ref_features["layer_9"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
-            ref_l6 = ref_features["layer_6"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
-            ref_l3 = ref_features["layer_3"].reshape(B, D_dino, h, w).repeat_interleave(T, dim=0)
-        
-        if self.compress_skip:
-            l9 = self.skip_conv1(l9)
-            l6 = self.skip_conv2(l6)
-            l3 = self.skip_conv3(l3)
-        
-        # Prepare auxiliary masks
+            def _broadcast_ref(feat):
+                D_r = feat.shape[2]
+                P_r = feat.shape[3]
+                hr = wr = int(P_r ** 0.5)
+                return feat.squeeze(1).reshape(B, D_r, hr, wr).repeat_interleave(T, dim=0)
+
+            ref_s3 = _broadcast_ref(ref_features["stage_3"])
+            ref_s2 = _broadcast_ref(ref_features["stage_2"])
+            ref_s1 = _broadcast_ref(ref_features["stage_1"])
+
+        # ── Spatial guide mask ──────────────────────────────────────────
         m_guidance = prev_mask
         if m_guidance is not None:
-            # Ensure 4D [BT, 1, H, W]
             if m_guidance.ndim == 5:
-                # Could be [B, T, C, H, W] or [B, T, 1, H, W]
                 m_guidance = m_guidance.reshape(B * T, -1, *m_guidance.shape[-2:])
-                if m_guidance.shape[1] > 1: # multi-channel prob mask
-                    m_guidance = m_guidance[:, 1:2] # take first object channel
+                if m_guidance.shape[1] > 1:
+                    m_guidance = m_guidance[:, 1:2]   # first object channel
             elif m_guidance.ndim == 3:
                 m_guidance = m_guidance.unsqueeze(1).repeat_interleave(T, dim=0)
             m_guidance = m_guidance.float()
-            
+
         r_mask = ref_mask
         if r_mask is not None:
-            # Ensure 4D [N, 1, H, W]
-            if r_mask.ndim == 5: # [B, 1, 1, H, W]
+            if r_mask.ndim == 5:
                 r_mask = r_mask.reshape(B, 1, *r_mask.shape[-2:])
-            elif r_mask.ndim == 3: # [B, H, W]
+            elif r_mask.ndim == 3:
                 r_mask = r_mask.unsqueeze(1)
-            r_mask = r_mask.float()
-            r_mask = r_mask.repeat_interleave(T, dim=0) # [B*T, 1, H, W]
+            r_mask = r_mask.float().repeat_interleave(T, dim=0)
 
-        # Recursive fusion
-        # Only KANSpatialGatingUpBlock and KANRefinedCrossAttentionUpBlock currently support ref_context
+        # ── Top-down FPN fusion ─────────────────────────────────────────
         def execute_up(block, current_x, skip_feat, r_skip, r_mask_g):
             if isinstance(block, KANRefinedCrossAttentionUpBlock):
                 return block(current_x, skip_feat, prev_mask=m_guidance, ref_skip=r_skip, ref_mask=r_mask_g)
@@ -498,18 +537,24 @@ class SegmentationDecoder(nn.Module):
             else:
                 return block(current_x, skip_feat)
 
-        x = execute_up(self.up1, x, l9, ref_l9, r_mask)
-        x = execute_up(self.up2, x, l6, ref_l6, r_mask)
-        x = execute_up(self.up3, x, l3, ref_l3, r_mask)
-        
-        logits = self.final_head(x) # [BT, num_classes, 112, 112]
-        
-        # Final upscale to target (e.g., 224)
+        # up1: 14×14 semantics + Stage-3 skip  → [BT, 256, 14×14]
+        # up2: 14→28 first genuine upsample   + Stage-2 skip  → [BT, 128, 28×28]
+        # up3: 28→56 second genuine upsample  + Stage-1 skip  → [BT,  64, 56×56]
+        x = execute_up(self.up1, x, s3, ref_s3, r_mask)
+        x = execute_up(self.up2, x, s2, ref_s2, r_mask)
+        x = execute_up(self.up3, x, s1, ref_s1, r_mask)
+
+        logits = self.final_head(x)   # [BT, num_classes, 56, 56]
+
+        # Final upscale to target_size (e.g. 56→224).
         if logits.shape[-1] != self.target_size:
             logits = nn.functional.interpolate(
-                logits, size=(self.target_size, self.target_size), 
-                mode='bilinear', align_corners=False
+                logits,
+                size=(self.target_size, self.target_size),
+                mode="bilinear",
+                align_corners=False,
             )
-            
+
         _, C, H, W = logits.shape
         return logits.reshape(B, T, C, H, W)
+

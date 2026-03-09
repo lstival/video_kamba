@@ -7,7 +7,7 @@ from torchmetrics import Accuracy, F1Score, Recall, JaccardIndex
 from utils.davis_metrics import DAVISMetric
 from utils.vos_loss import HybridVOSLoss
 
-from models.components.dinov3_wrapper import DinoV3Wrapper
+from models.components.hiera_wrapper import HieraWrapper
 from models.components.kanga_ssm import KangaSSM
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
@@ -16,7 +16,7 @@ from models.components.memory_bank import MemoryBank
 from models.components.propagation_attention import PropagationAttention
 
 class VideoMambaSystem(L.LightningModule):
-    """Multi-task video understanding model.
+    """Multi-task video understanding model — Phase 2 (Hiera backbone).
 
     Supports three task families configured purely through YAML:
 
@@ -25,22 +25,27 @@ class VideoMambaSystem(L.LightningModule):
     * **Multi-object VOS** – YouTube-VOS / MOSE style 6-element batches
       ``(ref_img, ref_mask, query_imgs, query_masks, obj_present, meta)``.
 
+    Phase 2 changes vs Phase 1:
+    - Backbone: Hiera-Base-Plus (MAE, ImageNet-1K) replaces DINOv2 ViT-B/14.
+    - ``dim_in`` defaults to 384 (Hiera Stage 3 channel width vs 768 DINOv2).
+    - MemoryBank dual-scale keys: Stage 3 (semantic) + Stage 2 (fine-grained).
+    - SegmentationDecoder: genuine FPN with native Stage 1/2/3 skip connections.
+
     Args:
-        dim_in:          Feature dimension from DinoV3 (default 768).
-        dim_out:         Projection dimension (unused by default, reserved).
-        num_clf_classes: Number of action-classification output classes
-                         (e.g. 51 for HMDB51).
-        num_seg_classes: Number of segmentation output channels
-                         (background + n_id, e.g. 11 for n_id=10).
-        num_boxes:       Fixed number of predicted bounding boxes per frame.
-        target_size:     Spatial resolution of segmentation output.
-        learning_rate:   AdamW base learning rate.
-        vos_loss_beta:   Beta for HybridVOSLoss (BCE weight; default 0.5).
+        dim_in:              Primary feature dimension — Stage 3 channels (384).
+        dim_out:             Reserved projection dimension.
+        num_clf_classes:     Action-classification output classes.
+        num_seg_classes:     Segmentation channels (background + n_id).
+        num_boxes:           Fixed predicted bounding boxes per frame.
+        target_size:         Spatial resolution of segmentation output.
+        learning_rate:       AdamW base learning rate.
+        vos_loss_beta:       Beta for HybridVOSLoss (BCE weight).
+        prop_use_dual_scale: Use Stage 2 fine-grained keys in MemoryBank.
     """
 
     def __init__(
         self,
-        dim_in: int = 768,
+        dim_in: int = 384,             # Hiera Stage 3 channels (was 768 DINOv2 ViT-B)
         dim_out: int = 256,
         num_clf_classes: int = 51,
         num_seg_classes: int = 11,
@@ -62,17 +67,23 @@ class VideoMambaSystem(L.LightningModule):
         # KAN-SSM
         ssm_d_state: int = 16,
         ssm_layers: int = 1,
-        compress_skip: bool = False,
         use_checkpointing: bool = False,
         fusion_mode: str = "kan_spatial",
         modulator_type: str = "kan",
         # Regularisation
         consistency_weight: float = 0.0,
+        # Phase 2: dual-scale memory keys (Stage 3 semantic + Stage 2 fine-grained)
+        prop_use_dual_scale: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.feature_extractor = DinoV3Wrapper(freeze=True)
+        # Hiera stage channel widths inferred from dim_in (Stage 3).
+        # For hiera-base-plus-224: dim_in=384  → dim_fine=192, dim_s1=96.
+        dim_fine = dim_in // 2   # Stage 2: 192
+        dim_s1   = dim_in // 4   # Stage 1:  96
+
+        self.feature_extractor = HieraWrapper(freeze=True)
         self.temporal_model = KangaSSM(
             d_model=dim_in,
             d_state=ssm_d_state,
@@ -84,20 +95,21 @@ class VideoMambaSystem(L.LightningModule):
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
         self.seg_decoder = SegmentationDecoder(
             dim_ssm=dim_in,
-            dim_dinov2=dim_in,
+            skip_dims=(dim_in, dim_fine, dim_s1),  # Stage 3 / 2 / 1 channels
             num_classes=num_seg_classes,
             target_size=target_size,
-            compress_skip=compress_skip,
             fusion_mode=fusion_mode,
         )
         # Propagation: MemoryBank holds explicit K/V pairs per frame;
         # PropagationAttention cross-attends query patches to the bank.
         self.memory_bank = MemoryBank(
             d_model=dim_in,
+            d_model_fine=dim_fine,
             d_key=prop_d_key,
             d_value=prop_d_value,
             n_objects=num_seg_classes - 1,
             max_mem_frames=max_mem_frames,
+            use_dual_scale=prop_use_dual_scale,
         )
         self.propagation_attention = PropagationAttention(
             d_model=dim_in,
@@ -182,19 +194,22 @@ class VideoMambaSystem(L.LightningModule):
 
         # ── 1. Spatial feature extraction ──────────────────────────────
         query_cls, query_features_ms = self.feature_extractor(x)
-        # query_features_ms: {"layer_3": [B, T, D, P], ..., "layer_11": [B, T, D, P]}
-        query_patch = query_features_ms["layer_11"]  # [B, T, D, P]
+        # query_features_ms: {"stage_3": [B,T,384,196], "stage_2": [B,T,192,784], "stage_1": [B,T,96,3136]}
+        query_patch = query_features_ms["stage_3"]  # [B, T, 384, 196]
         D, P = query_patch.shape[2], query_patch.shape[3]
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
             # ── 2. Reference feature extraction ────────────────────────
             _ref_cls, _ref_features_ms = self.feature_extractor(ref_frame.unsqueeze(1))
-            ref_patch = _ref_features_ms["layer_11"]  # [B, 1, D, P]
+            ref_patch = _ref_features_ms["stage_3"]                 # [B, 1, 384, 196]
             # [B, 1, D, P] → [B, P, D]
             ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
+            # Fine-scale reference features for dual-scale memory key.
+            ref_patch_fine = _ref_features_ms["stage_2"].squeeze(1).permute(0, 2, 1)  # [B, P2, 192]
+
             # ── 3. Initialise memory bank with reference frame ──────────
-            self.memory_bank.encode_reference(ref_patch_p, ref_mask)
+            self.memory_bank.encode_reference(ref_patch_p, ref_mask, ref_patch_fine)
 
             # Spatial decoder guidance: binary objectness from reference mask
             ref_mask_safe = ref_mask.clone()
@@ -206,18 +221,20 @@ class VideoMambaSystem(L.LightningModule):
 
             for t in range(T):
                 # Current frame patches: [B, D, P] → [B, P, D]
-                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, D]
+                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, 384]
+                # Fine-scale patches for dual-scale memory update.
+                curr_patch_fine = query_features_ms["stage_2"][:, t].permute(0, 2, 1)  # [B, P2, 192]
 
                 # ── 4. Propagation: cross-attend to memory bank ─────────
                 K_mem, V_mem = self.memory_bank.get_memory()
                 prop_feat = self.propagation_attention(
                     curr_patch, K_mem, V_mem
-                )  # [B, P, D]
+                )  # [B, P, 384]
 
                 # ── 5. KAN-SSM temporal refinement (patch-parallel) ─────
                 # Feed as [B*P, 1, D] — one token per step preserves the
                 # SSM's recurrent hidden-state across the clip.
-                prop_flat = prop_feat.reshape(B * P, 1, -1)  # [B*P, 1, D]
+                prop_flat = prop_feat.reshape(B * P, 1, -1)  # [B*P, 1, 384]
                 ssm_out_flat, ssm_states = self.temporal_model(
                     prop_flat, prev_states=ssm_states, return_last_state=True
                 )
@@ -230,8 +247,7 @@ class VideoMambaSystem(L.LightningModule):
                 )
 
                 # ── 6. Hierarchical decoding ────────────────────────────
-                # prev_guide_mask provides spatial objectness prior for the
-                # KAN-spatial gating upblocks.
+                # frame_ms passes all Hiera stages to the decoder (stage_1/2/3).
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
                 logits_t = self.seg_decoder(
                     last_feat, frame_ms, prev_mask=prev_guide_mask
@@ -255,7 +271,11 @@ class VideoMambaSystem(L.LightningModule):
                         mem_mask = (
                             torch.softmax(logits_t, dim=2).squeeze(1).detach()
                         )  # [B, C, H, W]
-                    self.memory_bank.add_frame(curr_patch.detach(), mem_mask)
+                    self.memory_bank.add_frame(
+                        curr_patch.detach(),
+                        mem_mask,
+                        curr_patch_fine.detach(),
+                    )
 
                 # Update spatial guide: total objectness across all object channels
                 pred_soft = torch.softmax(logits_t, dim=2)  # [B, 1, C, H, W]
@@ -264,7 +284,7 @@ class VideoMambaSystem(L.LightningModule):
                 )  # [B, 1, H, W]
 
             logits_seg = torch.cat(all_preds_seg, dim=1)  # [B, T, C, H, W]
-            ssm_cls = query_cls  # [B, T, D]
+            ssm_cls = query_cls  # [B, T, 384]
 
         else:
             # ── Fallback: no reference context ─────────────────────────
