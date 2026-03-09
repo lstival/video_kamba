@@ -17,8 +17,18 @@ fusion_mode: 'kan_spatial'
 # 'kan'  → FastKAN Gaussian RBF (production default)
 # 'mlp'  → two-layer MLP (ablation baseline)
 modulator_type: 'kan'
-# Propagation mode for recurrent mask feedback
-# Options: 'soft_mask', 'direct_feature', 'teacher_forcing'
-propagation_mode: 'soft_mask'
-# Scheduled sampling rate: 0.0=always use GT, 1.0=always use prediction
+
+# ── Memory-Attention Propagation ────────────────────────────────────────
+# Key/value projection dimension for cross-frame attention matching
+prop_d_key: 256
+prop_d_value: 256
+# Number of attention heads in PropagationAttention
+prop_n_heads: 8
+prop_dropout: 0.1
+# Maximum stored frames in the memory bank (reference + N past frames)
+max_mem_frames: 5
+# Add current frame to memory every N query frames (1 = every frame)
+memory_update_freq: 1
+# Scheduled sampling for memory updates:
+# 0.0 = always use GT mask (teacher forcing), 1.0 = always use prediction
 scheduled_sampling_rate: 0.0

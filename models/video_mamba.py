@@ -12,6 +12,8 @@ from models.components.kanga_ssm import KangaSSM
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
 from models.components.segmentation_decoder import SegmentationDecoder
+from models.components.memory_bank import MemoryBank
+from models.components.propagation_attention import PropagationAttention
 
 class VideoMambaSystem(L.LightningModule):
     """Multi-task video understanding model.
@@ -47,77 +49,66 @@ class VideoMambaSystem(L.LightningModule):
         learning_rate: float = 1e-4,
         vos_loss_beta: float = 0.5,
         use_ref_context: bool = True,
-        identity_mode: str = "add", # "add", "concat", "modulate"
-        online_context: bool = False,
-        consistency_weight: float = 0.0,
+        # Memory-attention propagation
+        prop_d_key: int = 256,
+        prop_d_value: int = 256,
+        prop_n_heads: int = 8,
+        prop_dropout: float = 0.1,
+        max_mem_frames: int = 5,
+        memory_update_freq: int = 1,
+        # Scheduled sampling: 0.0 = always use GT mask for memory update (teacher
+        # forcing), 1.0 = always use predicted mask (pure autoregressive).
+        scheduled_sampling_rate: float = 0.0,
+        # KAN-SSM
         ssm_d_state: int = 16,
         ssm_layers: int = 1,
         compress_skip: bool = False,
         use_checkpointing: bool = False,
-        fusion_mode: str = "concat",
+        fusion_mode: str = "kan_spatial",
         modulator_type: str = "kan",
-        propagation_mode: str = "soft_mask", # "soft_mask", "direct_feature", "teacher_forcing"
-        scheduled_sampling_rate: float = 0.0, # 0.0 = always use GT (teacher forcing), 1.0 = always use prediction
+        # Regularisation
+        consistency_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        # Adjusted dimension for identity injection
-        self.dim_infused = dim_in * 2 if identity_mode == "concat" else dim_in
-        
         self.feature_extractor = DinoV3Wrapper(freeze=True)
         self.temporal_model = KangaSSM(
-            d_model=self.dim_infused,
+            d_model=dim_in,
             d_state=ssm_d_state,
             num_layers=ssm_layers,
             use_checkpointing=use_checkpointing,
             modulator_type=modulator_type,
         )
-        self.clf_head = ClassificationHead(dim_in=self.dim_infused, num_classes=num_clf_classes)
-        self.detection_head = DetectionHead(dim_in=self.dim_infused, num_classes=num_clf_classes, num_boxes=num_boxes)
+        self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
+        self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
         self.seg_decoder = SegmentationDecoder(
-            dim_ssm=self.dim_infused, 
-            dim_dinov2=dim_in, 
-            num_classes=num_seg_classes, 
-            target_size=target_size, 
+            dim_ssm=dim_in,
+            dim_dinov2=dim_in,
+            num_classes=num_seg_classes,
+            target_size=target_size,
             compress_skip=compress_skip,
-            fusion_mode=fusion_mode
+            fusion_mode=fusion_mode,
+        )
+        # Propagation: MemoryBank holds explicit K/V pairs per frame;
+        # PropagationAttention cross-attends query patches to the bank.
+        self.memory_bank = MemoryBank(
+            d_model=dim_in,
+            d_key=prop_d_key,
+            d_value=prop_d_value,
+            n_objects=num_seg_classes - 1,
+            max_mem_frames=max_mem_frames,
+        )
+        self.propagation_attention = PropagationAttention(
+            d_model=dim_in,
+            d_key=prop_d_key,
+            d_value=prop_d_value,
+            n_heads=prop_n_heads,
+            dropout=prop_dropout,
         )
 
-        # Object Memory: one embedding per segmentation channel (bg + objects)
-        self.mask_embedding = nn.Embedding(num_seg_classes, dim_in)
-
-        # Projection for direct feature feedback: maps SSM output back to mask embedding space
-        if propagation_mode == "direct_feature":
-            self.feat_proj = nn.Linear(self.dim_infused, dim_in)
-
-        # Pixel-level matching attention (Global Identity)
-        if propagation_mode in ["pixel_matching", "hybrid_flow"]:
-            self.pixel_matching_attn = nn.MultiheadAttention(
-                embed_dim=dim_in, 
-                num_heads=8, 
-                kdim=self.dim_infused,
-                vdim=self.dim_infused,
-                batch_first=True
-            )
-            self.identity_norm = nn.LayerNorm(dim_in)
-
-        # Flow SSM (Local Motion)
-        if propagation_mode == "hybrid_flow":
-            # We use a smaller SSM for flow guidance
-            self.flow_ssm = KangaSSM(
-                d_model=self.dim_infused,
-                d_state=ssm_d_state // 2, # Half state for efficiency
-                num_layers=1,
-                modulator_type=modulator_type
-            )
-            # Projection to fuse matching + flow before decoder
-            self.flow_fusion = nn.Linear(dim_in + self.dim_infused, self.dim_infused)
-            self.flow_norm = nn.LayerNorm(self.dim_infused)
-
-        # Hybrid VOS loss
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
-        
+
         # Metrics
         self.test_acc = Accuracy(task="multiclass", num_classes=num_clf_classes)
         self.test_f1 = F1Score(task="multiclass", num_classes=num_clf_classes, average="macro")
@@ -151,251 +142,156 @@ class VideoMambaSystem(L.LightningModule):
     # Forward
     # ------------------------------------------------------------------
 
-    def _get_mask_embedding(self, mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        """Helper to embed a mask into the patch grid. 
-        Supports both hard label masks [B, H, W] and soft probability masks [B, C, H, W].
-        """
-        B = mask.shape[0]
-        
-        if mask.ndim == 3: # Hard mask [B, H, W]
-            mask_small = F.interpolate(
-                mask.unsqueeze(1).float(), 
-                size=(h, w), 
-                mode="nearest"
-            ).long() # [B, 1, h, w]
-            
-            mask_safe = mask_small.clone()
-            mask_safe[mask_small == 255] = 0
-            
-            # Embed mask patches -> [B, h*w, D]
-            emb = self.mask_embedding(mask_safe.squeeze(1)) 
-            return emb.reshape(B, h * w, -1)
-        else: # Soft probabilities [B, C, H, W]
-            mask_small = F.interpolate(
-                mask.float(), 
-                size=(h, w), 
-                mode="area"
-            ) # [B, C, h, w]
-            
-            # [B, h*w, C]
-            mask_flat = mask_small.view(B, mask.shape[1], h * w).transpose(1, 2)
-            
-            # Multiply by embedding weights: [B, h*w, C] @ [C, D] -> [B, h*w, D]
-            emb = torch.matmul(mask_flat, self.mask_embedding.weight)
-            return emb
-
-    def _infuse_identity(self, patch: torch.Tensor, mask_emb: torch.Tensor) -> torch.Tensor:
-        """Helper to infuse identity information into patches based on identity_mode."""
-        if self.hparams.identity_mode == "concat":
-            # mask_emb is [B, P, D] or [B, T, P, D]
-            # patch is [B, 1, P, D] or [B, T, P, D]
-            if mask_emb.dim() == 3 and patch.dim() == 4:
-                mask_emb = mask_emb.unsqueeze(1)
-            elif mask_emb.dim() == 4 and patch.dim() == 3:
-                patch = patch.unsqueeze(1)
-            return torch.cat([patch, mask_emb], dim=-1)
-        elif self.hparams.identity_mode == "modulate":
-            if mask_emb.dim() == 3 and patch.dim() == 4:
-                mask_emb = mask_emb.unsqueeze(1)
-            return patch * torch.sigmoid(mask_emb)
-        else: # "add"
-            if mask_emb.dim() == 3 and patch.dim() == 4:
-                mask_emb = mask_emb.unsqueeze(1)
-            return patch + mask_emb
-
     def forward(
-        self, 
-        x: torch.Tensor, 
-        ref_frame: torch.Tensor = None, 
+        self,
+        x: torch.Tensor,
+        ref_frame: torch.Tensor = None,
         ref_mask: torch.Tensor = None,
-        query_masks: torch.Tensor = None
+        query_masks: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Recursive inference for VOS with mask feedback and multi-scale fusion."""
+        """Forward pass: memory-attention propagation followed by KAN-SSM refinement.
+
+        For VOS (with ``ref_frame``/``ref_mask``):
+
+        1. Extract DINOv2 features for all query frames (backbone frozen).
+        2. Encode the reference frame into the ``MemoryBank`` (K/V pairs with
+           object ID embeddings injected into the values).
+        3. For each query frame *t*:
+
+           a. Cross-attend query patches to memory  →  propagated features.
+           b. Feed propagated features through the KAN-SSM  →  temporal context.
+           c. Decode to segmentation logits.
+           d. Update the memory bank with the current frame (GT or predicted
+              mask chosen via ``scheduled_sampling_rate``).
+
+        Args:
+            x:           Query video frames ``[B, T, C, H, W]``.
+            ref_frame:   Reference (first) frame ``[B, C, H, W]``.
+            ref_mask:    Integer segmentation mask for the reference frame
+                         ``[B, H, W]`` (0 = background, 1..N = objects,
+                         255 = void).
+            query_masks: Ground-truth query masks ``[B, T, H, W]``.  Required
+                         only during training for scheduled-sampling on memory
+                         updates; may be ``None`` at evaluation.
+
+        Returns:
+            Tuple ``(logits_clf, pred_boxes, pred_box_logits, logits_seg)``
+            where ``logits_seg`` is ``[B, T, num_seg_classes, H, W]``.
+        """
         B, T, C, H, W = x.shape
-        # 1. Spatial feature extraction (DinoV3 - Multi-scale)
-        query_cls, query_features_ms = self.feature_extractor(x) 
-        # query_features_ms: {"layer_3": [B, T, D, P], ...}
-        
-        # We use the deepest layer (layer_11) for temporal propagation
-        query_patch = query_features_ms["layer_11"]
+
+        # ── 1. Spatial feature extraction ──────────────────────────────
+        query_cls, query_features_ms = self.feature_extractor(x)
+        # query_features_ms: {"layer_3": [B, T, D, P], ..., "layer_11": [B, T, D, P]}
+        query_patch = query_features_ms["layer_11"]  # [B, T, D, P]
         D, P = query_patch.shape[2], query_patch.shape[3]
-        h = w = int(P**0.5)
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
-            # 2. Reference Initializer
-            ref_cls, ref_features_ms = self.feature_extractor(ref_frame.unsqueeze(1))
-            ref_patch = ref_features_ms["layer_11"]
-            
-            # Embed the reference mask
-            ref_mask_emb = self._get_mask_embedding(ref_mask, h, w) # [B, P, D]
-            
-            # Infuse identity into ref patches
-            ref_patch_p = ref_patch.transpose(2, 3) # [B, 1, P, D]
-            ref_patch_infused = self._infuse_identity(ref_patch_p, ref_mask_emb)
-            
-            # 3. State-Aware Recurrent Sequence Processing (O(T))
-            all_preds_seg = []
-            
-            # Initialize SSM hidden states for each layer 
-            ssm_states = None 
-            flow_states = None
-            
-            
-            # We process query frames one by one to allow mask feedback
-            # Note: During training, we can parallelize if we don't have feedback, 
-            # but for "Memory Bank" we need recursion.
-            
-            # Step 1: "Warm up" the SSM with the reference frame
-            ref_flattened = ref_patch_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
-            _, ssm_states = self.temporal_model(ref_flattened, return_last_state=True)
+            # ── 2. Reference feature extraction ────────────────────────
+            _ref_cls, _ref_features_ms = self.feature_extractor(ref_frame.unsqueeze(1))
+            ref_patch = _ref_features_ms["layer_11"]  # [B, 1, D, P]
+            # [B, 1, D, P] → [B, P, D]
+            ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
-            if self.hparams.propagation_mode == "hybrid_flow":
-                # Warm up Flow SSM with shallow reference patches
-                # Use Layer 3 for texture-based motion initialization
-                shallow_ref = ref_features_ms["layer_3"].permute(0, 1, 3, 2)
-                shallow_ref_infused = self._infuse_identity(shallow_ref, ref_mask_emb)
-                shallow_ref_flat = shallow_ref_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
-                _, flow_states = self.flow_ssm(shallow_ref_flat, return_last_state=True)
-            
-            # Initial prediction for "previous mask" starts with the reference mask
-            # We scale it to match the expected probability range if it's a hard mask
-            if ref_mask.ndim == 3: # [B, H, W]
-                # Convert to [B, 1, H, W] soft-style
-                prev_mask_v = F.one_hot(ref_mask.long(), num_classes=self.hparams.num_seg_classes).permute(0, 3, 1, 2).float()[:, 1:2]
-            else: # [B, C, H, W]
-                prev_mask_v = ref_mask[:, 1:2]
+            # ── 3. Initialise memory bank with reference frame ──────────
+            self.memory_bank.encode_reference(ref_patch_p, ref_mask)
 
-            # Step 2: Recurrent processing of query frames
+            # Spatial decoder guidance: binary objectness from reference mask
+            ref_mask_safe = ref_mask.clone()
+            ref_mask_safe[ref_mask == 255] = 0
+            prev_guide_mask = (ref_mask_safe > 0).float().unsqueeze(1)  # [B, 1, H, W]
+
+            all_preds_seg: list[torch.Tensor] = []
+            ssm_states = None
+
             for t in range(T):
-                # t-th query frame patches
-                curr_patch = query_patch[:, t:t+1].transpose(2, 3) # [B, 1, P, D]
-                
-                # --- 3. Choose Feed Mask (Scheduled Sampling) ---
-                gt_mask_t = query_masks[:, t:t+1]
-                if gt_mask_t.ndim == 5: # [B, 1, 1, H, W]
-                    gt_mask_t = gt_mask_t.squeeze(2)
-                elif gt_mask_t.ndim == 3: # [B, H, W] -> [B, 1, H, W]
-                    gt_mask_t = gt_mask_t.unsqueeze(1)
-                
-                if self.training and self.hparams.scheduled_sampling_rate > 0:
-                    use_gt = torch.rand(1).item() > self.hparams.scheduled_sampling_rate
-                    # If using prediction, we take the soft mask from previous step (or ref at t=0)
-                    feed_mask = gt_mask_t if use_gt else prev_mask_v
-                else:
-                    # In eval, always use previous prediction (pure autoregressive)
-                    feed_mask = prev_mask_v
+                # Current frame patches: [B, D, P] → [B, P, D]
+                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, D]
 
-                # Feedback the mask information into the patches (SSM input)
-                mask_emb = self._get_mask_embedding(feed_mask, h, w)
-                curr_infused = self._infuse_identity(curr_patch, mask_emb)
-                
-                # --- 3. Feature Propagation (SSM / Pixel Matching / Hybrid) ---
-                if self.hparams.propagation_mode == "pixel_matching":
-                    q = curr_patch.squeeze(1) # [B, P, D]
-                    kv = ref_patch_infused.squeeze(1) # [B, P, D_inf]
-                    attn_out, _ = self.pixel_matching_attn(query=q, key=kv, value=kv)
-                    last_feat_p = self.identity_norm(q + attn_out)
-                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) 
+                # ── 4. Propagation: cross-attend to memory bank ─────────
+                K_mem, V_mem = self.memory_bank.get_memory()
+                prop_feat = self.propagation_attention(
+                    curr_patch, K_mem, V_mem
+                )  # [B, P, D]
 
-                elif self.hparams.propagation_mode == "hybrid_flow":
-                    # --- Stream A: Global Identity matching (Deep Layer) ---
-                    q_deep = curr_patch.squeeze(1) 
-                    kv_deep = ref_patch_infused.squeeze(1)
-                    target_identity, _ = self.pixel_matching_attn(query=q_deep, key=kv_deep, value=kv_deep)
-                    target_identity = self.identity_norm(target_identity)
+                # ── 5. KAN-SSM temporal refinement (patch-parallel) ─────
+                # Feed as [B*P, 1, D] — one token per step preserves the
+                # SSM's recurrent hidden-state across the clip.
+                prop_flat = prop_feat.reshape(B * P, 1, -1)  # [B*P, 1, D]
+                ssm_out_flat, ssm_states = self.temporal_model(
+                    prop_flat, prev_states=ssm_states, return_last_state=True
+                )
+                # [B*P, 1, D] → [B, 1, D, P] for decoder
+                last_feat = (
+                    ssm_out_flat.squeeze(1)   # [B*P, D]
+                    .reshape(B, P, D)         # [B, P, D]
+                    .permute(0, 2, 1)         # [B, D, P]
+                    .unsqueeze(1)             # [B, 1, D, P]
+                )
 
-                    # --- Stream B: Local Motion Flow (Shallow Layer) ---
-                    # Use Layer 3 for texture-based motion
-                    shallow_patch = query_features_ms["layer_3"][:, t:t+1].permute(0, 1, 3, 2)
-                    shallow_infused = self._infuse_identity(shallow_patch, mask_emb)
-                    shallow_flat = shallow_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
-                    
-                    flow_out_flat, flow_states = self.flow_ssm(
-                        shallow_flat, 
-                        prev_states=flow_states, 
-                        return_last_state=True
-                    )
-                    flow_out = flow_out_flat.reshape(B, P, -1) # [B, P, D_inf]
-                    
-                    # --- Fusion: Identity + Flow ---
-                    combined = torch.cat([target_identity, flow_out], dim=-1)
-                    last_feat_p = self.flow_norm(self.flow_fusion(combined))
-                    last_feat = last_feat_p.unsqueeze(1).transpose(2, 3) # [B, 1, D_inf, P]
-
-                else:
-                    # Original SSM temporal update
-                    curr_flattened = curr_infused.permute(0, 2, 1, 3).reshape(B * P, 1, -1)
-                    last_feat_flattened, ssm_states = self.temporal_model(
-                        curr_flattened, 
-                        prev_states=ssm_states, 
-                        return_last_state=True
-                    )
-                    last_feat = last_feat_flattened.reshape(B, P, 1, -1).permute(0, 2, 3, 1)
-                
-                # --- 4. Hierarchical Masked Decoding (Cross-Attention Bridge) ---
+                # ── 6. Hierarchical decoding ────────────────────────────
+                # prev_guide_mask provides spatial objectness prior for the
+                # KAN-spatial gating upblocks.
                 frame_ms = {k: v[:, t:t+1] for k, v in query_features_ms.items()}
                 logits_t = self.seg_decoder(
-                    last_feat, 
-                    frame_ms, 
-                    prev_mask=feed_mask, # Feed the SAME mask to the decoder spatial prior
-                    ref_features=ref_features_ms,
-                    ref_mask=ref_mask  # Global Anchor for Cross-Attention
-                )
+                    last_feat, frame_ms, prev_mask=prev_guide_mask
+                )  # [B, 1, num_classes, H, W]
                 all_preds_seg.append(logits_t)
-                
-                # --- 5. Prepare Prediction for next step ---
-                # Extract soft-mask for next recursive step [B, 1, H, W]
-                # We assume channel 1 is the foreground object (DAVIS/seen splits)
-                prev_mask_v = torch.softmax(logits_t, dim=2)[:, :, 1:2].detach()
-            
-            logits_seg = torch.cat(all_preds_seg, dim=1)
-            ssm_cls = query_cls # Simplification for classification heads in VOS mode
-            
-            # If concat mode, pad ssm_cls to match dim_infused
-            if self.hparams.identity_mode == "concat":
-                zeros = torch.zeros_like(ssm_cls)
-                ssm_cls = torch.cat([ssm_cls, zeros], dim=-1)
+
+                # ── 7. Update memory bank ───────────────────────────────
+                if t % self.hparams.memory_update_freq == 0:
+                    use_gt = (
+                        self.training
+                        and query_masks is not None
+                        and torch.rand(1).item() > self.hparams.scheduled_sampling_rate
+                    )
+                    if use_gt:
+                        gt_t = query_masks[:, t]
+                        if gt_t.ndim == 4:  # [B, 1, H, W]
+                            gt_t = gt_t.squeeze(1)
+                        mem_mask = gt_t  # [B, H, W]
+                    else:
+                        # Soft predicted mask — detached to prevent graph growth
+                        mem_mask = (
+                            torch.softmax(logits_t, dim=2).squeeze(1).detach()
+                        )  # [B, C, H, W]
+                    self.memory_bank.add_frame(curr_patch.detach(), mem_mask)
+
+                # Update spatial guide: total objectness across all object channels
+                pred_soft = torch.softmax(logits_t, dim=2)  # [B, 1, C, H, W]
+                prev_guide_mask = (
+                    pred_soft[:, 0, 1:].sum(dim=1, keepdim=True).clamp(0.0, 1.0).detach()
+                )  # [B, 1, H, W]
+
+            logits_seg = torch.cat(all_preds_seg, dim=1)  # [B, T, C, H, W]
+            ssm_cls = query_cls  # [B, T, D]
 
         else:
-            # Fallback for no-ref case (standard feedforward)
-            P_feat = query_patch.shape[-1]
-            all_patches = query_patch.transpose(2, 3).reshape(B * P_feat, T, -1)
-            
-            # If concat mode, we must zero-pad to match dim_infused (2*D)
-            if self.hparams.identity_mode == "concat":
-                zeros = torch.zeros_like(all_patches)
-                all_patches = torch.cat([all_patches, zeros], dim=-1)
-                
-            ssm_out_raw = self.temporal_model(all_patches)
-            infused_patches = ssm_out_raw.view(B, P_feat, T, -1).permute(0, 2, 3, 1)
-            ssm_cls = ssm_out_raw.view(B, P_feat, T, -1).mean(dim=1)
-            
-            # Simple decoding without multi-scale for fallback
-            # (In practice, you'd want to handle this better)
-            # Pass ref_features_ms and ref_mask if available even in parallel mode
-            logits_seg = self.seg_decoder(
-                infused_patches, 
-                query_features_ms, 
-                ref_features=ref_features_ms if self.hparams.use_ref_context else None,
-                ref_mask=ref_mask if self.hparams.use_ref_context else None
-            )
-            
-        # 3. Heads
+            # ── Fallback: no reference context ─────────────────────────
+            # Process all patches in parallel across time.
+            # [B, T, D, P] → [B, P, T, D] → [B*P, T, D]
+            all_patches = query_patch.permute(0, 3, 1, 2).reshape(B * P, T, D)
+            ssm_out_raw = self.temporal_model(all_patches)  # [B*P, T, D]
+            # [B*P, T, D] → [B, P, T, D] → [B, T, D, P]
+            infused_patches = ssm_out_raw.reshape(B, P, T, D).permute(0, 2, 3, 1)
+            ssm_cls = ssm_out_raw.reshape(B, P, T, D).mean(dim=1)  # [B, T, D]
+            logits_seg = self.seg_decoder(infused_patches, query_features_ms)
+
+        # ── 8. Classification and detection heads ───────────────────────
         logits_clf = self.clf_head(ssm_cls)
-        # For simplicity, we only run detection on final features
-        # Note: infused_patches is not defined in recursive path yet, we'd use the last ssm output
-        # pred_boxes, pred_box_logits = self.detection_head(infused_patches)
-        pred_boxes = torch.zeros(B, T, 10, 4, device=x.device) # Dummies
-        pred_box_logits = torch.zeros(B, T, 10, self.hparams.num_clf_classes, device=x.device)
-        
-        # Resize logits_seg back to input resolution if needed
+        pred_boxes = torch.zeros(B, T, 10, 4, device=x.device)
+        pred_box_logits = torch.zeros(
+            B, T, 10, self.hparams.num_clf_classes, device=x.device
+        )
+
+        # Resize segmentation logits to original spatial resolution if needed
         if logits_seg.shape[-2:] != (H, W):
             L_B, L_T, L_C, L_H, L_W = logits_seg.shape
             logits_seg = F.interpolate(
                 logits_seg.view(L_B * L_T, L_C, L_H, L_W),
                 size=(H, W),
                 mode="bilinear",
-                align_corners=False
+                align_corners=False,
             ).view(L_B, L_T, L_C, H, W)
 
         return logits_clf, pred_boxes, pred_box_logits, logits_seg
