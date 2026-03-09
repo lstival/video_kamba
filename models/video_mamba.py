@@ -527,11 +527,26 @@ class VideoMambaSystem(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            self.parameters(),
             lr=self.hparams.learning_rate,
-            weight_decay=1e-2
+            weight_decay=1e-2,
         )
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def _get_mask_embedding(self, mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """
