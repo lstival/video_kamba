@@ -680,18 +680,19 @@ class VideoMambaSystem(L.LightningModule):
             ],
             weight_decay=1e-2,
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # CosineAnnealingLR decays LR every epoch regardless of any metric,
+        # preventing the overshot that occurs when ReduceLROnPlateau never fires
+        # because val_loss keeps monotonically decreasing even as J&F collapses.
+        t_max = self.trainer.max_epochs if self.trainer is not None else 20
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            mode="min",
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
+            T_max=t_max,
+            eta_min=1e-6,
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
                 "interval": "epoch",
                 "frequency": 1,
             },
