@@ -99,8 +99,10 @@ else
 fi
 
 export PYTHONPATH=.
-
-mkdir -p logs/slurm
+# ── Avoid cross-device link errors and /tmp overflows ────────────────────────
+export TMPDIR="${PROJECT_ROOT}/tmp"
+export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
+mkdir -p "$TMPDIR" "$HF_HOME" logs/slurm
 
 python train.py \
     model=default \
