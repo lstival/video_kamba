@@ -256,7 +256,7 @@ class COCOPretrainDataset(IterableDataset):
         raw = raw.filter(_has_masks)
         
         if self.shuffle:
-            raw = raw.shuffle(buffer_size=1000, seed=42)
+            raw = raw.shuffle(buffer_size=250, seed=42)
             
         if max_samples is not None:
             raw = raw.take(max_samples)
