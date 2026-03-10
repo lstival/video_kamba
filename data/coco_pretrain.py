@@ -236,7 +236,7 @@ class COCOPretrainDataset(IterableDataset):
         self.max_samples = max_samples
         self.shuffle    = shuffle
 
-        hf_split = "train" if split == "train" else "validation"
+        hf_split = "train" if split == "train" else "val"
         
         # Use streaming=True to bypass disk-heavy Arrow generation
         raw = load_dataset(
