@@ -16,16 +16,11 @@ import torch
 # Fixtures
 # ---------------------------------------------------------------------------
 
-D_KEY   = 64   # small key dim for speed
+D_KEY   = 256  # match MemoryBank default d_key
 D_STATE = 4
 B       = 2
 P       = 16   # number of patches
-
-
-@pytest.fixture(scope="module")
-def adapter():
-    from models.components.kan_key_adapter import KANKeyAdapter
-    return KANKeyAdapter(d_key=D_KEY, d_state=D_STATE, num_layers=1)
+D_MODEL = 256  # d_model fed to MemoryBank (matches d_key for the isolated test)
 
 
 @pytest.fixture(scope="module")
@@ -34,8 +29,8 @@ def memory_bank_with_adapter():
     from models.components.memory_bank import MemoryBank
     adapter = KANKeyAdapter(d_key=D_KEY, d_state=D_STATE, num_layers=1)
     bank = MemoryBank(
-        d_model=D_KEY,
-        d_model_fine=D_KEY,
+        d_model=D_MODEL,
+        d_model_fine=D_MODEL,
         d_key=D_KEY,
         d_value=D_KEY,
         n_objects=4,
@@ -46,19 +41,10 @@ def memory_bank_with_adapter():
     return bank
 
 
+# Standalone adapter fixture — derived from the bank so weights are shared
 @pytest.fixture(scope="module")
-def memory_bank_no_adapter():
-    from models.components.memory_bank import MemoryBank
-    return MemoryBank(
-        d_model=D_KEY,
-        d_model_fine=D_KEY,
-        d_key=D_KEY,
-        d_value=D_KEY,
-        n_objects=4,
-        max_mem_frames=5,
-        use_dual_scale=False,
-        key_adapter=None,
-    )
+def adapter(memory_bank_with_adapter):
+    return memory_bank_with_adapter.key_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -135,32 +121,41 @@ class TestMemoryBankWithAdapter:
     def test_adapter_modifies_frame_keys(
         self,
         memory_bank_with_adapter,
-        memory_bank_no_adapter,
     ):
-        """Keys stored in the bank should differ between adapter ON vs OFF."""
+        """Keys stored after add_frame with adapter must differ from keys without adapter.
+
+        Strategy: use the SAME bank but compare the key from add_frame with and
+        without monkey-patching the adapter off, so projection weights are identical.
+        """
         features, mask = self._make_batch()
+        bank = memory_bank_with_adapter
 
-        # Bank WITH adapter
-        bank_a = memory_bank_with_adapter
-        bank_a.reset()
-        bank_a.encode_reference(features.clone(), mask.clone())
-        bank_a.add_frame(features.clone(), mask.clone())
-        K_a, _ = bank_a.get_memory()
+        # ── Run WITH adapter ──────────────────────────────────────────────
+        bank.reset()
+        bank.encode_reference(features.clone(), mask.clone())
+        bank.add_frame(features.clone(), mask.clone())
+        K_with, _ = bank.get_memory()
+        K_query_with = K_with[:, P:, :].clone()
 
-        # Bank WITHOUT adapter
-        bank_n = memory_bank_no_adapter
-        bank_n.reset()
-        bank_n.encode_reference(features.clone(), mask.clone())
-        bank_n.add_frame(features.clone(), mask.clone())
-        K_n, _ = bank_n.get_memory()
+        # ── Run WITHOUT adapter (temporarily disabled) ────────────────────
+        orig_adapter = bank.key_adapter
+        bank.key_adapter = None
+        bank.reset()
+        bank.encode_reference(features.clone(), mask.clone())
+        bank.add_frame(features.clone(), mask.clone())
+        K_without, _ = bank.get_memory()
+        K_query_without = K_without[:, P:, :].clone()
+        bank.key_adapter = orig_adapter  # restore
 
-        assert K_a.shape == K_n.shape, "Shape mismatch between adapter and no-adapter banks"
-        # The first P entries are the reference (no adapter applied) — should be equal
-        # The second P entries are the query frame — should differ
-        assert torch.allclose(K_a[:, :P, :], K_n[:, :P, :], atol=1e-5), (
+        assert K_with.shape == K_without.shape, "Shape mismatch with/without adapter"
+
+        # Reference slot must be identical (same projection weights, adapter never touches it)
+        assert torch.allclose(K_with[:, :P, :], K_without[:, :P, :], atol=1e-5), (
             "Reference frame keys were modified by adapter (should not be)"
         )
-        assert not torch.allclose(K_a[:, P:, :], K_n[:, P:, :], atol=1e-5), (
+
+        # Query slot must differ (adapter added a residual)
+        assert not torch.allclose(K_query_with, K_query_without, atol=1e-5), (
             "Query frame keys are identical — adapter had no effect"
         )
 
@@ -212,12 +207,16 @@ class TestMemoryBankWithAdapter:
 # ---------------------------------------------------------------------------
 
 class TestVideoMambaSystemWithAdapter:
+    """Integration-level tests for the VOS training step with KAN key adapter.
+
+    Uses real default dimensions (dim_in=768 for DINOv2) so the Linear
+    projection weights match the actual encoder output size.
+    """
 
     @pytest.fixture(scope="class")
     def model_with_adapter(self):
         from models.video_mamba import VideoMambaSystem
         return VideoMambaSystem(
-            dim_in=D_KEY,   # tiny dim for speed
             num_clf_classes=5,
             num_seg_classes=5,
             target_size=16,
@@ -229,7 +228,6 @@ class TestVideoMambaSystemWithAdapter:
     def model_no_adapter(self):
         from models.video_mamba import VideoMambaSystem
         return VideoMambaSystem(
-            dim_in=D_KEY,
             num_clf_classes=5,
             num_seg_classes=5,
             target_size=16,
