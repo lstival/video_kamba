@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=mobilenetv2_ytvos_20ep
+#SBATCH --job-name=mobilenetv2_ytvos_100ep
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/slurm/mobilenetv2_ytvos_20ep_%j.out
-#SBATCH --error=logs/slurm/mobilenetv2_ytvos_20ep_%j.err
+#SBATCH --output=logs/slurm/mobilenetv2_ytvos_100ep_%j.out
+#SBATCH --error=logs/slurm/mobilenetv2_ytvos_100ep_%j.err
 
 # ============================================================
 # Phase: Train MobileNetV2 encoder backbones on YouTube-VOS
@@ -22,7 +22,7 @@ cd "$PROJECT_ROOT"
 
 echo "=========================================="
 echo "  Video Kamba: MobileNetV2 YouTube-VOS Training"
-echo "  Epochs    : 20"
+echo "  Epochs    : 100"
 echo "  Target Res: 480x480"
 echo "  Job ID    : ${SLURM_JOB_ID:-manual}"
 echo "  Node      : $(hostname)"
@@ -45,10 +45,9 @@ python train.py \
     model=mobilenetv2 \
     datamodule=youtubevos \
     ++model.target_size=480 \
-    ++model.max_epochs=20 \
-    ++trainer.max_epochs=20 \
+    ++trainer.max_epochs=100 \
     ++trainer.precision="16-mixed" \
-    ++logger.name="mobilenetv2_ytvos_20ep" \
+    ++logger.name="mobilenetv2_ytvos_100ep" \
     ++callbacks.monitor=val_vos_J_and_F \
     ++callbacks.mode=max \
     "$@"

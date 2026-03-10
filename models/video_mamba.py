@@ -10,6 +10,7 @@ from utils.vos_loss import HybridVOSLoss
 from models.components.dinov3_wrapper import DinoV3Wrapper
 from models.components.mobilenetv2_wrapper import MobileNetV2Wrapper
 from models.components.kanga_ssm import KangaSSM
+from models.components.kan_key_adapter import KANKeyAdapter
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
 from models.components.segmentation_decoder import SegmentationDecoder
@@ -91,6 +92,13 @@ class VideoMambaSystem(L.LightningModule):
         mv2_output_stride: int = 16,
         mv2_freeze_at: int = 0,
         mv2_pretrained: bool = True,
+        # Training schedule
+        max_epochs: int = 20,
+        # KAN-SSM Memory Key Adapter
+        # When True, a lightweight KANKeyAdapter refines non-reference memory
+        # bank keys recurrently over the clip to model appearance drift.
+        use_kan_key_adapter: bool = True,
+        kan_adapter_d_state: int = 8,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -137,6 +145,15 @@ class VideoMambaSystem(L.LightningModule):
         )
         # Propagation: MemoryBank holds explicit K/V pairs per frame;
         # PropagationAttention cross-attends query patches to the bank.
+        # ── KAN Key Adapter (optional) ──────────────────────────────────
+        _key_adapter = None
+        if use_kan_key_adapter:
+            _key_adapter = KANKeyAdapter(
+                d_key=prop_d_key,
+                d_state=kan_adapter_d_state,
+                num_layers=1,
+            )
+
         self.memory_bank = MemoryBank(
             d_model=dim_in,
             d_model_fine=_dim_fine,
@@ -145,6 +162,7 @@ class VideoMambaSystem(L.LightningModule):
             n_objects=num_seg_classes - 1,
             max_mem_frames=max_mem_frames,
             use_dual_scale=prop_use_dual_scale,
+            key_adapter=_key_adapter,
         )
         self.propagation_attention = PropagationAttention(
             d_model=dim_in,

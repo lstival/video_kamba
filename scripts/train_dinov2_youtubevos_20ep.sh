@@ -53,7 +53,6 @@ python train.py \
     datamodule=youtubevos \
     ++model.encoder_type=dino \
     ++model.target_size=448 \
-    ++model.max_epochs=100 \
     ++model.scheduled_sampling_rate=0.3 \
     ++datamodule.img_size=448 \
     ++trainer.max_epochs=100 \

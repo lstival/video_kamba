@@ -26,6 +26,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
 
+# Import lazily to avoid circular imports; KANKeyAdapter is in the same package
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .kan_key_adapter import KANKeyAdapter
+
 
 class MemoryBank(nn.Module):
     """Explicit key-value memory bank for VOS propagation.
@@ -61,6 +66,7 @@ class MemoryBank(nn.Module):
         n_objects: int = 10,
         max_mem_frames: int = 5,
         use_dual_scale: bool = True,
+        key_adapter: "KANKeyAdapter | None" = None,
     ) -> None:
         super().__init__()
         self.d_key = d_key
@@ -68,6 +74,8 @@ class MemoryBank(nn.Module):
         self.n_objects = n_objects
         self.max_mem_frames = max_mem_frames
         self.use_dual_scale = use_dual_scale
+        # Optional KAN-SSM adapter that refines non-reference frame keys
+        self.key_adapter = key_adapter
 
         # ── Coarse (Stage 3) projection heads ───────────────────────────
         self.proj_key = nn.Sequential(
@@ -114,6 +122,8 @@ class MemoryBank(nn.Module):
         self._keys.clear()
         self._values.clear()
         self._is_reference.clear()
+        if self.key_adapter is not None:
+            self.key_adapter.reset()
 
     def encode_reference(
         self,
@@ -154,6 +164,17 @@ class MemoryBank(nn.Module):
                                  (optional; used when ``use_dual_scale=True``).
         """
         K, V = self._encode_frame(frame_features, mask, frame_features_fine)
+
+        # Apply KAN-SSM key adaptation to non-reference frames.
+        # The adapter adds a recurrent residual so each key is conditioned on
+        # the full appearance history seen so far.
+        if self.key_adapter is not None:
+            # Adapt only the coarse key portion (first P tokens per frame)
+            # The coarse key is at the front of K when dual_scale is enabled.
+            P_coarse = frame_features.shape[1]  # number of coarse patches
+            K_coarse = K[:, :P_coarse, :]       # [B, P, d_key]
+            K_coarse_adapted = K_coarse + self.key_adapter.adapt(K_coarse)
+            K = torch.cat([K_coarse_adapted, K[:, P_coarse:, :]], dim=1)
 
         if len(self._keys) >= self.max_mem_frames:
             # Evict the oldest non-reference entry (FIFO)

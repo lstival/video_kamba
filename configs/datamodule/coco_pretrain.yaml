@@ -1,0 +1,29 @@
+# COCO 2017 pre-training datamodule configuration
+# Usage: python train.py datamodule=coco_pretrain
+#
+# Following the AOT/DeAOT static-image pre-training strategy:
+# each COCO image is treated as a 1+seq_len "video" where query frames
+# are augmented copies of the reference, teaching the memory bank
+# how to localise objects under appearance variation.
+#
+# After pre-training, pass the checkpoint to finetune_dinov2_youtubevos.sh.
+_target_: data.coco_pretrain.COCOPretrainDataModule
+
+# Spatial resolution — 448 matches the DINOv2 ViT-B/14 native patch grid
+img_size: 448
+
+# Number of augmented query frames per COCO image clip
+seq_len: 3
+
+# Identity bank size (must match model.num_seg_classes - 1)
+n_id: 10
+
+# Larger batch than video — static images need less memory
+batch_size: 4
+num_workers: 4
+
+# HuggingFace datasets cache directory (set to shared storage on the cluster)
+cache_dir: /home/WUR/stiva001/.cache/huggingface
+
+# Set to a small integer (e.g. 500) to run a smoke-test job (null = use all ~118k)
+max_samples: null
