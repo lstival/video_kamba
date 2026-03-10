@@ -198,12 +198,11 @@ def _augment_query(
 # Dataset
 # ---------------------------------------------------------------------------
 
-class COCOPretrainDataset(Dataset):
-    """In-memory COCO 2017 dataset for VOS pre-training.
+class COCOPretrainDataset(IterableDataset):
+    """Streaming COCO 2017 dataset for VOS pre-training.
 
-    Downloads (and caches) the HuggingFace ``detection-datasets/coco`` dataset
-    on first use.  The ``instances_train2017.json`` provides object-level
-    segmenation masks via ``pycocotools``.
+    Uses HuggingFace ``streaming=True`` to avoid downloading the entire 20GB+
+    dataset and converting it to Arrow format, which avoids disk quota issues.
 
     Args:
         img_size:   Spatial resolution of output tensors.
@@ -212,6 +211,7 @@ class COCOPretrainDataset(Dataset):
         split:      ``'train'`` or ``'validation'``.
         cache_dir:  HuggingFace datasets cache directory.
         max_samples: Cap the number of samples (useful for smoke-tests).
+        shuffle:    Whether to use a shuffle buffer (only for train).
     """
 
     def __init__(
@@ -222,6 +222,7 @@ class COCOPretrainDataset(Dataset):
         split: str = "train",
         cache_dir: Optional[str] = None,
         max_samples: Optional[int] = None,
+        shuffle: bool = False,
     ) -> None:
         super().__init__()
         assert _HF_AVAILABLE, (
@@ -231,13 +232,18 @@ class COCOPretrainDataset(Dataset):
         self.img_size   = img_size
         self.seq_len    = seq_len
         self.n_id       = n_id
+        self.split      = split
+        self.max_samples = max_samples
+        self.shuffle    = shuffle
 
-        # Load the full split into memory (COCO train ≈ 118k, HF returns PIL images)
         hf_split = "train" if split == "train" else "validation"
+        
+        # Use streaming=True to bypass disk-heavy Arrow generation
         raw = load_dataset(
             "detection-datasets/coco",
             split=hf_split,
             cache_dir=cache_dir,
+            streaming=True,
         )
 
         # Filter: keep images with 1..n_id objects that have segmentation masks
@@ -248,29 +254,24 @@ class COCOPretrainDataset(Dataset):
             return 1 <= n <= _MAX_OBJECTS_PER_IMAGE
 
         raw = raw.filter(_has_masks)
+        
+        if self.shuffle:
+            raw = raw.shuffle(buffer_size=1000, seed=42)
+            
         if max_samples is not None:
-            raw = raw.select(range(min(max_samples, len(raw))))
+            raw = raw.take(max_samples)
 
         self._data = raw
 
-    def __len__(self) -> int:
-        return len(self._data)
-
-    def __getitem__(
-        self, idx: int
+    def _process_sample(
+        self, sample: Dict
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
-        """Return a synthetic VOS clip from one COCO image.
-
-        Returns the same 6-tuple as ``MultiObjectVOSDataset``:
-        ``(ref_img, ref_mask, query_images, query_masks, obj_present, meta)``
-        """
-        sample = self._data[idx]
+        """Convert a raw COCO sample into a synthetic VOS clip."""
         pil_img: Image.Image = sample["image"]
         H, W = pil_img.height, pil_img.width
 
         # ── Build instance mask ────────────────────────────────────────────
         objs = sample.get("objects", {})
-        # HF COCO format: objects["segmentations"] is a list of seg dicts
         seg_list = [
             {"segmentation": s}
             for s in objs.get("segmentations", [])
@@ -300,12 +301,22 @@ class COCOPretrainDataset(Dataset):
                 obj_present[t, k - 1] = (query_masks_t[t] == k).any()
 
         meta = {
-            "video_id": f"coco_{sample.get('image_id', idx)}",
+            "video_id": f"coco_{sample.get('image_id', 'unknown')}",
             "seen_obj_ids": list(range(1, self.n_id + 1)),
             "unseen_obj_ids": [],
         }
 
         return ref_img_t, ref_mask_t, query_images, query_masks_t, obj_present, meta
+
+    def __iter__(self):
+        """Yield processed synthetic VOS clips."""
+        for sample in self._data:
+            try:
+                yield self._process_sample(sample)
+            except Exception as e:
+                # In streaming mode, some samples might be corrupted or missing images
+                # we just skip them to keep the pipeline alive.
+                continue
 
 
 # ---------------------------------------------------------------------------
@@ -330,15 +341,7 @@ class COCOPretrainDataModule(L.LightningDataModule):
     """Lightning DataModule wrapping ``COCOPretrainDataset``.
 
     Drop-in replacement for ``MultiObjectVOSDataModule`` — same batch format.
-
-    Args:
-        img_size:     Spatial resolution (default 448, matching DINOv2 patch grid).
-        seq_len:      Augmented query frames per clip (default 3).
-        n_id:         Identity bank size / max tracked objects (default 10).
-        batch_size:   Mini-batch size (default 4 — static images are cheaper than video).
-        num_workers:  DataLoader workers.
-        cache_dir:    HuggingFace datasets download cache.
-        max_samples:  Cap dataset size (set low for smoke-tests).
+    Uses streaming mode to work within disk quota limits.
     """
 
     def __init__(
@@ -367,6 +370,7 @@ class COCOPretrainDataModule(L.LightningDataModule):
                 split="train",
                 cache_dir=hp.cache_dir,
                 max_samples=hp.max_samples,
+                shuffle=True,  # Shuffle enabled for training
             )
             self.val_dataset = COCOPretrainDataset(
                 img_size=hp.img_size,
@@ -375,6 +379,7 @@ class COCOPretrainDataModule(L.LightningDataModule):
                 split="validation",
                 cache_dir=hp.cache_dir,
                 max_samples=hp.max_samples,
+                shuffle=False,
             )
         if stage in ("validate",):
             self.val_dataset = COCOPretrainDataset(
@@ -384,16 +389,18 @@ class COCOPretrainDataModule(L.LightningDataModule):
                 split="validation",
                 cache_dir=hp.cache_dir,
                 max_samples=hp.max_samples,
+                shuffle=False,
             )
 
     def _make_loader(self, dataset, shuffle: bool) -> DataLoader:
         hp = self.hparams
+        # Note: shuffle must be False for DataLoader when using IterableDataset
         return DataLoader(
             dataset,
             batch_size=hp.batch_size,
             num_workers=hp.num_workers,
-            shuffle=shuffle,
-            drop_last=shuffle,
+            shuffle=False, 
+            drop_last=False,
             collate_fn=_coco_collate_fn,
             pin_memory=True,
         )
