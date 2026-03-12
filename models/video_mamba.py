@@ -9,6 +9,7 @@ from utils.vos_loss import HybridVOSLoss
 
 from models.components.dinov3_wrapper import DinoV3Wrapper
 from models.components.mobilenetv2_wrapper import MobileNetV2Wrapper
+from models.components.vision_mamba_tiny_wrapper import VisionMambaTinyWrapper
 from models.components.kanga_ssm import KangaSSM
 from models.components.kan_key_adapter import KANKeyAdapter
 from models.components.classification_head import ClassificationHead
@@ -46,7 +47,7 @@ class VideoMambaSystem(L.LightningModule):
 
     def __init__(
         self,
-        dim_in: int = 768,             # DINOv2 ViT-B/14 dim; 256 for MobileNetV2
+        dim_in: int = 768,             # DINOv2 ViT-B/14 dim; e.g. 256(MV2), 192(ViM-tiny)
         dim_out: int = 256,
         num_clf_classes: int = 51,
         num_seg_classes: int = 11,
@@ -60,13 +61,13 @@ class VideoMambaSystem(L.LightningModule):
         # "mobilenetv2" : AOT-style MobileNetV2 (trainable), 256-dim, multi-scale
         encoder_type: str = "dino",
         # Fine-scale dim fed into MemoryBank dual-scale key (-1 → same as dim_in).
-        # MobileNetV2: 96 (pre-projection 16× features at same spatial as stage_3).
+        # MobileNetV2: 96, Vision-Mamba tiny: usually 96.
         dim_in_fine: int = -1,
         # Decoder up2 skip dim (-1 → same as dim_in).
-        # MobileNetV2: 32 (stride-8 features, genuine 28×28 spatial level).
+        # MobileNetV2: 32, Vision-Mamba tiny: usually 64.
         dim_in_s2: int = -1,
         # Decoder up3 skip dim (-1 → same as dim_in).
-        # MobileNetV2: 24 (stride-4 features, genuine 56×56 spatial level).
+        # MobileNetV2: 24, Vision-Mamba tiny: usually 48.
         dim_in_s1: int = -1,
         # Memory-attention propagation
         prop_d_key: int = 256,
@@ -83,6 +84,9 @@ class VideoMambaSystem(L.LightningModule):
         ssm_layers: int = 1,
         use_checkpointing: bool = False,
         fusion_mode: str = "kan_spatial",
+        dec_dim_up1: int = 256,
+        dec_dim_up2: int = 128,
+        dec_dim_up3: int = 64,
         modulator_type: str = "kan",
         # Regularisation
         consistency_weight: float = 0.0,
@@ -92,6 +96,13 @@ class VideoMambaSystem(L.LightningModule):
         mv2_output_stride: int = 16,
         mv2_freeze_at: int = 0,
         mv2_pretrained: bool = True,
+        # Vision-Mamba tiny-specific
+        vim_stem_dim: int = 24,
+        vim_stage0_dim: int = 48,
+        vim_stage1_dim: int = 64,
+        vim_stage2_dim: int = 96,
+        vim_spatial_d_state: int = 8,
+        vim_spatial_layers: int = 1,
         # Training schedule
         max_epochs: int = 20,
         # KAN-SSM Memory Key Adapter
@@ -107,9 +118,18 @@ class VideoMambaSystem(L.LightningModule):
         # dim_in_fine : fine-scale dim for MemoryBank dual-scale key
         # dim_in_s2   : decoder up2 skip (one level coarser than stage_3 spatially)
         # dim_in_s1   : decoder up3 skip (two levels coarser)
-        _dim_fine = dim_in if dim_in_fine < 0 else dim_in_fine
-        _dim_s2   = dim_in if dim_in_s2   < 0 else dim_in_s2
-        _dim_s1   = dim_in if dim_in_s1   < 0 else dim_in_s1
+        if encoder_type == "mobilenetv2":
+            _dim_fine = MobileNetV2Wrapper.DIM_16X if dim_in_fine < 0 else dim_in_fine
+            _dim_s2 = MobileNetV2Wrapper.DIM_8X if dim_in_s2 < 0 else dim_in_s2
+            _dim_s1 = MobileNetV2Wrapper.DIM_4X if dim_in_s1 < 0 else dim_in_s1
+        elif encoder_type == "vision_mamba_tiny":
+            _dim_fine = vim_stage2_dim if dim_in_fine < 0 else dim_in_fine
+            _dim_s2 = vim_stage1_dim if dim_in_s2 < 0 else dim_in_s2
+            _dim_s1 = vim_stage0_dim if dim_in_s1 < 0 else dim_in_s1
+        else:
+            _dim_fine = dim_in if dim_in_fine < 0 else dim_in_fine
+            _dim_s2 = dim_in if dim_in_s2 < 0 else dim_in_s2
+            _dim_s1 = dim_in if dim_in_s1 < 0 else dim_in_s1
 
         # ── Encoder ────────────────────────────────────────────────────
         if encoder_type == "mobilenetv2":
@@ -118,8 +138,24 @@ class VideoMambaSystem(L.LightningModule):
                 freeze_at=mv2_freeze_at,
                 pretrained=mv2_pretrained,
             )
-        else:  # "dino" (default — backward compatible)
+        elif encoder_type == "vision_mamba_tiny":
+            self.feature_extractor = VisionMambaTinyWrapper(
+                out_dim=dim_in,
+                stem_dim=vim_stem_dim,
+                stage0_dim=_dim_s1,
+                stage1_dim=_dim_s2,
+                stage2_dim=_dim_fine,
+                ssm_d_state=vim_spatial_d_state,
+                ssm_layers=vim_spatial_layers,
+                modulator_type=modulator_type,
+            )
+        elif encoder_type == "dino":
             self.feature_extractor = DinoV3Wrapper(freeze=True)
+        else:
+            raise ValueError(
+                f"Unsupported encoder_type '{encoder_type}'. "
+                "Expected one of {'dino', 'mobilenetv2', 'vision_mamba_tiny'}."
+            )
         self.temporal_model = KangaSSM(
             d_model=dim_in,
             d_state=ssm_d_state,
@@ -129,9 +165,9 @@ class VideoMambaSystem(L.LightningModule):
         )
         self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
-        # For MobileNetV2 the decoder skips use the pre-projection stage_2 (96ch)
-        # as up1 skip (same spatial), stage_1 (32ch) for up2, stage_0 (24ch) for up3.
-        # For DINO all three stages are at the same 14×14 resolution (768ch each).
+        # For multi-scale trainable encoders the decoder skips use
+        # stage_2 / stage_1 / stage_0 for up1 / up2 / up3.
+        # For DINO all three stages are at the same 14×14 resolution.
         _dec_up1_skip = _dim_fine  # up1: semantic refinement at same spatial as SSM
         _dec_up2_skip = _dim_s2   # up2: first genuine upsample level
         _dec_up3_skip = _dim_s1   # up3: second genuine upsample level
@@ -139,6 +175,7 @@ class VideoMambaSystem(L.LightningModule):
         self.seg_decoder = SegmentationDecoder(
             dim_ssm=dim_in,
             skip_dims=(_dec_up1_skip, _dec_up2_skip, _dec_up3_skip),
+            decoder_dims=(dec_dim_up1, dec_dim_up2, dec_dim_up3),
             num_classes=num_seg_classes,
             target_size=target_size,
             fusion_mode=fusion_mode,
@@ -195,17 +232,17 @@ class VideoMambaSystem(L.LightningModule):
         ``_build_dec_ms()`` instead, which routes the encoder-native multi-scale
         features to the correct decoder levels.
 
-        For DINOv2 all three are at 14×14 (768-ch each) — same skip and SSM features.
-        For MobileNetV2 ``stage_3`` is the projected 256-ch SSM input; ``stage_2``
-        and ``stage_1`` are the stride-8/stride-4 features used internally but
-        **not** as decoder up1/up2/up3 skips (those have different channel widths
-        handled by ``_build_dec_ms``).
+        For DINOv2 all three are at 14×14 (same channels) — same skip and SSM
+        features. For lightweight multi-scale encoders (MobileNetV2 and
+        Vision-Mamba tiny), ``stage_3`` is the projected SSM input while
+        ``stage_2`` and ``stage_1`` are lower-level features used by the
+        fallback (no-reference) path.
         """
-        if self.hparams.encoder_type == "mobilenetv2":
+        if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny"):
             return {
-                "stage_3": raw["stage_3"],  # 256-ch, stride-16 — projected SSM/memory-bank input
-                "stage_2": raw["stage_1"],  # 32-ch,  stride-8  — NOT used in VOS path (see _build_dec_ms)
-                "stage_1": raw["stage_0"],  # 24-ch,  stride-4  — NOT used in VOS path (see _build_dec_ms)
+                "stage_3": raw["stage_3"],
+                "stage_2": raw["stage_1"],
+                "stage_1": raw["stage_0"],
             }
         # DINOv2 (default)
         return {
@@ -217,13 +254,13 @@ class VideoMambaSystem(L.LightningModule):
     def _get_fine_features(self, raw: dict, t: int | None = None) -> torch.Tensor:
         """Return fine-scale patch tokens for dual-scale MemoryBank updates.
 
-        For DINOv2  → layer_9  (768-ch, 14×14 — deeper semantic than layer_11).
-        For MobileNetV2 → stage_2 (96-ch, 14×14 — pre-projection 16× features).
+        For DINOv2  → layer_9 (14×14).
+        For MobileNetV2 / Vision-Mamba tiny → stage_2 (pre-projection stride-16).
 
         If ``t`` is given, selects frame ``t`` and permutes to ``[B, P, Ch]``.
         Otherwise returns ``[B, T, Ch, P]`` without permuting.
         """
-        key = "stage_2" if self.hparams.encoder_type == "mobilenetv2" else "layer_9"
+        key = "stage_2" if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny") else "layer_9"
         feat = raw[key]
         if t is not None:
             return feat[:, t].permute(0, 2, 1)  # [B, P, Ch]
@@ -236,18 +273,19 @@ class VideoMambaSystem(L.LightningModule):
         ``"stage_1"`` as up1 / up2 / up3 skip features.
 
         For DINOv2 these are the same multi-scale features used internally.
-        For MobileNetV2 the decoder skips are the *pre-projection* and lower
-        stride features, giving genuine multi-scale skip connections:
+        For MobileNetV2 and Vision-Mamba tiny the decoder skips are the
+        *pre-projection* and lower-stride features, giving genuine multi-scale
+        skip connections:
 
             up1 skip  "stage_3"  ← MV2 stage_2  96-ch  14×14  (same-scale refinement)
             up2 skip  "stage_2"  ← MV2 stage_1  32-ch  28×28  (first genuine upsample)
             up3 skip  "stage_1"  ← MV2 stage_0  24-ch  56×56  (second genuine upsample)
         """
-        if self.hparams.encoder_type == "mobilenetv2":
+        if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny"):
             return {
-                "stage_3": raw["stage_2"][:, t:t+1],  # 96-ch, 14×14
-                "stage_2": raw["stage_1"][:, t:t+1],  # 32-ch, 28×28
-                "stage_1": raw["stage_0"][:, t:t+1],  # 24-ch, 56×56
+                "stage_3": raw["stage_2"][:, t:t+1],
+                "stage_2": raw["stage_1"][:, t:t+1],
+                "stage_1": raw["stage_0"][:, t:t+1],
             }
         ms = self._map_ms_features(raw)
         return {k: v[:, t:t+1] for k, v in ms.items()}
@@ -331,7 +369,7 @@ class VideoMambaSystem(L.LightningModule):
             ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
             # Fine-scale reference features for dual-scale memory key.
-            # DINOv2: layer_9 (768-ch, 14×14) | MobileNetV2: stage_2 (96-ch, 14×14)
+            # DINOv2: layer_9 | multi-scale encoders: stage_2
             ref_patch_fine = self._get_fine_features(_ref_features_raw, t=0)  # [B, P2, Ch]
 
             # ── 3. Initialise memory bank with reference frame ──────────
@@ -349,7 +387,7 @@ class VideoMambaSystem(L.LightningModule):
                 # Current frame patches: [B, D, P] → [B, P, D]
                 curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, dim_in]
                 # Fine-scale patches for dual-scale memory update.
-                # DINOv2: layer_9 (768-ch) | MobileNetV2: stage_2 (96-ch, 14×14)
+                # DINOv2: layer_9 | multi-scale encoders: stage_2
                 curr_patch_fine = self._get_fine_features(query_features_raw, t=t)  # [B, P2, Ch]
 
                 # ── 4. Propagation: cross-attend to memory bank ─────────
@@ -376,7 +414,7 @@ class VideoMambaSystem(L.LightningModule):
                 # ── 6. Hierarchical decoding ────────────────────────────
                 # Decoder skip connections differ by encoder type:
                 # DINOv2: all stages at 14×14 (same resolution)
-                # MobileNetV2: stage_2(14×14), stage_1(28×28), stage_0(56×56) → genuine multi-scale
+                # Multi-scale encoders: stage_2(14x14), stage_1(28x28), stage_0(56x56).
                 frame_ms = self._build_dec_ms(query_features_raw, t)
                 logits_t = self.seg_decoder(
                     last_feat, frame_ms, prev_mask=prev_guide_mask
@@ -424,15 +462,15 @@ class VideoMambaSystem(L.LightningModule):
             # [B*P, T, D] → [B, P, T, D] → [B, T, D, P]
             infused_patches = ssm_out_raw.reshape(B, P, T, D).permute(0, 2, 3, 1)
             ssm_cls = ssm_out_raw.reshape(B, P, T, D).mean(dim=1)  # [B, T, D]
-            # For MobileNetV2 the decoder skips differ from the SSM input:
+            # For multi-scale encoders the decoder skips differ from the SSM input:
             #   query_features_ms["stage_3"] = 256-ch (SSM input), but
             #   the decoder's up1 block expects 96-ch (raw stage_2, same spatial).
             # query_features_ms is only correct for DINOv2 (all stages 768-ch, same spatial).
-            if self.hparams.encoder_type == "mobilenetv2":
+            if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny"):
                 dec_ms_full = {
-                    "stage_3": query_features_raw["stage_2"],  # 96-ch, 14×14 — up1 skip
-                    "stage_2": query_features_raw["stage_1"],  # 32-ch, 28×28 — up2 skip
-                    "stage_1": query_features_raw["stage_0"],  # 24-ch, 56×56 — up3 skip
+                    "stage_3": query_features_raw["stage_2"],
+                    "stage_2": query_features_raw["stage_1"],
+                    "stage_1": query_features_raw["stage_0"],
                 }
             else:
                 dec_ms_full = query_features_ms
@@ -676,7 +714,7 @@ class VideoMambaSystem(L.LightningModule):
         prop_params = list(self.memory_bank.parameters()) + list(self.propagation_attention.parameters())
         prop_ids = {id(p) for p in prop_params}
 
-        # For a trainable encoder (MobileNetV2) the backbone must use a much
+        # For trainable encoders (MobileNetV2 / Vision-Mamba tiny) the backbone must use a much
         # lower LR than the randomly-initialised heads to preserve the pretrained
         # ImageNet features.  Applying the full lr=1e-4 corrupts the backbone
         # early in training and causes the characteristic val-J&F plateau.
@@ -688,7 +726,8 @@ class VideoMambaSystem(L.LightningModule):
             if id(p) not in prop_ids and id(p) not in backbone_ids
         ]
 
-        backbone_lr = lr * 0.1 if self.hparams.encoder_type == "mobilenetv2" else lr * 0.01
+        trainable_backbones = {"mobilenetv2", "vision_mamba_tiny"}
+        backbone_lr = lr * 0.1 if self.hparams.encoder_type in trainable_backbones else lr * 0.01
 
         optimizer = torch.optim.AdamW(
             [

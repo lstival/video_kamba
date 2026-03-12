@@ -1,0 +1,60 @@
+# Lightweight Vision-Mamba + KAN preset for full trainable VOS pipeline.
+# Usage:
+#   python train.py model=vision_mamba_tiny datamodule=youtubevos
+_target_: models.video_mamba.VideoMambaSystem
+
+# Encoder
+encoder_type: vision_mamba_tiny
+dim_in: 192
+dim_out: 256
+
+# Multi-scale dims from encoder
+# stage_2: stride-16 (fine), stage_1: stride-8, stage_0: stride-4
+dim_in_fine: 96
+dim_in_s2: 64
+dim_in_s1: 48
+
+# Vision-Mamba tiny internals
+vim_stem_dim: 24
+vim_stage0_dim: 48
+vim_stage1_dim: 64
+vim_stage2_dim: 96
+vim_spatial_d_state: 8
+vim_spatial_layers: 1
+
+# Lightweight decoder widths (up1/up2/up3)
+dec_dim_up1: 160
+dec_dim_up2: 96
+dec_dim_up3: 48
+
+# Task heads
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+
+# Image/output resolution
+target_size: 480
+learning_rate: 1e-4
+vos_loss_beta: 0.5
+
+# KAN-guided fusion and temporal model
+fusion_mode: 'kan_spatial'
+modulator_type: 'kan'
+ssm_d_state: 16
+ssm_layers: 1
+use_checkpointing: false
+use_ref_context: true
+consistency_weight: 0.0
+
+# Memory-attention propagation (lightweight)
+prop_d_key: 192
+prop_d_value: 192
+prop_n_heads: 6
+prop_dropout: 0.1
+max_mem_frames: 5
+memory_update_freq: 1
+scheduled_sampling_rate: 0.3
+prop_use_dual_scale: true
+
+# Training schedule helper for cosine T_max fallback
+max_epochs: 20

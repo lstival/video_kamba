@@ -403,6 +403,8 @@ class SegmentationDecoder(nn.Module):
         dim_ssm:    SSM output channel dimension (384 for Hiera-B+).
         skip_dims:  Tuple of (skip1, skip2, skip3) channel dims for up1/up2/up3.
                     Defaults to Hiera-B+ native dims ``(384, 192, 96)``.
+        decoder_dims: Tuple of decoder channel widths for up1/up2/up3.
+                     Defaults to ``(256, 128, 64)``.
         num_classes: Segmentation output channels (background + n_id).
         target_size: Final spatial output resolution (default 224).
         fusion_mode: Up-block variant — see block class map below.
@@ -411,6 +413,7 @@ class SegmentationDecoder(nn.Module):
         self,
         dim_ssm: int = 384,
         skip_dims: tuple[int, int, int] = (384, 192, 96),
+        decoder_dims: tuple[int, int, int] = (256, 128, 64),
         num_classes: int = 11,
         target_size: int = 224,
         fusion_mode: str = "kan_spatial",
@@ -421,6 +424,7 @@ class SegmentationDecoder(nn.Module):
         self.fusion_mode = fusion_mode
 
         skip1, skip2, skip3 = skip_dims  # per-level channel dims
+        dec1, dec2, dec3 = decoder_dims
 
         BlockClass = {
             "concat": ConcatUpBlock,
@@ -434,16 +438,21 @@ class SegmentationDecoder(nn.Module):
 
         use_g = self.fusion_mode in ("kan_spatial", "kan_cross_attn")
 
+        def _make_up_block(in_ch: int, skip_ch: int, out_ch: int) -> nn.Module:
+            if BlockClass is KANSpatialGatingUpBlock:
+                return BlockClass(in_ch, skip_ch, out_ch, use_mask_guidance=use_g)
+            return BlockClass(in_ch, skip_ch, out_ch)
+
         # Genuine top-down pyramid — each skip has a different spatial resolution.
         # up1: SSM (14×14) fused with Stage 3 (14×14)  → 256-ch  (semantic refinement)
         # up2: 256 (14×14) fused with Stage 2 (28×28)  → 128-ch  (first real upsample)
         # up3: 128 (28×28) fused with Stage 1 (56×56)  →  64-ch  (second real upsample)
-        self.up1 = BlockClass(dim_ssm, skip1, 256, use_mask_guidance=use_g)
-        self.up2 = BlockClass(256,     skip2, 128, use_mask_guidance=use_g)
-        self.up3 = BlockClass(128,     skip3,  64, use_mask_guidance=use_g)
+        self.up1 = _make_up_block(dim_ssm, skip1, dec1)
+        self.up2 = _make_up_block(dec1, skip2, dec2)
+        self.up3 = _make_up_block(dec2, skip3, dec3)
 
         self.final_head = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.Conv2d(dec3, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, num_classes, kernel_size=1),
         )
