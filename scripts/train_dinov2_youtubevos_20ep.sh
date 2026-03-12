@@ -2,7 +2,7 @@
 #SBATCH --job-name=dinov2_ytvos_100ep
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/dinov2_ytvos_100ep_%j.out
@@ -55,8 +55,10 @@ python train.py \
     ++model.target_size=448 \
     ++model.scheduled_sampling_rate=0.3 \
     ++datamodule.img_size=448 \
+    ++datamodule.num_workers=8 \
     ++trainer.max_epochs=100 \
     ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     ++logger.name="dinov2_ytvos_100ep" \
     ++callbacks.monitor=val_vos_J_and_F \
     ++callbacks.mode=max \

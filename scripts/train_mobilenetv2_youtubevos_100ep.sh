@@ -2,7 +2,7 @@
 #SBATCH --job-name=mobilenetv2_ytvos_100ep
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/slurm/mobilenetv2_ytvos_100ep_%j.out
@@ -45,8 +45,10 @@ python train.py \
     model=mobilenetv2 \
     datamodule=youtubevos \
     ++model.target_size=480 \
+    ++datamodule.num_workers=8 \
     ++trainer.max_epochs=100 \
     ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     ++logger.name="mobilenetv2_ytvos_100ep" \
     ++callbacks.monitor=val_vos_J_and_F \
     ++callbacks.mode=max \

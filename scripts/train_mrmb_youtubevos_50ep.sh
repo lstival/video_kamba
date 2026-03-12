@@ -14,7 +14,10 @@ export PYTHONPATH=$PYTHONPATH:.
 # Training with Reference Anchors (MRMB)
 python train.py \
     datamodule=youtubevos \
+    ++datamodule.num_workers=8 \
     trainer.max_epochs=50 \
+    ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     model.learning_rate=1e-4 \
     model.propagation_mode=soft_mask \
     +model.use_ref_context=True \

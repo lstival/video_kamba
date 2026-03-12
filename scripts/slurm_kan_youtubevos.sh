@@ -22,8 +22,11 @@ echo "Current Branch: $(git rev-parse --abbrev-ref HEAD)"
 python train.py \
     datamodule=youtubevos \
     datamodule.batch_size=2 \
+    ++datamodule.num_workers=8 \
     trainer.max_epochs=20 \
     trainer.devices=1 \
+    ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     model.fusion_mode=kan_spatial \
     model.modulator_type=kan \
     model.learning_rate=1e-5 \

@@ -2,7 +2,7 @@
 #SBATCH --job-name=dinov2_ytvos_ft
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/dinov2_ytvos_ft_%j.out
@@ -113,6 +113,7 @@ python train.py \
     ++model.learning_rate=2e-5 \
     ++model.scheduled_sampling_rate=0.5 \
     ++datamodule.img_size=448 \
+    ++datamodule.num_workers=8 \
     ++trainer.max_epochs=30 \
     ++trainer.precision="16-mixed" \
     ++trainer.gradient_clip_val=0.5 \

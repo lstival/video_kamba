@@ -65,6 +65,9 @@ python train.py \
     ++logger.name="coco_pretrain_15ep" \
     ++callbacks.monitor=val_loss \
     ++callbacks.mode=min \
+    ++datamodule.num_workers=8 \
+    ++datamodule.cache_dir="${PROJECT_ROOT}/data/coco_cache" \
+    ++datamodule.streaming=false \
     "$@"
 
 echo ""

@@ -20,8 +20,11 @@ echo "Starting YouTube-VOS Training (100 Epochs) on $(hostname)"
 python train.py \
     datamodule=youtubevos \
     datamodule.batch_size=2 \
+    ++datamodule.num_workers=8 \
     trainer.max_epochs=100 \
     trainer.devices=1 \
+    ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     model.learning_rate=1e-5 \
     logger=comet \
     ++logger.project_name="vos-advanced-pretrain" \

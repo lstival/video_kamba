@@ -2,7 +2,7 @@
 #SBATCH --job-name=v_kamba_ytbvos
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=64000
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/youtubevos_%j.out
@@ -38,6 +38,9 @@ mkdir -p logs/slurm
 python train.py \
     datamodule=youtubevos \
     model.num_seg_classes=11 \
+    ++datamodule.num_workers=8 \
+    ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     "$@"
 
 echo ""

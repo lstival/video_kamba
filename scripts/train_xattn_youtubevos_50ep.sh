@@ -17,7 +17,10 @@ mkdir -p logs/cross_attention_bridge
 python train.py \
     datamodule=youtubevos \
     model=default \
+    ++datamodule.num_workers=8 \
     trainer.max_epochs=50 \
+    ++trainer.precision="16-mixed" \
+    ++trainer.gradient_clip_val=0.5 \
     model.fusion_mode=kan_cross_attn \
     model.scheduled_sampling_rate=0.5 \
     +model.use_ref_context=True

@@ -19,8 +19,10 @@ export PYTHONPATH=$PYTHONPATH:.
 # Run training for 50 epochs on YouTube-VOS
 python train.py \
     datamodule=youtubevos \
+    ++datamodule.num_workers=8 \
     trainer.max_epochs=50 \
     trainer.precision=16-mixed \
+    ++trainer.gradient_clip_val=0.5 \
     model.propagation_mode=soft_mask \
     model.learning_rate=1e-4 \
     hydra.run.dir=logs/rsp_masked_decoder/youtubevos_${SLURM_JOB_ID} \

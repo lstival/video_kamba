@@ -20,7 +20,7 @@ n_id: 10
 
 # Larger batch than video — static images need less memory
 batch_size: 4
-num_workers: 4
+num_workers: 8
 
 # HuggingFace datasets cache directory (set to shared storage on the cluster)
 cache_dir: /home/WUR/stiva001/.cache/huggingface

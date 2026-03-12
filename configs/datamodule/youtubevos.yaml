@@ -28,7 +28,7 @@ n_id: 10
 # num_seg_classes: 11  (set in configs/model/default.yaml)
 
 batch_size: 2      # 480p frames require larger GPU memory
-num_workers: 4
+num_workers: 8
 
 # Apply kornia affine + TPS augmentation on train split
 augment_train: true

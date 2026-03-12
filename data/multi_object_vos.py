@@ -277,6 +277,23 @@ class MultiObjectVOSDataset(Dataset):
         augment:      Whether to apply spatial augmentation (train only).
     """
 
+    @staticmethod
+    def _extract_categories(meta_path: str) -> Set[str]:
+        """Extract all unique category names from a YouTube-VOS meta.json."""
+        cats: Set[str] = set()
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    raw = json.load(f)
+                for v in raw.get("videos", {}).values():
+                    for o in v.get("objects", {}).values():
+                        c = o.get("category")
+                        if c:
+                            cats.add(c)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return cats
+
     def __init__(
         self,
         root_dir: str,
@@ -308,6 +325,11 @@ class MultiObjectVOSDataset(Dataset):
         # YouTube-VOS: parse meta.json for seen/unseen category tracking
         self._meta: Dict[str, Dict] = {}
         if dataset_type == "youtubevos":
+            # Identify unseen categories by comparing train vs valid
+            train_cats = self._extract_categories(os.path.join(root_dir, "train", "meta.json"))
+            valid_cats = self._extract_categories(os.path.join(root_dir, "valid", "meta.json"))
+            unseen_categories = valid_cats - train_cats
+            
             meta_path = os.path.join(root_dir, split, "meta.json")
             if os.path.exists(meta_path):
                 with open(meta_path, "r") as fh:
@@ -318,10 +340,13 @@ class MultiObjectVOSDataset(Dataset):
                     unseen_ids: List[int] = []
                     for obj_str, obj_info in vid_data.get("objects", {}).items():
                         oid = int(obj_str)
-                        if obj_info.get("split", "seen") == "seen":
-                            seen_ids.append(oid)
-                        else:
+                        category = obj_info.get("category", "")
+                        # Classify based on category since "split" field is missing
+                        if category in unseen_categories:
                             unseen_ids.append(oid)
+                        else:
+                            seen_ids.append(oid)
+                    
                     self._meta[vid_id] = {
                         "seen_obj_ids": seen_ids,
                         "unseen_obj_ids": unseen_ids,

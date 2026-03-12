@@ -24,7 +24,7 @@ img_size: 480
 n_id: 10
 
 batch_size: 2
-num_workers: 4
+num_workers: 8
 
 # Apply kornia affine + TPS augmentation on train split
 augment_train: true

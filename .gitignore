@@ -5,3 +5,22 @@ venv/
 __pycache__/
 eval_results/
 sota/
+
+# Temp files
+tmp/
+*.tmp
+*.temp
+.DS_Store
+.cache/
+
+# Models, weights and checkpoints
+checkpoints/
+*.ckpt
+*.pth
+*.h5
+*.weights
+*.bin
+lightning_logs/
+outputs/
+results/
+slurm_logs/
