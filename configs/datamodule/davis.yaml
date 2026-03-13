@@ -3,7 +3,7 @@ _target_: data.davis.DAVISDataModule
 
 data_dir: ${work_dir}/data/DAVIS/DAVIS
 batch_size: 2
-num_workers: 4
+num_workers: 8
 seq_len: 16
 img_size: 224
-num_classes: 2
+test_split: val

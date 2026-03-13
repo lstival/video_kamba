@@ -13,3 +13,9 @@ precision: 16-mixed
 
 deterministic: false
 fast_dev_run: false
+
+# Clip gradient norm to prevent explosions in the T=16 sequential propagation loop.
+# Without this, SSM hidden-state gradients accumulate across frames and cause
+# loss spikes that prevent convergence.
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm

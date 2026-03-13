@@ -1,0 +1,34 @@
+# YouTube-VOS 2019 datamodule configuration
+# Usage: python train.py datamodule=youtubevos
+#
+# Expected data layout:
+#   data/YouTubeVOS/train/{JPEGImages,Annotations}/<video_id>/
+#   data/YouTubeVOS/train/meta.json
+#   data/YouTubeVOS/valid/{JPEGImages,Annotations}/<video_id>/
+#   data/YouTubeVOS/valid/meta.json
+#
+# Dataset stats (2019 split):
+#   Train: ~3,471 videos | Valid: ~507 videos
+#   Categories: 65 seen + 26 unseen during validation
+_target_: data.multi_object_vos.MultiObjectVOSDataModule
+
+dataset_type: youtubevos
+data_dir: ${work_dir}/data/YouTubeVOS
+
+# Sequence length: 5 query frames per clip (first-frame anchor + 5 queries)
+seq_len: 5
+
+# Spatial resolution – 480 matches the native annotation resolution
+img_size: 480
+
+# Identity bank size: max simultaneous tracked objects per clip
+n_id: 10
+
+# Segmentation output channels = background + n_id  (must match model.num_seg_classes)
+# num_seg_classes: 11  (set in configs/model/default.yaml)
+
+batch_size: 2      # 480p frames require larger GPU memory
+num_workers: 8
+
+# Apply kornia affine + TPS augmentation on train split
+augment_train: true

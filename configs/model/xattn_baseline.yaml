@@ -1,0 +1,18 @@
+# Cross-Attention Baseline model — ablation counterpart to the KAN model.
+# Overrides fusion_mode to use Cross-Attention instead of KANSpatialGating.
+_target_: models.video_mamba.VideoMambaSystem
+
+dim_in: 768
+dim_out: 256
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+target_size: 224
+learning_rate: 1e-4
+vos_loss_beta: 0.5
+# --- Ablation overrides ---
+fusion_mode: 'cross_attn'
+modulator_type: 'mlp'
+# -------------------------
+propagation_mode: 'soft_mask'
+scheduled_sampling_rate: 0.0

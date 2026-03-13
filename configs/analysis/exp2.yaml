@@ -1,0 +1,34 @@
+# Experiment 2 — Spatial Gate Fidelity  (IoU_gate, Geometric Proof)
+# Measures how well G_k from the KAN decoder aligns with the GT object mask
+# versus averaged cross-attention maps from a CrossAttention baseline.
+
+# Paths to trained checkpoints
+kan_ckpt: ???
+xattn_ckpt: ???   # model trained with fusion_mode='cross_attn'
+
+# DAVIS data root
+data_dir: data/DAVIS/DAVIS
+
+# Output directory
+output_dir: results/exp2
+
+# Binarisation threshold for the gate/attention map
+tau: 0.5
+
+# Which decoder pyramid levels to include in the averaged IoU_gate.
+# 0=up1 (14x14), 1=up2 (28x28), 2=up3 (56x56)
+pyramid_levels: [0, 1, 2]
+
+# Whether to save per-sequence gate overlay images
+save_visualizations: true
+vis_max_seqs: 10   # number of sequences to visualise
+
+# Dataloader
+batch_size: 1
+num_workers: 4
+img_size: 224
+seq_len: 8
+max_batches: -1   # -1 = full validation set
+
+# Reproducibility
+seed: 42

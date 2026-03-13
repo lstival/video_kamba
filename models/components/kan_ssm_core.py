@@ -297,6 +297,100 @@ class FastKANModulator(nn.Module):
         return self.kan.regularization_loss()
 
 
+class MLPModulator(nn.Module):
+    """Two-layer MLP modulator — drop-in baseline for FastKANModulator.
+
+    Used in ablation experiments to provide a dense, entangled gating
+    vector as a contrast to the sparse KAN modulation.
+
+    The hidden dimension ``input_dim`` gives the same width as the input,
+    ensuring a fair comparison without inflating the parameter count.
+
+    Args:
+        input_dim: Dimension of the input features.
+        output_dim: Dimension of the modulation output.
+        grid_size: Accepted for API parity with FastKANModulator; not used.
+        activation: Activation to ensure positive modulation
+            (``'softplus'``, ``'sigmoid'``, or ``'exp'``).
+
+    Shape:
+        - Input:  ``[B, input_dim]``
+        - Output: ``[B, output_dim]``
+
+    Example::
+
+        >>> mod = MLPModulator(768, 768)
+        >>> out = mod(torch.randn(4, 768))
+        >>> out.shape
+        torch.Size([4, 768])
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        grid_size: int = 8,          # noqa: ARG002  — API parity only
+        activation: Literal["softplus", "sigmoid", "exp"] = "softplus",
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}")
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
+
+        hidden_dim = input_dim  # symmetric 2-layer MLP
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.activation_type = activation
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialise output linear so activation(0) ≈ 1.0 at start of training."""
+        # Last linear in self.net is index 3
+        nn.init.zeros_(self.net[3].weight)
+        if self.activation_type == "softplus":
+            # softplus(x) + 0.1 = 1.0  =>  x ≈ 0.378
+            nn.init.constant_(self.net[3].bias, 0.38)
+        else:
+            nn.init.zeros_(self.net[3].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute dense modulation factors.
+
+        Args:
+            x: Input tensor ``[B, input_dim]``.
+
+        Returns:
+            Modulation factors ``[B, output_dim]``, positive-valued.
+        """
+        out = self.net(x)
+        if self.activation_type == "softplus":
+            return F.softplus(out) + 0.1
+        elif self.activation_type == "sigmoid":
+            return torch.sigmoid(out) + 0.5
+        elif self.activation_type == "exp":
+            return torch.exp(out.clamp(-5, 5))
+        return out
+
+    def regularization_loss(self) -> torch.Tensor:
+        """L1 regularisation on weight matrices."""
+        return sum(p.abs().mean() for p in self.parameters() if p.ndim >= 2)
+
+    def extra_repr(self) -> str:
+        hidden = self.net[1].out_features
+        return (
+            f"input_dim={self.net[1].in_features}, "
+            f"hidden_dim={hidden}, "
+            f"output_dim={self.net[3].out_features}, "
+            f"activation={self.activation_type}"
+        )
+
+
 class IntricateKANSSMCore(nn.Module):
     """Intricate KAN-SSM Core with learned B and C modulation.
     
@@ -332,8 +426,10 @@ class IntricateKANSSMCore(nn.Module):
         modulation_mode: Literal["element", "factor", "mixture"] = "factor",
         n_mixtures: int = 4,  # Only used if modulation_mode == "mixture"
         use_fast_kan: bool = False,
+        modulator_type: str = "kan",
         use_mamba_kernels: bool = True,
         learnable_A: bool = False,  # Default to False for stability
+        identity_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         
@@ -344,6 +440,7 @@ class IntricateKANSSMCore(nn.Module):
         self.modulation_mode = modulation_mode
         self.n_mixtures = n_mixtures
         self.use_fast_kan = use_fast_kan
+        self.modulator_type = modulator_type
         self.use_mamba_kernels = use_mamba_kernels and HAS_MAMBA_KERNELS
         
         # Initialize HiPPO-LegS matrices for long-range dependencies
@@ -376,39 +473,49 @@ class IntricateKANSSMCore(nn.Module):
             self.C = nn.Parameter(C_init.unsqueeze(0).repeat(inner_dim, 1) * scale)
         
         # KAN Modulators for B matrix (input-to-state)
-        # Select modulator class based on flag
-        ModulatorClass = FastKANModulator if use_fast_kan else KANModulator
+        # Select modulator class based on modulator_type flag.
+        # 'mlp'  → dense two-layer MLP (ablation baseline)
+        # 'kan'  → FastKAN (RBF) or B-spline KAN depending on use_fast_kan
+        if modulator_type == "mlp":
+            ModulatorClass = MLPModulator
+        else:
+            ModulatorClass = FastKANModulator if use_fast_kan else KANModulator
         
         if modulate_B:
+            # We allow an optional identity_dim to be concatenated for modulation
+            mod_in_dim = inner_dim + (identity_dim if identity_dim is not None else 0)
             if modulation_mode == "element":
                 # Single scalar modulation per sample
                 self.B_modulator = ModulatorClass(
-                    inner_dim, 1, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, 1, grid_size=grid_size, activation="softplus"
                 )
             elif modulation_mode == "factor":
                 # Per-feature modulation factors
                 self.B_modulator = ModulatorClass(
-                    inner_dim, inner_dim, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, inner_dim, grid_size=grid_size, activation="softplus"
                 )
             elif modulation_mode == "mixture":
                 # Mixture weights for B prototypes
                 self.B_modulator = ModulatorClass(
-                    inner_dim, n_mixtures, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, n_mixtures, grid_size=grid_size, activation="softplus"
                 )
         
         # KAN Modulators for C matrix (state-to-output)
         if modulate_C:
+            mod_in_dim = inner_dim + (identity_dim if identity_dim is not None else 0)
             if modulation_mode == "element":
                 self.C_modulator = ModulatorClass(
-                    inner_dim, 1, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, 1, grid_size=grid_size, activation="softplus"
                 )
             elif modulation_mode == "factor":
+                # Per-output modulation: [B, D] -> scale each row of C
                 self.C_modulator = ModulatorClass(
-                    inner_dim, inner_dim, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, inner_dim, grid_size=grid_size, activation="softplus"
                 )
             elif modulation_mode == "mixture":
+                # Mixture-of-experts
                 self.C_modulator = ModulatorClass(
-                    inner_dim, n_mixtures, grid_size=grid_size, activation="softplus"
+                    mod_in_dim, n_mixtures, grid_size=grid_size, activation="softplus"
                 )
         
         # Identity matrix for discretization
@@ -444,11 +551,13 @@ class IntricateKANSSMCore(nn.Module):
     def _get_modulated_B(
         self,
         u_t: Float[torch.Tensor, "B D"],
+        identity: Optional[Float[torch.Tensor, "B D_id"]] = None,
     ) -> Float[torch.Tensor, "B N D"]:
         """Get KAN-modulated B matrix for current input.
         
         Args:
             u_t: Current input [batch, inner_dim]
+            identity: Optional object identity vector [batch, identity_dim]
             
         Returns:
             Modulated B matrix [batch, state_dim, inner_dim]
@@ -459,8 +568,13 @@ class IntricateKANSSMCore(nn.Module):
             # No modulation, broadcast base B
             return self.B.unsqueeze(0).expand(batch, -1, -1)
         
+        # Combine input and identity for modulation
+        mod_in = u_t
+        if identity is not None:
+            mod_in = torch.cat([u_t, identity], dim=-1)
+
         # Compute modulation from KAN
-        mod = self.B_modulator(u_t)  # [B, ?]
+        mod = self.B_modulator(mod_in)  # [B, ?]
         
         if self.modulation_mode == "element":
             # Scalar modulation: [B, 1] -> scale entire B
@@ -480,6 +594,7 @@ class IntricateKANSSMCore(nn.Module):
     def _get_modulated_C(
         self,
         x: Float[torch.Tensor, "B D"],
+        identity: Optional[Float[torch.Tensor, "B D_id"]] = None,
     ) -> Float[torch.Tensor, "B D N"]:
         """Get KAN-modulated C matrix based on input (not state).
         
@@ -487,6 +602,7 @@ class IntricateKANSSMCore(nn.Module):
         
         Args:
             x: Current input [batch, inner_dim]
+            identity: Optional object identity vector [batch, identity_dim]
             
         Returns:
             Modulated C matrix [batch, inner_dim, state_dim]
@@ -497,8 +613,13 @@ class IntricateKANSSMCore(nn.Module):
             # No modulation, broadcast base C
             return self.C.unsqueeze(0).expand(batch, -1, -1)
         
+        # Combine input and identity for modulation
+        mod_in = x
+        if identity is not None:
+            mod_in = torch.cat([x, identity], dim=-1)
+
         # Compute modulation from KAN based on input
-        mod = self.C_modulator(x)  # [B, ?]
+        mod = self.C_modulator(mod_in)  # [B, ?]
         
         if self.modulation_mode == "element":
             # Scalar modulation
@@ -516,23 +637,30 @@ class IntricateKANSSMCore(nn.Module):
             return C_mix
     
     def _compute_C_modulation_batched(
-        self, x: Float[torch.Tensor, "BT D"]
+        self, x: Float[torch.Tensor, "BT D"],
+        identity: Optional[Float[torch.Tensor, "BT D_id"]] = None,
     ) -> Float[torch.Tensor, "BT D N"]:
         """Compute C modulation for batched inputs.
         
         Args:
             x: Flattened input [batch*seq_len, inner_dim]
+            identity: Flattened identity context [batch*seq_len, identity_dim]
             
         Returns:
             Modulated C matrices [batch*seq_len, inner_dim, state_dim]
         """
         bt = x.size(0)
         
+        # Combine input and identity
+        mod_in = x
+        if identity is not None:
+             mod_in = torch.cat([x, identity], dim=-1)
+
         if not self.modulate_C:
             return self.C.unsqueeze(0).expand(bt, -1, -1)
         
         # Get modulation factors
-        mod = self.C_modulator(x)  # [BT, ?]
+        mod = self.C_modulator(mod_in)  # [BT, ?]
         
         if self.modulation_mode == "element":
             # Scalar modulation
@@ -551,117 +679,51 @@ class IntricateKANSSMCore(nn.Module):
         self,
         x: Float[torch.Tensor, "B T D"],
         delta: Float[torch.Tensor, "B T 1"],
-    ) -> Float[torch.Tensor, "B T D"]:
+        initial_state: Optional[Float[torch.Tensor, "B N 1"]] = None,
+        return_last_state: bool = False,
+        identity: Optional[Float[torch.Tensor, "B D_id"]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Selective scan with KAN-modulated B and C matrices (fully optimized).
         
-        This version batches ALL computations:
-        - B modulations computed for all timesteps upfront
-        - C modulations computed for all timesteps upfront (based on input)
-        - Matrix exponentials batched across time
-        - Only state updates remain sequential (fundamental RNN constraint)
-        - Output computation is vectorized post-loop
+        This method implements the core 'Temporal Modeling' step of the Training/Inference processes.
+        It uses KAN-based modulation factors to adjust the SSM matrices dynamically.
         
         Args:
-            x: Input sequence [batch, seq_len, inner_dim]
-            delta: Step sizes [batch, seq_len, 1]
+            x: Input sequence [batch, seq_len, inner_dim].
+            delta: Step sizes [batch, seq_len, 1].
+            initial_state: Optional initial hidden state [batch, state_dim, 1].
+            return_last_state: Whether to return the final hidden state.
+            identity: Optional object identity vector [batch, identity_dim].
             
         Returns:
-            Output sequence [batch, seq_len, inner_dim]
+            Output sequence [batch, seq_len, inner_dim] or 
+            tuple (output, final_state).
         """
         batch, seq_len, _ = x.shape
         device = x.device
         dtype = x.dtype
         
-        # === OPTIMIZED KERNEL PATH (Mamba SSM) ===
-        if self.use_mamba_kernels:
-            # Prepare inputs for selective_scan_fn
-            # Expected shapes:
-            # u: [B, D, L]
-            # delta: [B, D, L]
-            # A: [D, N]
-            # B: [B, N, L] 
-            # C: [B, N, L] 
-            
-            # 1. Transpose x and delta to [B, D, L]
-            u_ssm = x.transpose(1, 2)
-            delta_ssm = delta.transpose(1, 2)
-            
-            # 2. Compute Modulated B and C
-            x_flat = x.reshape(batch * seq_len, -1)
-            
-            # B Modulation
-            if self.modulate_B:
-                # [B*T, N, D] -> [B, T, N, D] -> [B, D, N, T] ? 
-                # Mamba expects B matrix of shape [B, N, L] (typically input-independent B per channel means G=1)
-                # KAN-Mamba modulates B per 'timestep'.
-                # selective_scan_fn supports variable B if it has shape [B, G, N, L] or [B, N, L].
-                
-                # Let's assume standard mamba mode where we produce B_t per step
-                B_mod_flat = self._compute_B_modulation_batched(x_flat) # [B*T, N, D]
-                # We need to reduce D. Standard Mamba projects to N directly (D->N).
-                # Here we have [N, D] full matrix.
-                # optimized kernels often assume B is [B, G, N, L].
-                # Our intricate design allows full B matrix [N, D].
-                # Making this compatible with standard selective_scan is TRICKY because 
-                # standard scan assumes diagonal or low-rank structure usually implicitly.
-                # Actually, selective_scan_fn takes B: (batch, d_state, seqlen) !!!
-                # This implies B is shared across channels D, or we have groups.
-                
-                # CRITICAL: If we want to use mamba_ssm kernels, we must conform to its constraints.
-                # Typically B is (B, N, L). This means B projects u_t (D) -> state (N) using a rank-1 projection u_t * B_t?
-                # No, standard Mamba: dx/dt = A x + B u. A is diagonal (D, N). B is (B, N, L).
-                # u is (B, D, L).
-                # Wait, standard Mamba B is (B, N, L). This means B is NOT a matrix [N, D]. 
-                # It effectively broadcasts or dots?
-                # In Mamba paper: B_t is (N,). So u_t * B_t is not possible if u_t is (D,)
-                # Actually in Mamba, B_projection outputs (B, G, N, L).
-                # Then x = A x + B * u.
-                # If u is (B, D, L) and B is (B, N, L), how does it multiply?
-                # It's usually elementwise broadcast over D (input channels) if N=N and we just scale?
-                pass
-                
-                # For now, to be safe and fast, if we are using the 'Intricate' dense B [N, D] concept,
-                # it is NOT compatible with standard `selective_scan_fn` which expects simpler B structure.
-                # HOWEVER, if our modulation is "element" or "factor", maybe we can adapt.
-                
-                # Fallback: If we can't map to selective_scan_fn easily, we must use the manual path.
-                # Given 'Intricate' KAN-SSM defined B as matrix [N, D], this is fully general SSM.
-                # Mamba's selective_scan is for Diagonal/Structured SSM.
-                # A is diagonal in our init (HiPPO).
-                
-                # A is [N, N] in our code, but `selective_scan_fn` expects A to be [D, N] (diagonal per channel).
-                # Our A is full matrix [N, N].
-                # selective_scan_fn ONLY supports Diagonal A.
-                
-                # CONCLUSION: We CANNOT use `selective_scan_fn` directly with full matrix A!
-                # Our code uses `A_expm = torch.matrix_exp`. This implies A is dense.
-                # Mamba relies on A being diagonal for speed.
-                
-                # Optimization Strategy Update:
-                # We can only use `mamba_ssm` if we Diagonalize A.
-                # HiPPO A is NOT diagonal. However, it can be approximated or we can diagonalize it.
-                # But for this specific task, keeping the "Intricate" design (Dense A) means we are bound to Python loops or custom CUDA.
-                
-                # FORCE FALLBACK to Python Loop if A is not diagonal?
-                # Actually, let's keep Python loop for correctness but implement optimizations:
-                # 1. Batched modulation (already done).
-                # 2. FastKAN (done).
-                # 3. Use JIT compilation?
-                
-                pass
+        # === OPTIMIZED KERNEL PATH (NOT COMPATIBLE WITH INTENSE B DISCRETIZATION) ===
+        # (Keeping the infrastructure but following the Python path for full SSM)
 
         # === PRECOMPUTE ALL MODULATIONS FOR ALL TIMESTEPS ===
         x_flat = x.reshape(batch * seq_len, -1)  # [B*T, D]
         
+        # Broadcast identity over time if provided
+        id_flat = None
+        if identity is not None:
+             # identity is [B, D_id] -> [B, T, D_id] -> [B*T, D_id]
+             id_flat = identity.unsqueeze(1).repeat(1, seq_len, 1).reshape(batch * seq_len, -1)
+
         # B modulations
         if self.modulate_B:
-            B_mod_flat = self._compute_B_modulation_batched(x_flat)  # [B*T, N, D]
+            B_mod_flat = self._compute_B_modulation_batched(x_flat, identity=id_flat)  # [B*T, N, D]
             B_mod_all = B_mod_flat.view(batch, seq_len, self.state_dim, self.inner_dim)
         else:
             B_mod_all = self.B.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1, -1)
         
         # C modulations (NOW BASED ON INPUT, NOT STATE!)
-        C_mod_flat = self._compute_C_modulation_batched(x_flat)  # [B*T, D, N]
+        C_mod_flat = self._compute_C_modulation_batched(x_flat, identity=id_flat)  # [B*T, D, N]
         C_mod_all = C_mod_flat.view(batch, seq_len, self.inner_dim, self.state_dim)  # [B, T, D, N]
         
         # === PRECOMPUTE MATRIX EXPONENTIALS ===
@@ -678,36 +740,25 @@ class IntricateKANSSMCore(nn.Module):
         eye = self.eye_state.to(device=device, dtype=dtype)
         
         # We use a robust discretization for the integral: (exp(A*delta) - I) * A^-1
-        # For better stability, especially if A is learnable, we use a Taylor approximation
-        # for cases where A might be singular or poorly conditioned.
-        # Fallback to Euler discretization (B_disc = delta * B) if solve fails or is unstable.
-        
         A_expand = self.A.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1, -1)
         A_flat = A_expand.reshape(batch * seq_len, self.state_dim, self.state_dim)
         diff_flat = (A_expm_flat - eye)
         
         try:
             # Try to solve the ZOH integral: A * integral = exp(A*delta) - I
-            # Add small epsilon to diagonal for stability
             A_stable = A_flat + 1e-6 * eye.unsqueeze(0)
             integral_flat = torch.linalg.solve(A_stable, diff_flat)
-            
-            # Sanity check for NaNs in solve
             if torch.isnan(integral_flat).any():
-                # Fallback to first-order approximation
                 integral_flat = delta_expanded.view(-1, 1, 1) * (eye.unsqueeze(0) + 0.5 * A_scaled_flat)
         except RuntimeError:
-            # Fallback to first-order approximation
             integral_flat = delta_expanded.view(-1, 1, 1) * (eye.unsqueeze(0) + 0.5 * A_scaled_flat)
             
         integral_all = integral_flat.view(batch, seq_len, self.state_dim, self.state_dim)
-        
         B_disc_all = torch.einsum('btij,btjd->btid', integral_all, B_mod_all)  # [B, T, N, D]
         
         # === SEQUENTIAL STATE UPDATES (fundamental RNN constraint) ===
-        # Collect all states for vectorized output computation
         states_all = x.new_zeros(batch, seq_len, self.state_dim, 1)  # [B, T, N, 1]
-        state = x.new_zeros(batch, self.state_dim, 1)
+        state = initial_state if initial_state is not None else x.new_zeros(batch, self.state_dim, 1)
         
         for t in range(seq_len):
             u_t = x[:, t, :]  # [B, D]
@@ -720,27 +771,34 @@ class IntricateKANSSMCore(nn.Module):
             states_all[:, t, :, :] = state
         
         # === VECTORIZED OUTPUT COMPUTATION ===
-        # outputs[b, t] = C_mod[b, t] @ states[b, t]
-        # C_mod_all: [B, T, D, N], states_all: [B, T, N, 1]
         outputs = torch.einsum('btdn,btn->btd', C_mod_all, states_all.squeeze(-1))  # [B, T, D]
         
+        if return_last_state:
+            return outputs, state
         return outputs
     
     def _compute_B_modulation_batched(
-        self, x: Float[torch.Tensor, "BT D"]
+        self, x: Float[torch.Tensor, "BT D"],
+        identity: Optional[Float[torch.Tensor, "BT D_id"]] = None,
     ) -> Float[torch.Tensor, "BT N D"]:
         """Compute B modulation for batched inputs.
         
         Args:
             x: Flattened input [batch*seq_len, inner_dim]
+            identity: Flattened identity context [batch*seq_len, identity_dim]
             
         Returns:
             Modulated B matrices [batch*seq_len, state_dim, inner_dim]
         """
         bt = x.size(0)
         
+        # Combine input and identity
+        mod_in = x
+        if identity is not None:
+             mod_in = torch.cat([x, identity], dim=-1)
+
         # Get modulation factors
-        mod = self.B_modulator(x)  # [BT, ?]
+        mod = self.B_modulator(mod_in)  # [BT, ?]
         
         if self.modulation_mode == "element":
             # Scalar modulation
@@ -773,6 +831,7 @@ class IntricateKANSSMCore(nn.Module):
             f"modulate_B={self.modulate_B}, "
             f"modulate_C={self.modulate_C}, "
             f"modulation_mode={self.modulation_mode}, "
+            f"modulator_type={self.modulator_type}, "
             f"use_fast_kan={self.use_fast_kan}, "
             f"mamba_kernels={self.use_mamba_kernels}"
         )

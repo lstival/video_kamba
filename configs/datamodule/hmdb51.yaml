@@ -6,4 +6,3 @@ batch_size: 4
 num_workers: 4
 seq_len: 16
 img_size: 224
-num_classes: 51

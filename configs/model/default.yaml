@@ -1,6 +1,0 @@
-# Default model configuration
-_target_: models.video_mamba.VideoMambaSystem
-
-dim_in: 768
-dim_out: 256
-num_classes: ${datamodule.num_classes}

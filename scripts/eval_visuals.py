@@ -1,106 +1,105 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
+import cv2
 import hydra
 from omegaconf import DictConfig
 import os
+import json
+import glob
 from datetime import datetime
+from PIL import Image
 from models.video_mamba import VideoMambaSystem
 
-def visualize_batch(model, batch, save_dir, batch_idx=0):
-    # Determine batch structure
-    # HMDB51: (frames, labels)
-    # DAVIS: (frames, masks)
-    # VideoDataset: (frames, labels, boxes, box_labels)
+def save_gif_with_cv2(frames, save_path, fps=8):
+    """Save a list of numpy frames as a video/GIF using OpenCV fallback for now or PIL."""
+    # Since writing GIFs with OpenCV is tricky, we'll use PIL's native capability
+    pil_frames = [Image.fromarray(f) for f in frames]
+    if pil_frames:
+        pil_frames[0].save(
+            save_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=int(1000/fps),
+            loop=0
+        )
+
+def export_mask(mask, save_path):
+    """Save a segmentation mask as a grayscale PNG."""
+    mask_img = Image.fromarray(mask.astype(np.uint8))
+    mask_img.save(save_path)
+
+def visualize_sequence(model, dataset, clip_idx, save_dir):
+    """Generate visuals (masks, GIFs) for a specific sequence/clip."""
+    batch = dataset[clip_idx]
+    # Handle MultiObjectVOSDataset (6 elements) vs old format (4 elements)
+    if len(batch) == 6:
+        ref_img, ref_mask, query_images, query_masks, _, meta = batch
+        seq_name = meta['video_id']
+    else:
+        ref_img, ref_mask, query_images, query_masks = batch
+        seq_name = dataset.clips[clip_idx]['seq']
     
-    frames = batch[0].to(model.device)
-    labels = batch[1] if len(batch) >= 2 else None
+    # Move and unsqueeze for batch dimension
+    ref_img = ref_img.unsqueeze(0).to(model.device)
+    ref_mask = ref_mask.unsqueeze(0).to(model.device)
+    query_images = query_images.unsqueeze(0).to(model.device)
+    query_masks = query_masks.unsqueeze(0).to(model.device)
     
     with torch.no_grad():
-        logits_clf, pred_boxes, pred_box_logits, logits_seg = model(frames)
+        _, _, _, logits_seg = model(query_images, ref_frame=ref_img, ref_mask=ref_mask)
     
-    # Get predictions
-    pred_classes = torch.argmax(logits_clf, dim=1)
+    preds = torch.argmax(logits_seg, dim=2).squeeze(0).cpu().numpy() # [T, H, W]
+    gt_masks = query_masks.squeeze(0).cpu().numpy() # [T, H, W]
+    query_imgs = query_images.squeeze(0).cpu() # [T, C, H, W]
+    seq_dir = os.path.join(save_dir, seq_name)
+    os.makedirs(seq_dir, exist_ok=True)
+    os.makedirs(os.path.join(seq_dir, "masks"), exist_ok=True)
     
-    # Create directory for this batch
-    batch_dir = os.path.join(save_dir, f"batch_{batch_idx}")
-    os.makedirs(batch_dir, exist_ok=True)
+    gif_frames = []
     
-    B, T, C, H, W = frames.shape
+    # Pre-define colors for up to 10 objects
+    colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), 
+        (255, 255, 0), (255, 0, 255), (0, 255, 255),
+        (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0)
+    ]
     
-    for b in range(B):
-        fig, axes = plt.subplots(1, T, figsize=(24, 5))
-        if T == 1:
-            axes = [axes]
+    for t in range(preds.shape[0]):
+        # Save raw predicted mask
+        export_mask(preds[t], os.path.join(seq_dir, "masks", f"frame_{t:04d}.png"))
         
-        # Get scores
-        # Detection scores: [B, T, num_boxes]
-        box_scores = torch.softmax(pred_box_logits, dim=-1)
-        # Max score per box (excluding background if class 0 is background)
-        max_box_scores, max_box_classes = torch.max(box_scores[b], dim=-1)
+        # Prepare GIF frame (Overlay) with OpenCV
+        img = query_imgs[t].permute(1, 2, 0).numpy()
+        # De-normalize ImageNet
+        img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         
-        # Classification info
-        gt_cls = labels[b].item() if labels is not None and labels.dim() == 1 else "N/A"
-        pr_cls = pred_classes[b].item()
+        # Overlay prediction
+        mask = preds[t]
+        overlay = img_bgr.copy()
+        for obj_id in range(1, int(mask.max()) + 1):
+            overlay[mask == obj_id] = colors[(obj_id - 1) % len(colors)]
         
-        # Segmentation probabilities for overlay intensity
-        seg_probs = torch.softmax(logits_seg, dim=2) # [B, T, C, H, W]
+        # Blend overlay
+        cv2.addWeighted(overlay, 0.4, img_bgr, 0.6, 0, img_bgr)
         
-        for t in range(T):
-            # Frame [C, H, W] -> [H, W, C]
-            img = frames[b, t].cpu().permute(1, 2, 0).numpy()
-            
-            # Simple de-normalization (assuming ImageNet stats)
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            img = std * img + mean
-            img = np.clip(img, 0, 1)
-            
-            axes[t].imshow(img)
-            
-            # 1. Overlay Predicted Segmentation (as heatmap)
-            mask_logits = logits_seg[b, t] # [C, H, W]
-            mask_probs = torch.softmax(mask_logits, dim=0)
-            # Sum probabilities of all classes except background (0)
-            obj_prob = 1.0 - mask_probs[0].cpu().numpy()
-            
-            # Show heatmap
-            if obj_prob.max() > 0.01: # Small threshold to avoid showing pure noise
-                # Use a specific colormap for the heatmap (e.g., 'jet' or 'viridis')
-                # Mask out very low probability areas
-                masked_prob = np.ma.masked_where(obj_prob < 0.1, obj_prob)
-                axes[t].imshow(masked_prob, alpha=0.5, cmap='jet', vmin=0, vmax=1)
-            
-            # 2. Overlay Ground Truth Mask (Contour)
-            if labels is not None and labels.dim() == 4: # [B, T, H, W] (DAVIS)
-                gt_mask = labels[b, t].cpu().numpy()
-                if gt_mask.max() > 0:
-                    axes[t].contour(gt_mask, levels=[0.5], colors='white', linewidths=0.8)
-
-            # 3. Overlay Predicted Bounding Boxes
-            # Show boxes with confidence > 0.3
-            for box_idx in range(pred_boxes.shape[2]):
-                score = max_box_scores[t, box_idx].item()
-                if score > 0.3:
-                    box = pred_boxes[b, t, box_idx].cpu().numpy()
-                    cls_id = max_box_classes[t, box_idx].item()
-                    
-                    xc, yc, w, h = box[0] * W, box[1] * H, box[2] * W, box[3] * H
-                    x1, y1 = xc - w/2, yc - h/2
-                    
-                    rect = plt.Rectangle((x1, y1), w, h, fill=False, color='red', linewidth=1.2)
-                    axes[t].add_patch(rect)
-                    axes[t].text(x1, y1, f"{cls_id}:{score:.2f}", color='white', 
-                                 fontsize=6, backgroundcolor='red')
-            
-            axes[t].axis('off')
-            if t == 0:
-                axes[t].set_title(f"GT: {gt_cls} | PR: {pr_cls}", fontsize=10)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(batch_dir, f"sample_{b}.png"), bbox_inches='tight', dpi=150)
-        plt.close()
+        # Overlay GT contour
+        if gt_masks[t].max() > 0:
+            for obj_id in range(1, int(gt_masks[t].max()) + 1):
+                contours, _ = cv2.findContours(
+                    (gt_masks[t] == obj_id).astype(np.uint8), 
+                    cv2.RETR_EXTERNAL, 
+                    cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(img_bgr, contours, -1, (255, 255, 255), 1)
+        
+        # Convert back to RGB for PIL GIF
+        gif_frames.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        
+    save_gif_with_cv2(gif_frames, os.path.join(seq_dir, f"{seq_name}_overlay.gif"))
+    print(f"Exported visuals for {seq_name} to {seq_dir}")
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
@@ -109,27 +108,41 @@ def main(cfg: DictConfig):
         print(f"Error: checkpoint={checkpoint_path} invalid.")
         return
 
+    # Determine look-up directory
+    output_subdir = cfg.get("output_subdir", "")
+    base_dir = os.path.join("eval_results", output_subdir)
+    
+    # Find latest manifest
+    manifest_files = sorted(glob.glob(os.path.join(base_dir, "top_5_manifest_*.json")))
+    if not manifest_files:
+        print(f"Error: No top_5_manifest found in {base_dir}. Please run eval_metrics.py first.")
+        return
+    
+    with open(manifest_files[-1], 'r') as f:
+        top_5 = json.load(f)
+
     print(f"Loading model from {checkpoint_path}...")
-    model = VideoMambaSystem.load_from_checkpoint(checkpoint_path)
+    num_seg = cfg.get("num_seg_classes") or cfg.model.get("num_seg_classes", 11)
+    num_clf = cfg.get("num_clf_classes") or cfg.model.get("num_clf_classes", 51)
+    
+    model = VideoMambaSystem.load_from_checkpoint(
+        checkpoint_path, 
+        strict=False,
+        num_seg_classes=num_seg,
+        num_clf_classes=num_clf
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     
-    print(f"Initializing datamodule: {cfg.datamodule._target_}")
     dm = hydra.utils.instantiate(cfg.datamodule)
     dm.setup(stage="test")
-    test_loader = dm.test_dataloader()
+    dataset = dm.test_dataset
     
-    # Create results directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = os.path.join("eval_results", f"visuals_{timestamp}")
+    save_dir = os.path.join(base_dir, f"top_5_visuals_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(save_dir, exist_ok=True)
     
-    print(f"Generating visualizations in {save_dir}...")
-    
-    # Take first batch
-    batch = next(iter(test_loader))
-    visualize_batch(model.to("cpu"), batch, save_dir)
-    
-    print("Visual evaluation completed.")
+    print(f"Using manifest: {manifest_files[-1]}")
+    for res in top_5:
+        visualize_sequence(model, dataset, res['clip_idx'], save_dir)
 
 if __name__ == "__main__":
     main()

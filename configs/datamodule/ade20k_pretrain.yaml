@@ -1,0 +1,31 @@
+# ADE20K pre-training datamodule configuration
+# Usage: python train.py datamodule=ade20k_pretrain
+#
+# Following the AOT/DeAOT static-image pre-training strategy:
+# each ADE20K image is treated as a 1+seq_len "video" where query frames
+# are augmented copies of the reference, teaching the memory bank
+# how to localise objects/textures under appearance variation.
+#
+_target_: data.ade20k_pretrain.ADE20KPretrainDataModule
+
+# Spatial resolution — 448 matches the DINOv2 ViT-B/14 native patch grid
+img_size: 448
+
+# Number of augmented query frames per ADE20K image clip
+seq_len: 3
+
+# Identity bank size (must match model.num_seg_classes - 1)
+n_id: 10
+
+# Batch size
+batch_size: 4
+num_workers: 8
+
+# HuggingFace datasets cache directory
+cache_dir: /home/WUR/stiva001/.cache/huggingface
+
+# Set to a small integer to run a smoke-test job
+max_samples: null
+
+# Use streaming=True to avoid disk-heavy download if desired
+streaming: false
