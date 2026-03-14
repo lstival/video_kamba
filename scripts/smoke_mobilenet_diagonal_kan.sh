@@ -46,7 +46,9 @@ elif [ -d "$HOME/.venv" ]; then
 fi
 
 # ── Working directory ────────────────────────────────────────────
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# SLURM copies the script to its spool dir, so BASH_SOURCE[0] is wrong.
+# SLURM_SUBMIT_DIR is the directory where sbatch was called — use that.
+REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_DIR"
 
 echo "Repo    : $REPO_DIR"
