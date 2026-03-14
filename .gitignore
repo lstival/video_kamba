@@ -3,3 +3,10 @@ data/*
 logs/
 venv/
 __pycache__/
+tmp/
+eval_results/
+checkpoints/
+.cache/
+presentation/
+scripts/eval_ade_ytvos_65612878.sh
+lightning_logs/
