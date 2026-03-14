@@ -837,6 +837,205 @@ class IntricateKANSSMCore(nn.Module):
         )
 
 
+class DiagonalKANSSMCore(nn.Module):
+    """Diagonal KAN-SSM Core: O(N·D) per step — no matrix_exp, no linalg.solve.
+
+    Replaces the dense [N,N] HiPPO-LegS A matrix with a learnable diagonal
+    ``log_A [N]``.  This reduces per-step cost from O(N³) to O(N·D) and
+    eliminates the Python for-loop bottleneck for the T=1 VOS inference path.
+
+    KAN Innovation (vs. standard Mamba / S4D):
+        Three optional modulators — selectable between FastKAN (RBF) and MLP —
+        give input-dependent selectivity at three points:
+
+        * **KAN_A** → per-channel decay rate  (input-dep. *forgetting*)
+        * **KAN_B** → per-channel state input (input-dep. *injection*)
+        * **KAN_C** → per-output readout      (input-dep. *readout*)
+
+    Mathematical Formulation::
+
+        delta_t   = softplus(W_δ · u_t)                        # [N]  input-dep step
+        alpha_A_t = KAN_A(u_t)                                 # [N]  decay modulator
+        A_bar_t   = exp(−exp(log_A) · delta_t · alpha_A_t)     # [N]  diagonal A_bar
+
+        alpha_B_t = KAN_B(u_t)                                 # [N]
+        b_t       = alpha_B_t · (B @ u_t)                      # [N]  state input
+
+        h_t       = A_bar_t · h_{t−1} + b_t                    # [N]  fast update
+
+        alpha_C_t = KAN_C(u_t)                                 # [D]
+        y_t       = alpha_C_t · (C @ h_t) + D_skip · u_t       # [D]  output + skip
+
+    State shape: ``[B, N]`` (no trailing singleton; differs from IntricateKANSSMCore).
+
+    Args:
+        inner_dim:      Input / output feature dimension D.
+        state_dim:      Hidden state dimension N (number of diagonal SSM channels).
+        grid_size:      RBF grid size for FastKANModulator.
+        modulate_A:     Enable KAN_A (decay-rate modulation).
+        modulate_B:     Enable KAN_B (state-input modulation).
+        modulate_C:     Enable KAN_C (readout modulation).
+        modulator_type: ``'kan'`` (FastKAN RBF, default) or ``'mlp'`` (ablation).
+        identity_dim:   Optional extra context dim concatenated to modulator input.
+    """
+
+    def __init__(
+        self,
+        inner_dim: int,
+        state_dim: int,
+        *,
+        grid_size: int = 8,
+        modulate_A: bool = True,
+        modulate_B: bool = True,
+        modulate_C: bool = True,
+        modulator_type: str = "kan",
+        identity_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.inner_dim = inner_dim
+        self.state_dim = state_dim
+        self.modulate_A = modulate_A
+        self.modulate_B = modulate_B
+        self.modulate_C = modulate_C
+        self.modulator_type = modulator_type
+        self.identity_dim = identity_dim
+
+        # Diagonal decay: log_A[n] → A_bar[n] = exp(-exp(log_A[n]) * delta[n])
+        # Init at log(0.5) → initial A_bar ≈ exp(-0.5) ≈ 0.6 (moderate forgetting)
+        self.log_A = nn.Parameter(torch.full((state_dim,), math.log(0.5)))
+
+        # B: [N, D] input-to-state projection
+        # C: [D, N] state-to-output projection
+        scale = 1.0 / math.sqrt(inner_dim)
+        self.B = nn.Parameter(torch.randn(state_dim, inner_dim) * scale)
+        self.C = nn.Parameter(torch.randn(inner_dim, state_dim) * scale)
+
+        # Skip connection: learned per-channel scale on input
+        self.D_skip = nn.Parameter(torch.ones(inner_dim))
+
+        # Input-dependent delta: D → N (per state channel step size)
+        # Bias init: softplus(log(0.1)) ≈ 0.1 — start with small step
+        self.delta_proj = nn.Linear(inner_dim, state_dim, bias=True)
+        nn.init.zeros_(self.delta_proj.weight)
+        nn.init.constant_(self.delta_proj.bias, math.log(0.1))
+
+        # Select modulator class (KAN or MLP for ablation)
+        ModCls: type = MLPModulator if modulator_type == "mlp" else FastKANModulator
+        mod_in = inner_dim + (identity_dim if identity_dim is not None else 0)
+
+        if modulate_A:
+            # [N] positive decay-rate modulator — softplus output near 1 initially
+            self.A_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation="softplus")
+        if modulate_B:
+            # [N] positive coupling scale
+            self.B_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation="softplus")
+        if modulate_C:
+            # [D] positive readout scale
+            self.C_modulator = ModCls(mod_in, inner_dim, grid_size=grid_size, activation="softplus")
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        x: Float[torch.Tensor, "B T D"],
+        initial_state: Optional[Float[torch.Tensor, "B N"]] = None,
+        return_last_state: bool = False,
+        identity: Optional[Float[torch.Tensor, "B D_id"]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Diagonal SSM forward with KAN-modulated selectivity.
+
+        Args:
+            x:             Input sequence ``[B, T, D]``.
+            initial_state: Carry-over state ``[B, N]`` from previous frame (VOS).
+                           ``None`` → zero-initialised.
+            return_last_state: If True, also return final state ``[B, N]``.
+            identity:      Optional object-identity context ``[B, identity_dim]``.
+
+        Returns:
+            ``y [B, T, D]`` or ``(y, final_state [B, N])``.
+        """
+        B, T, D = x.shape
+
+        # ── Build modulator input ──────────────────────────────────────
+        x_flat = x.reshape(B * T, D)
+        if identity is not None and self.identity_dim is not None:
+            id_flat = identity.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
+            mod_in = torch.cat([x_flat, id_flat], dim=-1)
+        else:
+            mod_in = x_flat
+
+        # ── Input-dependent step size [BT, N] ─────────────────────────
+        delta = F.softplus(self.delta_proj(x_flat)).clamp(1e-4, 3.0)  # [BT, N]
+
+        # ── KAN modulations (all vectorised over BT) ──────────────────
+        ones_N = x.new_ones(B * T, self.state_dim)
+        ones_D = x.new_ones(B * T, self.inner_dim)
+        alpha_A = self.A_modulator(mod_in) if self.modulate_A else ones_N   # [BT, N]
+        alpha_B = self.B_modulator(mod_in) if self.modulate_B else ones_N   # [BT, N]
+        alpha_C = self.C_modulator(mod_in) if self.modulate_C else ones_D   # [BT, D]
+
+        # ── Diagonal A_bar: exp(-exp(log_A) * delta * alpha_A) ────────
+        A_bar = torch.exp(
+            -torch.exp(self.log_A) * delta * alpha_A
+        ).view(B, T, self.state_dim)  # [B, T, N]
+
+        # ── State input b_t = alpha_B * (B @ u_t) ─────────────────────
+        # x_flat: [BT, D], B: [N, D] → [BT, N]
+        b_all = (x_flat @ self.B.T) * alpha_B          # [BT, N]
+        b_all = b_all.view(B, T, self.state_dim)        # [B, T, N]
+
+        # ── Diagonal state scan ───────────────────────────────────────
+        h = initial_state if initial_state is not None else x.new_zeros(B, self.state_dim)
+
+        if T == 1:
+            # Fast single-step path — dominant in VOS (one frame at a time)
+            # Pure element-wise: no loops, no matrix ops
+            h = A_bar[:, 0] * h + b_all[:, 0]  # [B, N]
+            h_all = h.unsqueeze(1)              # [B, 1, N]
+        else:
+            # Multi-step sequential scan (Python loop over T, not over patches)
+            # O(T * B * N) scalar element-wise ops — fast for T ≤ 36
+            h_list: list[torch.Tensor] = []
+            for t in range(T):
+                h = A_bar[:, t] * h + b_all[:, t]
+                h_list.append(h)
+            h_all = torch.stack(h_list, dim=1)  # [B, T, N]
+
+        # ── Output: y = alpha_C * (C @ h_t) + D_skip * u_t ───────────
+        # h_all: [B, T, N], C: [D, N] → y_ssm: [B, T, D]
+        y_ssm = torch.einsum("btn,dn->btd", h_all, self.C)
+        y_ssm = y_ssm * alpha_C.view(B, T, self.inner_dim)  # KAN-C readout scale
+        y = y_ssm + self.D_skip * x                          # skip connection
+
+        if return_last_state:
+            return y, h_all[:, -1]   # [B, T, D], [B, N]
+        return y
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def get_regularization_loss(self) -> torch.Tensor:
+        """Summed regularisation loss from active KAN modulators."""
+        loss = torch.tensor(0.0, device=self.log_A.device)
+        if self.modulate_A:
+            loss = loss + self.A_modulator.regularization_loss()
+        if self.modulate_B:
+            loss = loss + self.B_modulator.regularization_loss()
+        if self.modulate_C:
+            loss = loss + self.C_modulator.regularization_loss()
+        return loss
+
+    def extra_repr(self) -> str:
+        return (
+            f"inner_dim={self.inner_dim}, state_dim={self.state_dim}, "
+            f"modulate_A={self.modulate_A}, modulate_B={self.modulate_B}, "
+            f"modulate_C={self.modulate_C}, modulator_type={self.modulator_type}"
+        )
+
+
 if __name__ == "__main__":
     print("Testing IntricateKANSSMCore...")
     
