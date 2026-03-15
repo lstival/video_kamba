@@ -123,6 +123,33 @@ def main(cfg: DictConfig):
     # Initialize model
     model: L.LightningModule = hydra.utils.instantiate(cfg.model)
 
+    # Partial weight transfer from a pretrained checkpoint (shape-safe).
+    # Use `+pretrained_weights=path` when the architecture has changed since
+    # the checkpoint was saved. Only parameters whose names AND shapes match
+    # are transferred; everything else is left at its random initialisation.
+    # This is distinct from `+checkpoint` (full resume with optimizer state).
+    pretrained_weights_path = cfg.get("pretrained_weights")
+    if pretrained_weights_path:
+        pretrained_weights_path = os.path.expanduser(str(pretrained_weights_path))
+        if not os.path.exists(pretrained_weights_path):
+            raise FileNotFoundError(f"Pretrained weights not found: {pretrained_weights_path}")
+        ckpt = torch.load(pretrained_weights_path, map_location="cpu", weights_only=False)
+        ckpt_state = ckpt.get("state_dict", ckpt)
+        model_state = model.state_dict()
+        transferable = {
+            k: v for k, v in ckpt_state.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        skipped = [k for k in ckpt_state if k not in transferable]
+        model.load_state_dict({**model_state, **transferable}, strict=True)
+        LOGGER.info(
+            "Partial weight transfer: %d/%d params loaded from %s — skipped %d "
+            "(missing or shape mismatch): %s",
+            len(transferable), len(ckpt_state),
+            pretrained_weights_path, len(skipped),
+            skipped[:10],
+        )
+
     # Resume full training state from checkpoint when provided.
     checkpoint_path = cfg.get("checkpoint")
     if checkpoint_path:
