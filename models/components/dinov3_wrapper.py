@@ -44,6 +44,8 @@ class DinoV3Wrapper(nn.Module):
             new_H = (H // patch_size) * patch_size
             new_W = (W // patch_size) * patch_size
             x_flat = F.interpolate(x_flat, size=(new_H, new_W), mode='bilinear', align_corners=False)
+        h_tokens = x_flat.shape[-2] // patch_size
+        w_tokens = x_flat.shape[-1] // patch_size
             
         # Extract features from multiple intermediate layers (3, 6, 9, 11)
         # This allows the decoder to have high-res spatial details (early layers) 
@@ -57,6 +59,7 @@ class DinoV3Wrapper(nn.Module):
             # patches_flat: [BT, P, D] -> [B, T, D, P]
             P = patches_flat.shape[1]
             features[f"layer_{idx}"] = patches_flat.transpose(1, 2).view(B, T, D, P)
+            features[f"layer_{idx}_hw"] = (h_tokens, w_tokens)
         
         # Use the CLS token from the last layer (idx 11) for global features
         last_cls = multi_scale_out[-1][1].view(B, T, D)

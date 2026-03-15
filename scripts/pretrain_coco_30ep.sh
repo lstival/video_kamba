@@ -9,7 +9,7 @@
 #SBATCH --error=logs/slurm/pretrain_coco_30ep_%j.err
 
 # ============================================================
-# COCO Static-Image Pre-training — Resumed to 30 epochs
+# COCO Static-Image Pre-training (real instance masks) — Resumed to 30 epochs
 #
 # Current state: best_coco.ckpt = epoch=2 (only 3 epochs done)
 # This script resumes from that checkpoint and trains to 30 ep,
@@ -21,6 +21,7 @@
 #   - Trains to 30 epochs total (27 more epochs)
 #   - Resolution 480 to match YouTube-VOS native resolution
 #   - SSR 0.15: model starts practising own predictions
+#   - Uses official COCO instance masks (polygon/RLE via pycocotools)
 #   - Saves best val_loss checkpoint to checkpoints/best_coco_30ep.ckpt
 #
 # After completion:
@@ -62,6 +63,13 @@ export TMPDIR="${PROJECT_ROOT}/tmp"
 export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
 mkdir -p "$TMPDIR" "$HF_HOME" logs/slurm checkpoints
 
+COCO_DATA_DIR="${PROJECT_ROOT}/data/coco"
+if [ ! -f "${COCO_DATA_DIR}/annotations/instances_train2017.json" ]; then
+    echo "ERROR: COCO instance annotations not found in ${COCO_DATA_DIR}"
+    echo "Run: sbatch scripts/download_coco.sh"
+    exit 1
+fi
+
 # limit_train_batches caps each epoch to 5000 batches (~20k images).
 # This reduces epoch time from ~8h to ~30 min after the tensor-augment fix,
 # while still covering the full COCO dataset across 30 epochs (30 × 20k = 600k passes).
@@ -82,8 +90,7 @@ python train.py \
     ++callbacks.monitor=val_loss \
     ++callbacks.mode=min \
     ++datamodule.num_workers=8 \
-    ++datamodule.cache_dir="${PROJECT_ROOT}/data/coco_cache" \
-    ++datamodule.streaming=false \
+    ++datamodule.data_dir="${COCO_DATA_DIR}" \
     +checkpoint="${RESUME_CKPT}" \
     "$@"
 

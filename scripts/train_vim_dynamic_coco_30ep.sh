@@ -9,7 +9,7 @@
 #SBATCH --error=logs/slurm/vim_dynamic_coco_30ep_%j.err
 
 # ============================================================
-# Train Dynamic Vision-Mamba (Option 1) on COCO Warmup.
+# Train Dynamic Vision-Mamba (Option 1) on COCO Warmup (real instance masks).
 #
 # Highlights:
 #   - use_identity_modulation=True (Dynamic Tracker)
@@ -44,6 +44,13 @@ export TMPDIR="${PROJECT_ROOT}/tmp"
 export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
 mkdir -p "$TMPDIR" "$HF_HOME" logs/slurm checkpoints
 
+COCO_DATA_DIR="${PROJECT_ROOT}/data/coco"
+if [ ! -f "${COCO_DATA_DIR}/annotations/instances_train2017.json" ]; then
+    echo "Error: COCO instance annotations not found in ${COCO_DATA_DIR}."
+    echo "Run: sbatch scripts/download_coco.sh"
+    exit 1
+fi
+
 # We increase the learning rate for the scratch-trained backbone (warmup)
 # and enable identity modulation.
 python train.py \
@@ -53,8 +60,7 @@ python train.py \
     ++model.learning_rate=2e-4 \
     ++model.target_size=480 \
     ++datamodule.img_size=480 \
-    ++datamodule.streaming=False \
-    ++datamodule.cache_dir="${PROJECT_ROOT}/data/coco_cache" \
+    ++datamodule.data_dir="${COCO_DATA_DIR}" \
     ++datamodule.num_workers=2 \
     ++trainer.max_epochs=30 \
     ++trainer.precision="16-mixed" \

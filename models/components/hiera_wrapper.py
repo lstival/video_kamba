@@ -112,6 +112,9 @@ class HieraWrapper(nn.Module):
             "stage_1": to_btdp(s1,  96, 56 * 56),  # [B, T,  96, 3136]
             "stage_2": to_btdp(s2, 192, 28 * 28),  # [B, T, 192,  784]
             "stage_3": to_btdp(s3, 384, 14 * 14),  # [B, T, 384,  196]
+            "stage_1_hw": (int(s1.shape[-2]), int(s1.shape[-1])),
+            "stage_2_hw": (int(s2.shape[-2]), int(s2.shape[-1])),
+            "stage_3_hw": (int(s3.shape[-2]), int(s3.shape[-1])),
         }
 
         return cls_token, features

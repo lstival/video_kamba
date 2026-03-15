@@ -10,3 +10,4 @@ checkpoints/
 presentation/
 scripts/eval_ade_ytvos_65612878.sh
 lightning_logs/
+.claude

@@ -1,11 +1,11 @@
 """Hybrid VOS Segmentation Loss.
 
-Combines Binary Cross-Entropy (BCE) and Soft Dice to balance pixel-wise
+Combines multi-class Cross-Entropy (CE) and Soft Dice to balance pixel-wise
 accuracy with region-overlap quality:
 
 .. math::
 
-    \\mathcal{L} = \\beta \\cdot \\mathcal{L}_{\\text{BCE}}
+    \\mathcal{L} = \\beta \\cdot \\mathcal{L}_{\\text{CE}}
                  + (1 - \\beta) \\cdot \\mathcal{L}_{\\text{SoftDice}}
 
 Each object channel is evaluated independently. A boolean ``obj_present``
@@ -28,15 +28,15 @@ from jaxtyping import Float, Bool
 
 
 class HybridVOSLoss(nn.Module):
-    """Hybrid BCE + Soft-Dice loss for multi-object VOS segmentation.
+    """Hybrid CE + Soft-Dice loss for multi-object VOS segmentation.
 
     Args:
-        beta:         Weight for BCE term.  ``1 - beta`` weights Dice.
+        beta:         Weight for CE term.  ``1 - beta`` weights Dice.
                       Default ``0.5`` balances both components equally.
         smooth:       Smoothing constant added to Dice numerator and
                       denominator to avoid division by zero.
         from_logits:  Whether ``pred`` is in logit space (default ``True``).
-                      If ``True``, sigmoid is applied internally.
+                  If ``True``, softmax/log-softmax are applied internally.
         reduction:    ``"mean"`` averages over present objects; ``"sum"``
                       returns the total.
 
@@ -96,35 +96,37 @@ class HybridVOSLoss(nn.Module):
             f"obj_present shape mismatch: expected {(B, T, n_id)}, got {obj_present.shape}"
         )
 
-        # Convert logits → probabilities
+        # Convert logits → probabilities in mutually-exclusive class space.
         if self.from_logits:
-            prob = torch.sigmoid(pred)  # [B, T, C, H, W]
+            log_prob = F.log_softmax(pred, dim=2)
+            prob = torch.exp(log_prob)
         else:
-            prob = pred
+            prob = pred.clamp(min=1e-7)
+            prob = prob / prob.sum(dim=2, keepdim=True).clamp(min=1e-7)
+            log_prob = torch.log(prob)
 
-        # Build one-hot target: [B, T, C, H, W]
-        # Clamp target to [0, C-1] to avoid index errors on malformed masks
+        # Build one-hot target: [B, T, C, H, W].
+        # Ignore void labels (255) via valid_mask.
+        valid_mask = (target != 255).unsqueeze(2).float()  # [B, T, 1, H, W]
         target_clamped = target.clamp(0, C - 1)
         target_onehot = F.one_hot(target_clamped, num_classes=C).permute(0, 1, 4, 2, 3).float()
+        target_onehot = target_onehot * valid_mask
 
-        # ── BCE ───────────────────────────────────────────────────────────
-        # Compute per-channel BCE, shape [B, T, C, H, W]
-        bce_per_px = F.binary_cross_entropy_with_logits(
-            pred if self.from_logits else torch.log(prob.clamp(min=1e-7)),
-            target_onehot,
-            reduction="none",
-        )
-        # Average over spatial dims → [B, T, C]
-        bce_per_ch = bce_per_px.mean(dim=(-2, -1))
+        # ── Multi-class CE ────────────────────────────────────────────────
+        # Compute per-channel CE over valid pixels, shape [B, T, C].
+        ce_per_px = -(target_onehot * log_prob)
+        ce_num = ce_per_px.sum(dim=(-2, -1))
+        ce_den = target_onehot.sum(dim=(-2, -1)).clamp(min=1.0)
+        ce_per_ch = ce_num / ce_den
 
         # ── Soft Dice ─────────────────────────────────────────────────────
         # Compute per-channel Dice, shape [B, T, C]
         numerator = 2.0 * (prob * target_onehot).sum(dim=(-2, -1)) + self.smooth
-        denominator = (prob + target_onehot).sum(dim=(-2, -1)) + self.smooth
+        denominator = ((prob * valid_mask) + target_onehot).sum(dim=(-2, -1)) + self.smooth
         dice_per_ch = 1.0 - numerator / denominator  # [B, T, C]
 
         # ── Combine ───────────────────────────────────────────────────────
-        combined = self.beta * bce_per_ch + (1.0 - self.beta) * dice_per_ch  # [B, T, C]
+        combined = self.beta * ce_per_ch + (1.0 - self.beta) * dice_per_ch  # [B, T, C]
 
         # ── Mask absent objects ───────────────────────────────────────────
         # Background channel (index 0) is always active

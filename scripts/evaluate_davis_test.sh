@@ -42,15 +42,15 @@ fi
 if [[ "$CKPT_PATH" == *"="* ]]; then
     echo "Detected '=' in checkpoint path. Creating symlink workaround..."
     TMP_CKPT="eval_tmp_test_${SLURM_JOB_ID}.ckpt"
-    ln -s "$CKPT_PATH" "$TMP_CKPT"
-    CKPT_ARG="checkpoint=$(pwd)/$TMP_CKPT"
+    ln -sf "$CKPT_PATH" "$TMP_CKPT"
+    CKPT_ARG="+checkpoint=$(pwd)/$TMP_CKPT"
 else
-    CKPT_ARG="checkpoint=$CKPT_PATH"
+    CKPT_ARG="+checkpoint=$CKPT_PATH"
 fi
 
 # 1. Run Metrics Evaluation on 'test-dev' split
 echo -e "\n[1/2] Running Metrics Evaluation (DAVIS TEST)..."
-python scripts/eval_metrics.py $CKPT_ARG datamodule=davis ++datamodule.test_split=test-dev ++output_subdir=test
+python scripts/eval_metrics.py "$CKPT_ARG" datamodule=davis ++datamodule.test_split=test-dev ++output_subdir=test
 
 # 2. Run Visuals Evaluation for Top 5
 echo -e "\n[2/2] Running Visuals Evaluation (DAVIS TEST)..."

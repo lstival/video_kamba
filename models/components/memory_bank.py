@@ -130,6 +130,8 @@ class MemoryBank(nn.Module):
         frame_features: Float[torch.Tensor, "B P D"],
         mask: torch.Tensor,  # [B, H, W] integer object IDs
         frame_features_fine: Float[torch.Tensor, "B P2 D2"] | None = None,
+        feat_hw: tuple[int, int] | None = None,
+        feat_hw_fine: tuple[int, int] | None = None,
     ) -> None:
         """Encode the first annotated frame as the permanent reference entry.
 
@@ -141,9 +143,17 @@ class MemoryBank(nn.Module):
             mask:                Integer segmentation mask ``[B, H, W]``.
             frame_features_fine: Fine (Stage 2) patch features ``[B, P2, D2]``
                                  (optional; used when ``use_dual_scale=True``).
+            feat_hw:             Spatial shape ``(Hf, Wf)`` for ``frame_features``.
+            feat_hw_fine:        Spatial shape ``(Hf2, Wf2)`` for fine features.
         """
         self.reset()
-        K, V = self._encode_frame(frame_features, mask, frame_features_fine)
+        K, V = self._encode_frame(
+            frame_features,
+            mask,
+            frame_features_fine,
+            feat_hw=feat_hw,
+            feat_hw_fine=feat_hw_fine,
+        )
         self._keys.append(K)
         self._values.append(V)
         self._is_reference.append(True)
@@ -153,6 +163,8 @@ class MemoryBank(nn.Module):
         frame_features: Float[torch.Tensor, "B P D"],
         mask: torch.Tensor,  # [B, C, H, W] soft probs or [B, H, W] hard IDs
         frame_features_fine: Float[torch.Tensor, "B P2 D2"] | None = None,
+        feat_hw: tuple[int, int] | None = None,
+        feat_hw_fine: tuple[int, int] | None = None,
     ) -> None:
         """Append a new (K, V) pair; evict the oldest non-reference when full.
 
@@ -162,8 +174,16 @@ class MemoryBank(nn.Module):
                                  (preferred) or hard integer mask ``[B, H, W]``.
             frame_features_fine: Fine (Stage 2) patch features ``[B, P2, D2]``
                                  (optional; used when ``use_dual_scale=True``).
+            feat_hw:             Spatial shape ``(Hf, Wf)`` for ``frame_features``.
+            feat_hw_fine:        Spatial shape ``(Hf2, Wf2)`` for fine features.
         """
-        K, V = self._encode_frame(frame_features, mask, frame_features_fine)
+        K, V = self._encode_frame(
+            frame_features,
+            mask,
+            frame_features_fine,
+            feat_hw=feat_hw,
+            feat_hw_fine=feat_hw_fine,
+        )
 
         # Apply KAN-SSM key adaptation to non-reference frames.
         # The adapter adds a recurrent residual so each key is conditioned on
@@ -215,6 +235,8 @@ class MemoryBank(nn.Module):
         frame_features: Float[torch.Tensor, "B P D"],
         mask: torch.Tensor,
         frame_features_fine: Float[torch.Tensor, "B P2 D2"] | None = None,
+        feat_hw: tuple[int, int] | None = None,
+        feat_hw_fine: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project features to K/V space and inject object ID embeddings.
 
@@ -243,7 +265,11 @@ class MemoryBank(nn.Module):
             V: ``[B, P_total, d_value]``
         """
         K_c, V_c = self._project_with_id(
-            frame_features, mask, self.proj_key, self.proj_value
+            frame_features,
+            mask,
+            self.proj_key,
+            self.proj_value,
+            feat_hw=feat_hw,
         )
 
         if self.use_dual_scale and frame_features_fine is not None:
@@ -252,7 +278,11 @@ class MemoryBank(nn.Module):
 
             # Encode fine-scale with its own projections.
             K_f, V_f = self._project_with_id(
-                frame_features_fine, mask, self.proj_key_fine, self.proj_value_fine
+                frame_features_fine,
+                mask,
+                self.proj_key_fine,
+                self.proj_value_fine,
+                feat_hw=feat_hw_fine,
             )
             K_f = K_f + self.scale_embed_fine
 
@@ -270,6 +300,7 @@ class MemoryBank(nn.Module):
         mask: torch.Tensor,              # [B, H, W] or [B, C, H, W]
         proj_key_fn: nn.Module,
         proj_value_fn: nn.Module,
+        feat_hw: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project ``features`` → (K, V) and inject ID embeddings into V.
 
@@ -287,7 +318,7 @@ class MemoryBank(nn.Module):
             V: ``[B, P, d_value]``
         """
         B, P, _ = features.shape
-        h = w = int(P ** 0.5)
+        h, w = self._resolve_patch_hw(P, mask, feat_hw)
         n_cls = self.n_objects + 1  # background + objects
 
         K = proj_key_fn(features)    # [B, P, d_key]
@@ -309,7 +340,7 @@ class MemoryBank(nn.Module):
             # Soft probability mask [B, C, H, W]
             C = mask.shape[1]
             mask_small = F.interpolate(mask.float(), size=(h, w), mode="area")  # [B, C, h, w]
-            soft = mask_small.view(B, C, P).permute(0, 2, 1)                    # [B, P, C]
+            soft = mask_small.reshape(B, C, P).permute(0, 2, 1)                  # [B, P, C]
             if C < n_cls:
                 pad = torch.zeros(B, P, n_cls - C, device=mask.device, dtype=soft.dtype)
                 soft = torch.cat([soft, pad], dim=-1)
@@ -321,3 +352,54 @@ class MemoryBank(nn.Module):
         V = V + id_signal
 
         return K, V
+
+    @staticmethod
+    def _resolve_patch_hw(
+        p: int,
+        mask: torch.Tensor,
+        feat_hw: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        """Return spatial (h, w) for a token sequence length ``p``.
+
+        Priority:
+        1) Use explicit ``feat_hw`` from the encoder.
+        2) Fallback: infer a factor pair from ``p`` matching mask aspect ratio.
+        """
+        if feat_hw is not None:
+            h, w = int(feat_hw[0]), int(feat_hw[1])
+            if h <= 0 or w <= 0:
+                raise ValueError(f"Invalid feat_hw={feat_hw}; expected positive integers.")
+            if h * w != p:
+                raise ValueError(
+                    f"feat_hw={feat_hw} is incompatible with P={p} (h*w={h*w})."
+                )
+            return h, w
+
+        return MemoryBank._infer_hw_from_mask(p, mask)
+
+    @staticmethod
+    def _infer_hw_from_mask(p: int, mask: torch.Tensor) -> tuple[int, int]:
+        """Infer patch grid from sequence length using mask aspect ratio."""
+        if p <= 0:
+            raise ValueError(f"Expected positive P, got {p}.")
+
+        in_h, in_w = int(mask.shape[-2]), int(mask.shape[-1])
+        target_aspect = in_w / max(in_h, 1)
+
+        best_hw: tuple[int, int] | None = None
+        best_err = float("inf")
+
+        for h in range(1, int(p ** 0.5) + 1):
+            if p % h != 0:
+                continue
+            w = p // h
+            for hh, ww in ((h, w), (w, h)):
+                err = abs((ww / max(hh, 1)) - target_aspect)
+                if err < best_err:
+                    best_err = err
+                    best_hw = (hh, ww)
+
+        if best_hw is None:
+            # Defensive fallback; mathematically unreachable for integer p>0.
+            return p, 1
+        return best_hw

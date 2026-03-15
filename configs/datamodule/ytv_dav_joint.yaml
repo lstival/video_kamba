@@ -1,0 +1,25 @@
+# Joint YouTube-VOS + DAVIS fine-tuning datamodule (AOT PRE_YTB_DAV protocol)
+#
+# Usage:
+#   python train.py datamodule=ytv_dav_joint \
+#     datamodule.davis_root=/path/to/DAVIS \
+#     datamodule.ytv_root=/path/to/YouTubeVOS
+#
+# WeightedRandomSampler ensures DAVIS contributes davis_sampling_ratio of
+# every epoch despite being ~57x smaller than YouTube-VOS.
+_target_: data.vos_datamodule.VOSDataModule
+
+davis_root: ${work_dir}/data/DAVIS/DAVIS
+ytv_root:   ${work_dir}/data/YouTubeVOS
+
+# 25 % of each epoch from DAVIS, 75 % from YouTube-VOS.
+# Matches the balance used in the AOT PRE_YTB_DAV stage.
+davis_sampling_ratio: 0.25
+
+batch_size:   4
+clip_len:     4
+output_size:  480
+max_gap:      3
+num_workers:  8
+resolution:   480p
+val_output_size: 480

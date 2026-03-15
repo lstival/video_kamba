@@ -7,15 +7,14 @@ from data.coco_pretrain import COCOPretrainDataset
 def save_visualisation(output_dir="vis_coco_pretrain"):
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load COCO dataset (local cache)
+    # Load COCO dataset (official instance annotations)
     dataset = COCOPretrainDataset(
+        data_dir="./data/coco",
         img_size=448,
         seq_len=3,
         n_id=10,
         split="validation",
-        cache_dir="./data/coco_cache",
         max_samples=10,
-        streaming=False
     )
     
     # Get first valid sample
@@ -40,7 +39,7 @@ def save_visualisation(output_dir="vis_coco_pretrain"):
     axes[0, 0].imshow(to_img(ref_img))
     axes[0, 0].set_title("COCO Ref (Original)")
     axes[1, 0].imshow(ref_mask.numpy(), cmap=cmap, interpolation='nearest')
-    axes[1, 0].set_title("COCO Ref Mask (Rectangles)")
+    axes[1, 0].set_title("COCO Ref Mask (Instances)")
     
     # Query Frames
     for i in range(3):

@@ -293,14 +293,23 @@ class MobileNetV2Wrapper(nn.Module):
 
         cls_token = s256.mean(dim=[2, 3]).view(B, T, self.DIM_OUT)
 
-        def _to_tokens(feat: torch.Tensor) -> torch.Tensor:
+        def _to_tokens_and_hw(feat: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
             BT_, Ch, Hf, Wf = feat.shape
-            return feat.view(B, T, Ch, Hf * Wf)
+            return feat.view(B, T, Ch, Hf * Wf), (Hf, Wf)
+
+        stage_3, stage_3_hw = _to_tokens_and_hw(s256)
+        stage_2, stage_2_hw = _to_tokens_and_hw(s16x)
+        stage_1, stage_1_hw = _to_tokens_and_hw(s8x)
+        stage_0, stage_0_hw = _to_tokens_and_hw(s4x)
 
         features = {
-            "stage_3": _to_tokens(s256),
-            "stage_2": _to_tokens(s16x),
-            "stage_1": _to_tokens(s8x),
-            "stage_0": _to_tokens(s4x),
+            "stage_3": stage_3,
+            "stage_2": stage_2,
+            "stage_1": stage_1,
+            "stage_0": stage_0,
+            "stage_3_hw": stage_3_hw,
+            "stage_2_hw": stage_2_hw,
+            "stage_1_hw": stage_1_hw,
+            "stage_0_hw": stage_0_hw,
         }
         return cls_token, features

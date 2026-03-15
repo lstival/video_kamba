@@ -37,19 +37,27 @@ echo "=========================================="
 module purge 2>/dev/null || true
 module load cuda 2>/dev/null || true
 
-# Activate conda / venv — adjust path to your environment
-if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+# ── Working directory ────────────────────────────────────────────
+# SLURM copies the script to its spool dir, so BASH_SOURCE[0] is wrong.
+# SLURM_SUBMIT_DIR is the directory where sbatch was called — use that.
+REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_DIR"
+
+# Activate Python environment (prefer repo-local venv used for development).
+if [ -f "$REPO_DIR/venv/bin/activate" ]; then
+    source "$REPO_DIR/venv/bin/activate"
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
     conda activate video_kamba 2>/dev/null || conda activate base
 elif [ -d "$HOME/.venv" ]; then
     source "$HOME/.venv/bin/activate"
 fi
 
-# ── Working directory ────────────────────────────────────────────
-# SLURM copies the script to its spool dir, so BASH_SOURCE[0] is wrong.
-# SLURM_SUBMIT_DIR is the directory where sbatch was called — use that.
-REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-cd "$REPO_DIR"
+if ! python -c 'import torch' >/dev/null 2>&1; then
+    echo "[ERROR] Python environment does not provide torch."
+    echo "        Checked: $REPO_DIR/venv, conda(video_kamba/base), $HOME/.venv"
+    exit 1
+fi
 
 echo "Repo    : $REPO_DIR"
 echo "Python  : $(which python)"

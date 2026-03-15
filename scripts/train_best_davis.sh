@@ -67,7 +67,7 @@ echo -e "\nFound best checkpoint: $BEST_CKPT"
 
 # 3. Evaluation Phase (Submitted as a new Slurm job)
 echo -e "\n[2/2] Submitting DAVIS Evaluation Job..."
-sbatch scripts/evaluate_davis.sh checkpoint="$BEST_CKPT" datamodule=davis
+sbatch scripts/evaluate_davis_test.sh checkpoint="$BEST_CKPT" datamodule=davis
 
 echo -e "\n=========================================="
 echo "Pipeline Training Finished at $(date)"

@@ -5,6 +5,35 @@ import hydra
 from omegaconf import DictConfig
 from models.video_mamba import VideoMambaSystem
 
+
+def _instantiate_callbacks(cfg: DictConfig) -> list:
+    """Instantiate callbacks from Hydra config.
+
+    Supports a single callback config (`_target_` at root) or a mapping/list
+    of callback configs.
+    """
+    if cfg is None:
+        return []
+
+    callbacks = []
+
+    if isinstance(cfg, DictConfig) and "_target_" in cfg:
+        callbacks.append(hydra.utils.instantiate(cfg))
+        return callbacks
+
+    if isinstance(cfg, DictConfig):
+        for cb_cfg in cfg.values():
+            if isinstance(cb_cfg, DictConfig) and "_target_" in cb_cfg:
+                callbacks.append(hydra.utils.instantiate(cb_cfg))
+        return callbacks
+
+    if isinstance(cfg, (list, tuple)):
+        for cb_cfg in cfg:
+            if isinstance(cb_cfg, DictConfig) and "_target_" in cb_cfg:
+                callbacks.append(hydra.utils.instantiate(cb_cfg))
+
+    return callbacks
+
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     # Set matmul precision for A100 Tensor Core optimization
@@ -16,12 +45,15 @@ def main(cfg: DictConfig):
     
     # Initialize logger
     logger = hydra.utils.instantiate(cfg.logger) if "logger" in cfg else None
+
+    # Initialize callbacks from config (checkpointing, LR monitor, etc.)
+    callbacks = _instantiate_callbacks(cfg.get("callbacks"))
     
     # Initialize trainer
     trainer: L.Trainer = hydra.utils.instantiate(
         cfg.trainer, 
         logger=logger,
-        callbacks=[] # We will instantiate callbacks here later
+        callbacks=callbacks,
     )
     
     # Initialize datamodule (Placeholder for now)
@@ -31,13 +63,35 @@ def main(cfg: DictConfig):
     checkpoint_path = cfg.get("checkpoint")
     if checkpoint_path:
         print(f"Loading model from checkpoint: {checkpoint_path}")
-        # We use strict=False because some heads (like VOS) might be new 
-        # compared to pre-training, or have different class counts.
-        model: L.LightningModule = VideoMambaSystem.load_from_checkpoint(
-            checkpoint_path,
-            strict=False,
-            **cfg.model
-        )
+        # Instantiate model from config first, then do a shape-filtered weight
+        # transfer.  This is necessary when the checkpoint was trained with a
+        # different SSM / KAN hyperparameter set (e.g. different N or grid size)
+        # — strict=False alone still raises RuntimeError on shape mismatches.
+        model: L.LightningModule = hydra.utils.instantiate(cfg.model)
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt_sd   = ckpt["state_dict"]
+        model_sd  = model.state_dict()
+        matched, skipped_shape, skipped_missing = [], [], []
+        filtered_sd = {}
+        for k, v in ckpt_sd.items():
+            if k not in model_sd:
+                skipped_missing.append(k)
+            elif v.shape != model_sd[k].shape:
+                skipped_shape.append(f"{k}: ckpt{tuple(v.shape)} vs model{tuple(model_sd[k].shape)}")
+            else:
+                filtered_sd[k] = v
+                matched.append(k)
+        model.load_state_dict(filtered_sd, strict=False)
+        print(f"[checkpoint] Loaded {len(matched)} matching tensors.")
+        if skipped_shape:
+            print(f"[checkpoint] Skipped {len(skipped_shape)} shape-mismatched tensors "
+                  f"(will init from scratch):")
+            for s in skipped_shape[:10]:
+                print(f"  {s}")
+            if len(skipped_shape) > 10:
+                print(f"  ... and {len(skipped_shape) - 10} more")
+        if skipped_missing:
+            print(f"[checkpoint] Skipped {len(skipped_missing)} keys not in current model.")
     else:
         model: L.LightningModule = hydra.utils.instantiate(cfg.model)
     

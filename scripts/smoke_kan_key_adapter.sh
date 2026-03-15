@@ -40,6 +40,13 @@ fi
 export PYTHONPATH=.
 mkdir -p logs/slurm
 
+COCO_DATA_DIR="${PROJECT_ROOT}/data/coco"
+if [ ! -f "${COCO_DATA_DIR}/annotations/instances_train2017.json" ]; then
+    echo "Error: COCO instance annotations not found in ${COCO_DATA_DIR}."
+    echo "Run: sbatch scripts/download_coco.sh"
+    exit 1
+fi
+
 echo "--- Running pytest: test_kan_key_adapter.py ---"
 pytest tests/test_kan_key_adapter.py -v --tb=short
 
@@ -62,6 +69,7 @@ python train.py \
     ++datamodule.max_samples=20 \
     ++datamodule.batch_size=2 \
     ++datamodule.num_workers=0 \
+    ++datamodule.data_dir="${COCO_DATA_DIR}" \
     ++trainer.max_epochs=1 \
     ++trainer.limit_train_batches=3 \
     ++trainer.limit_val_batches=2 \

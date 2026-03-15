@@ -483,8 +483,42 @@ class SegmentationDecoder(nn.Module):
         Returns:
             ``[B, T, num_classes, H, W]`` segmentation logits at *target_size*.
         """
+        def _resolve_hw(
+            p: int,
+            hw: Optional[tuple[int, int]],
+            aspect_hint: Optional[tuple[int, int]] = None,
+        ) -> tuple[int, int]:
+            if hw is not None:
+                h, w = int(hw[0]), int(hw[1])
+                if h > 0 and w > 0 and h * w == p:
+                    return h, w
+
+            if p <= 0:
+                raise ValueError(f"Expected positive token count, got {p}.")
+
+            if aspect_hint is not None:
+                target_aspect = aspect_hint[1] / max(aspect_hint[0], 1)
+            else:
+                target_aspect = 1.0
+
+            best_hw: Optional[tuple[int, int]] = None
+            best_err = float("inf")
+            for h in range(1, int(p ** 0.5) + 1):
+                if p % h != 0:
+                    continue
+                w = p // h
+                for hh, ww in ((h, w), (w, h)):
+                    err = abs((ww / max(hh, 1)) - target_aspect)
+                    if err < best_err:
+                        best_err = err
+                        best_hw = (hh, ww)
+
+            if best_hw is None:
+                return p, 1
+            return best_hw
+
         B, T, D_ssm, P = ssm_output.shape
-        h3 = w3 = int(P ** 0.5)  # 14 for Hiera Stage 3
+        h3, w3 = _resolve_hw(P, skip_features.get("stage_3_hw"))
 
         # ── Flatten time for 2-D spatial ops ────────────────────────────
         x = ssm_output.reshape(B * T, D_ssm, h3, w3)  # [BT, 384, 14, 14]
@@ -492,31 +526,55 @@ class SegmentationDecoder(nn.Module):
         # ── Hiera skip features ─────────────────────────────────────────
         # Stage 3  14×14  384-ch  (same resolution as SSM output → semantic refinement)
         s3_feat = skip_features["stage_3"]
-        h_s3 = w_s3 = int(s3_feat.shape[3] ** 0.5)        # 14
+        h_s3, w_s3 = _resolve_hw(
+            s3_feat.shape[3],
+            skip_features.get("stage_3_hw"),
+            aspect_hint=(h3, w3),
+        )
         s3 = s3_feat.reshape(B * T, s3_feat.shape[2], h_s3, w_s3)  # [BT, 384, 14, 14]
 
         # Stage 2  28×28  192-ch  (genuine upsample target for up2)
         s2_feat = skip_features["stage_2"]
-        h_s2 = w_s2 = int(s2_feat.shape[3] ** 0.5)        # 28
+        h_s2, w_s2 = _resolve_hw(
+            s2_feat.shape[3],
+            skip_features.get("stage_2_hw"),
+            aspect_hint=(h_s3, w_s3),
+        )
         s2 = s2_feat.reshape(B * T, s2_feat.shape[2], h_s2, w_s2)  # [BT, 192, 28, 28]
 
         # Stage 1  56×56   96-ch  (genuine upsample target for up3)
         s1_feat = skip_features["stage_1"]
-        h_s1 = w_s1 = int(s1_feat.shape[3] ** 0.5)        # 56
+        h_s1, w_s1 = _resolve_hw(
+            s1_feat.shape[3],
+            skip_features.get("stage_1_hw"),
+            aspect_hint=(h_s3, w_s3),
+        )
         s1 = s1_feat.reshape(B * T, s1_feat.shape[2], h_s1, w_s1)  # [BT,  96, 56, 56]
 
         # ── Reference anchors (optional, broadcast over T) ────────────────
         ref_s3 = ref_s2 = ref_s1 = None
         if ref_features is not None:
-            def _broadcast_ref(feat):
+            def _broadcast_ref(feat, feat_hw, aspect_hint):
                 D_r = feat.shape[2]
                 P_r = feat.shape[3]
-                hr = wr = int(P_r ** 0.5)
+                hr, wr = _resolve_hw(P_r, feat_hw, aspect_hint=aspect_hint)
                 return feat.squeeze(1).reshape(B, D_r, hr, wr).repeat_interleave(T, dim=0)
 
-            ref_s3 = _broadcast_ref(ref_features["stage_3"])
-            ref_s2 = _broadcast_ref(ref_features["stage_2"])
-            ref_s1 = _broadcast_ref(ref_features["stage_1"])
+            ref_s3 = _broadcast_ref(
+                ref_features["stage_3"],
+                ref_features.get("stage_3_hw"),
+                (h_s3, w_s3),
+            )
+            ref_s2 = _broadcast_ref(
+                ref_features["stage_2"],
+                ref_features.get("stage_2_hw"),
+                (h_s2, w_s2),
+            )
+            ref_s1 = _broadcast_ref(
+                ref_features["stage_1"],
+                ref_features.get("stage_1_hw"),
+                (h_s1, w_s1),
+            )
 
         # ── Spatial guide mask ──────────────────────────────────────────
         m_guidance = prev_mask

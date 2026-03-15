@@ -9,12 +9,13 @@
 #SBATCH --error=logs/slurm/vimtiny_coco_30ep_%j.err
 
 # ============================================================
-# Train lightweight Vision-Mamba + KAN on COCO Pretrain.
+# Train lightweight Vision-Mamba + KAN on COCO Pretrain (real instance masks).
 #
 # Highlights:
 #   - trainable encoder_type=vision_mamba_tiny
 #   - lightweight decoder widths (160/96/48)
 #   - KAN-guided spatial Vision-Mamba + KAN temporal SSM
+#   - COCO polygon/RLE instance masks (no bbox-filled masks)
 # ============================================================
 
 set -euo pipefail
@@ -41,9 +42,18 @@ fi
 export PYTHONPATH=.
 mkdir -p logs/slurm
 
+COCO_DATA_DIR="${PROJECT_ROOT}/data/coco"
+
+if [ ! -f "${COCO_DATA_DIR}/annotations/instances_train2017.json" ]; then
+    echo "Error: COCO annotations not found in ${COCO_DATA_DIR}."
+    echo "Run: sbatch scripts/download_coco.sh"
+    exit 1
+fi
+
 python train.py \
     model=vision_mamba_tiny \
     datamodule=coco_pretrain \
+    ++datamodule.data_dir="${COCO_DATA_DIR}" \
     ++model.target_size=480 \
     ++datamodule.img_size=480 \
     ++datamodule.num_workers=8 \

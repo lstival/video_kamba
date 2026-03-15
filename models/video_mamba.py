@@ -79,6 +79,12 @@ class VideoMambaSystem(L.LightningModule):
         # Scheduled sampling: 0.0 = always use GT mask for memory update (teacher
         # forcing), 1.0 = always use predicted mask (pure autoregressive).
         scheduled_sampling_rate: float = 0.0,
+        # Optional schedule for scheduled sampling. If both are >= 0, the
+        # effective rate is linearly interpolated from start -> end over epochs
+        # after warmup; otherwise `scheduled_sampling_rate` is used as a fixed value.
+        scheduled_sampling_start: float = -1.0,
+        scheduled_sampling_end: float = -1.0,
+        scheduled_sampling_warmup_epochs: int = 0,
         # KAN-SSM
         ssm_d_state: int = 16,
         ssm_layers: int = 1,
@@ -246,15 +252,25 @@ class VideoMambaSystem(L.LightningModule):
                 "stage_3": raw["stage_3"],
                 "stage_2": raw["stage_1"],
                 "stage_1": raw["stage_0"],
+                "stage_3_hw": raw.get("stage_3_hw"),
+                "stage_2_hw": raw.get("stage_1_hw"),
+                "stage_1_hw": raw.get("stage_0_hw"),
             }
         # DINOv2 (default)
         return {
             "stage_3": raw["layer_11"],
             "stage_2": raw["layer_9"],
             "stage_1": raw["layer_6"],
+            "stage_3_hw": raw.get("layer_11_hw"),
+            "stage_2_hw": raw.get("layer_9_hw"),
+            "stage_1_hw": raw.get("layer_6_hw"),
         }
 
-    def _get_fine_features(self, raw: dict, t: int | None = None) -> torch.Tensor:
+    def _get_fine_features(
+        self,
+        raw: dict,
+        t: int | None = None,
+    ) -> tuple[torch.Tensor, tuple[int, int] | None]:
         """Return fine-scale patch tokens for dual-scale MemoryBank updates.
 
         For DINOv2  → layer_9 (14×14).
@@ -262,12 +278,21 @@ class VideoMambaSystem(L.LightningModule):
 
         If ``t`` is given, selects frame ``t`` and permutes to ``[B, P, Ch]``.
         Otherwise returns ``[B, T, Ch, P]`` without permuting.
+
+        Returns:
+            Tuple ``(features, feat_hw)`` where ``feat_hw`` is ``(Hf, Wf)`` when
+            available in the raw encoder output.
         """
-        key = "stage_2" if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny") else "layer_9"
+        if self.hparams.encoder_type in ("mobilenetv2", "vision_mamba_tiny"):
+            key, hw_key = "stage_2", "stage_2_hw"
+        else:
+            key, hw_key = "layer_9", "layer_9_hw"
+
         feat = raw[key]
+        feat_hw = raw.get(hw_key)
         if t is not None:
-            return feat[:, t].permute(0, 2, 1)  # [B, P, Ch]
-        return feat  # [B, T, Ch, P]
+            return feat[:, t].permute(0, 2, 1), feat_hw  # [B, P, Ch]
+        return feat, feat_hw  # [B, T, Ch, P]
 
     def _build_dec_ms(self, raw: dict, t: int) -> dict:
         """Build the decoder skip-connection dict for frame ``t``.
@@ -289,9 +314,19 @@ class VideoMambaSystem(L.LightningModule):
                 "stage_3": raw["stage_2"][:, t:t+1],
                 "stage_2": raw["stage_1"][:, t:t+1],
                 "stage_1": raw["stage_0"][:, t:t+1],
+                "stage_3_hw": raw.get("stage_2_hw"),
+                "stage_2_hw": raw.get("stage_1_hw"),
+                "stage_1_hw": raw.get("stage_0_hw"),
             }
         ms = self._map_ms_features(raw)
-        return {k: v[:, t:t+1] for k, v in ms.items()}
+        return {
+            "stage_3": ms["stage_3"][:, t:t+1],
+            "stage_2": ms["stage_2"][:, t:t+1],
+            "stage_1": ms["stage_1"][:, t:t+1],
+            "stage_3_hw": ms.get("stage_3_hw"),
+            "stage_2_hw": ms.get("stage_2_hw"),
+            "stage_1_hw": ms.get("stage_1_hw"),
+        }
 
     # ------------------------------------------------------------------
     # Batch type detection
@@ -313,6 +348,36 @@ class VideoMambaSystem(L.LightningModule):
             and isinstance(batch[4], torch.Tensor)
             and batch[4].dtype == torch.bool
         )
+
+    def _get_scheduled_sampling_rate(self) -> float:
+        """Return the effective scheduled-sampling rate for the current epoch.
+
+        If `scheduled_sampling_start` and `scheduled_sampling_end` are both set
+        (>= 0), applies a linear epoch-wise ramp after warmup.
+        Otherwise returns the fixed `scheduled_sampling_rate`.
+        """
+        fixed = float(getattr(self.hparams, "scheduled_sampling_rate", 0.0))
+        start = float(getattr(self.hparams, "scheduled_sampling_start", -1.0))
+        end = float(getattr(self.hparams, "scheduled_sampling_end", -1.0))
+
+        if start < 0.0 or end < 0.0:
+            return max(0.0, min(1.0, fixed))
+
+        warmup = max(0, int(getattr(self.hparams, "scheduled_sampling_warmup_epochs", 0)))
+        current_epoch = int(getattr(self, "current_epoch", 0))
+
+        if current_epoch <= warmup:
+            return max(0.0, min(1.0, start))
+
+        if self.trainer is not None and getattr(self.trainer, "max_epochs", None):
+            total_epochs = int(self.trainer.max_epochs)
+        else:
+            total_epochs = int(getattr(self.hparams, "max_epochs", 1))
+
+        ramp_span = max(1, total_epochs - warmup - 1)
+        progress = max(0.0, min(1.0, (current_epoch - warmup) / ramp_span))
+        rate = start + (end - start) * progress
+        return max(0.0, min(1.0, rate))
 
     # ------------------------------------------------------------------
     # Forward
@@ -361,6 +426,7 @@ class VideoMambaSystem(L.LightningModule):
         # Map raw encoder output → canonical stage keys for SSM / decoder
         query_features_ms = self._map_ms_features(query_features_raw)
         query_patch = query_features_ms["stage_3"]  # [B, T, dim_in, P]
+        query_patch_hw = query_features_ms.get("stage_3_hw")
         D, P = query_patch.shape[2], query_patch.shape[3]
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
@@ -368,6 +434,7 @@ class VideoMambaSystem(L.LightningModule):
             _ref_cls, _ref_features_raw = self.feature_extractor(ref_frame.unsqueeze(1))
             _ref_features_ms = self._map_ms_features(_ref_features_raw)
             ref_patch = _ref_features_ms["stage_3"]  # [B, 1, dim_in, P]
+            ref_patch_hw = _ref_features_ms.get("stage_3_hw")
             # [B, 1, D, P] → [B, P, D]
             ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
@@ -376,7 +443,10 @@ class VideoMambaSystem(L.LightningModule):
             if self.hparams.use_identity_modulation:
                 # Pool reference features using the reference mask to get global object identity
                 # Mask downsampling [B, H, W] -> [B, 1, gh, gw] -> [B, P]
-                gh, gw = H // 16, W // 16
+                if ref_patch_hw is not None:
+                    gh, gw = ref_patch_hw
+                else:
+                    gh, gw = H // 16, W // 16
                 m_down = F.interpolate(ref_mask.unsqueeze(1).float(), size=(gh, gw), mode='bilinear', align_corners=False)
                 m_down = (m_down.reshape(B, -1) > 0.5).float() # [B, P]
                 # Weighted average: [B, P, D] * [B, P, 1] -> [B, D]
@@ -386,15 +456,25 @@ class VideoMambaSystem(L.LightningModule):
 
             # Fine-scale reference features for dual-scale memory key.
             # DINOv2: layer_9 | multi-scale encoders: stage_2
-            ref_patch_fine = self._get_fine_features(_ref_features_raw, t=0)  # [B, P2, Ch]
+            ref_patch_fine, ref_patch_fine_hw = self._get_fine_features(
+                _ref_features_raw,
+                t=0,
+            )  # [B, P2, Ch]
 
             # ── 3. Initialise memory bank with reference frame ──────────
-            self.memory_bank.encode_reference(ref_patch_p, ref_mask, ref_patch_fine)
+            self.memory_bank.encode_reference(
+                ref_patch_p,
+                ref_mask,
+                ref_patch_fine,
+                feat_hw=ref_patch_hw,
+                feat_hw_fine=ref_patch_fine_hw,
+            )
 
             # Spatial decoder guidance: binary objectness from reference mask
             ref_mask_safe = ref_mask.clone()
             ref_mask_safe[ref_mask == 255] = 0
             prev_guide_mask = (ref_mask_safe > 0).float().unsqueeze(1)  # [B, 1, H, W]
+            ss_rate = self._get_scheduled_sampling_rate()
 
             all_preds_seg: list[torch.Tensor] = []
             ssm_states = None
@@ -404,7 +484,10 @@ class VideoMambaSystem(L.LightningModule):
                 curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, dim_in]
                 # Fine-scale patches for dual-scale memory update.
                 # DINOv2: layer_9 | multi-scale encoders: stage_2
-                curr_patch_fine = self._get_fine_features(query_features_raw, t=t)  # [B, P2, Ch]
+                curr_patch_fine, curr_patch_fine_hw = self._get_fine_features(
+                    query_features_raw,
+                    t=t,
+                )  # [B, P2, Ch]
 
                 # ── 4. Propagation: cross-attend to memory bank ─────────
                 K_mem, V_mem = self.memory_bank.get_memory()
@@ -449,7 +532,7 @@ class VideoMambaSystem(L.LightningModule):
                     use_gt = (
                         self.training
                         and query_masks is not None
-                        and torch.rand(1).item() > self.hparams.scheduled_sampling_rate
+                        and torch.rand(1).item() > ss_rate
                     )
                     if use_gt:
                         gt_t = query_masks[:, t]
@@ -465,6 +548,8 @@ class VideoMambaSystem(L.LightningModule):
                         curr_patch.detach(),
                         mem_mask,
                         curr_patch_fine.detach(),
+                        feat_hw=query_patch_hw,
+                        feat_hw_fine=curr_patch_fine_hw,
                     )
 
                 # Update spatial guide: total objectness across all object channels
@@ -494,6 +579,9 @@ class VideoMambaSystem(L.LightningModule):
                     "stage_3": query_features_raw["stage_2"],
                     "stage_2": query_features_raw["stage_1"],
                     "stage_1": query_features_raw["stage_0"],
+                    "stage_3_hw": query_features_raw.get("stage_2_hw"),
+                    "stage_2_hw": query_features_raw.get("stage_1_hw"),
+                    "stage_1_hw": query_features_raw.get("stage_0_hw"),
                 }
             else:
                 dec_ms_full = query_features_ms
@@ -543,6 +631,16 @@ class VideoMambaSystem(L.LightningModule):
         """
         ref_img, ref_mask, query_images, query_masks, obj_present, _meta = batch
 
+        if prefix == "train" and batch_idx == 0:
+            self.log(
+                "train_scheduled_sampling_rate",
+                self._get_scheduled_sampling_rate(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=ref_img.shape[0],
+            )
+
         # Forward pass with reference memory and ground truth masks (for scheduled sampling)
         _logits_clf, _pred_boxes, _pred_box_logits, logits_seg = self(
             query_images, ref_frame=ref_img, ref_mask=ref_mask, query_masks=query_masks
@@ -581,7 +679,8 @@ class VideoMambaSystem(L.LightningModule):
             The computed loss for the step.
         """
         loss = 0.0
-        label_smoothing = 0.1 if prefix == "train" else 0.0
+        label_smoothing_clf = 0.1 if prefix == "train" else 0.0
+        label_smoothing_seg = 0.0
 
         # ── Multi-object VOS (YouTube-VOS / MOSE) ────────────────────────
         if self._is_vos_batch(batch):
@@ -600,7 +699,7 @@ class VideoMambaSystem(L.LightningModule):
                 logits_seg.view(BT, C, H, W), 
                 query_masks.view(BT, H, W), 
                 ignore_index=255,
-                label_smoothing=label_smoothing
+                label_smoothing=label_smoothing_seg
             )
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg, batch_size=bs)
@@ -631,7 +730,7 @@ class VideoMambaSystem(L.LightningModule):
         # 1. Classification Loss (HMDB51 style)
         if len(batch) >= 2 and batch[1].dim() == 1:
             labels = batch[1]
-            loss_clf = F.cross_entropy(logits_clf, labels, label_smoothing=label_smoothing)
+            loss_clf = F.cross_entropy(logits_clf, labels, label_smoothing=label_smoothing_clf)
             loss += loss_clf
             self.log(f"{prefix}_loss_clf", loss_clf)
             
@@ -647,7 +746,7 @@ class VideoMambaSystem(L.LightningModule):
             # logits_seg: [B, T, num_classes, H, W]
             # Flatten to [BT, C, H, W] and [BT, H, W] for CrossEntropy
             BT, C, H, W = logits_seg.shape[0] * logits_seg.shape[1], logits_seg.shape[2], logits_seg.shape[3], logits_seg.shape[4]
-            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), masks.view(BT, H, W), label_smoothing=label_smoothing)
+            loss_seg = F.cross_entropy(logits_seg.view(BT, C, H, W), masks.view(BT, H, W), label_smoothing=label_smoothing_seg)
             loss += loss_seg
             self.log(f"{prefix}_loss_seg", loss_seg)
             
@@ -662,7 +761,7 @@ class VideoMambaSystem(L.LightningModule):
             loss_box_cls = F.cross_entropy(
                 pred_box_logits.view(-1, self.hparams.num_clf_classes),
                 box_labels_gt.view(-1).long(),
-                label_smoothing=label_smoothing
+                label_smoothing=label_smoothing_clf
             )
             loss_detection = loss_box + loss_box_cls
             loss += loss_detection

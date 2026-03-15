@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 import lightning as L
@@ -597,6 +597,10 @@ class VOSDataModule(L.LightningDataModule):
         max_gap:      Maximum frame stride within a training clip.
         ytv_root:     Optional path to YouTube-VOS 2019 root.  When set, the
                       training set is a ConcatDataset of DAVIS-train and YTV-train.
+        davis_sampling_ratio: Fraction of each epoch's samples drawn from DAVIS
+                      when joint training (0 < ratio < 1).  Default 0.25 means
+                      25 % DAVIS / 75 % YouTube-VOS, matching the AOT PRE_YTB_DAV
+                      balance.  Ignored when ``ytv_root`` is None.
         val_output_size: Validation resolution (defaults to ``output_size``).
     """
 
@@ -610,23 +614,26 @@ class VOSDataModule(L.LightningDataModule):
         resolution: str = "480p",
         max_gap: int = 3,
         ytv_root: Optional[str] = None,
+        davis_sampling_ratio: float = 0.25,
         val_output_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
 
-        self.davis_root     = Path(davis_root)
-        self.batch_size     = batch_size
-        self.clip_len       = clip_len
-        self.output_size    = output_size
-        self.num_workers    = num_workers
-        self.resolution     = resolution
-        self.max_gap        = max_gap
-        self.ytv_root       = ytv_root
-        self.val_output_size = val_output_size or output_size
+        self.davis_root           = Path(davis_root)
+        self.batch_size           = batch_size
+        self.clip_len             = clip_len
+        self.output_size          = output_size
+        self.num_workers          = num_workers
+        self.resolution           = resolution
+        self.max_gap              = max_gap
+        self.ytv_root             = ytv_root
+        self.davis_sampling_ratio = max(0.01, min(0.99, davis_sampling_ratio))
+        self.val_output_size      = val_output_size or output_size
 
         self._train_ds: Optional[Dataset] = None
         self._val_ds:   Optional[Dataset] = None
+        self._sampler:  Optional[WeightedRandomSampler] = None
 
     # ── setup ──────────────────────────────────────────────────────────────────
 
@@ -653,8 +660,27 @@ class VOSDataModule(L.LightningDataModule):
                     augmentor  = train_aug,
                 )
                 self._train_ds = ConcatDataset([davis_train, ytv_train])
-                print(f"[VOSDataModule] Train: DAVIS({len(davis_train)}) "
-                      f"+ YTV({len(ytv_train)}) = {len(self._train_ds)} clips")
+
+                # WeightedRandomSampler so DAVIS is not drowned by YouTube-VOS.
+                # With naive ConcatDataset DAVIS would be ~1.8 % of samples;
+                # the sampler ensures it contributes davis_sampling_ratio of
+                # every epoch (default 25 %, matching AOT PRE_YTB_DAV balance).
+                n_d = len(davis_train)
+                n_y = len(ytv_train)
+                r   = self.davis_sampling_ratio
+                # w_d / (w_d + 1) = r  →  w_d = r * n_y / ((1-r) * n_d)
+                w_d = r * n_y / ((1.0 - r) * n_d)
+                weights = [w_d] * n_d + [1.0] * n_y
+                self._sampler = WeightedRandomSampler(
+                    weights,
+                    num_samples=len(self._train_ds),
+                    replacement=True,
+                )
+                print(
+                    f"[VOSDataModule] Train: DAVIS({n_d}) + YTV({n_y}) "
+                    f"= {len(self._train_ds)} clips | "
+                    f"DAVIS sampling ratio={r:.0%} (w_davis={w_d:.2f})"
+                )
             else:
                 self._train_ds = davis_train
                 print(f"[VOSDataModule] Train: DAVIS-only {len(self._train_ds)} clips")
@@ -673,10 +699,13 @@ class VOSDataModule(L.LightningDataModule):
     # ── loaders ────────────────────────────────────────────────────────────────
 
     def train_dataloader(self) -> DataLoader:
+        # Use WeightedRandomSampler for joint DAVIS+YTB (shuffle=True is
+        # mutually exclusive with a custom sampler).
         return DataLoader(
             self._train_ds,
             batch_size  = self.batch_size,
-            shuffle     = True,
+            sampler     = self._sampler,   # None → default sequential, shuffle below
+            shuffle     = self._sampler is None,
             num_workers = self.num_workers,
             collate_fn  = _vos_collate,
             pin_memory  = True,
