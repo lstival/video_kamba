@@ -111,6 +111,11 @@ class VideoMambaSystem(L.LightningModule):
         vim_spatial_layers: int = 1,
         # Training schedule
         max_epochs: int = 20,
+        propagation_lr_multiplier: float = 5.0,
+        trainable_backbone_lr_multiplier: float = 0.1,
+        frozen_backbone_lr_multiplier: float = 0.01,
+        optimizer_weight_decay: float = 1e-2,
+        scheduler_eta_min: float = 1e-6,
         # KAN-SSM Memory Key Adapter
         # When True, a lightweight KANKeyAdapter refines non-reference memory
         # bank keys recurrently over the clip to model appearance drift.
@@ -827,7 +832,7 @@ class VideoMambaSystem(L.LightningModule):
         self.vos_val_metric.reset()
 
     def configure_optimizers(self):
-        lr = self.hparams.learning_rate
+        learning_rate = self.hparams.learning_rate
 
         # Separate propagation parameters — they need a higher LR because
         # the attention Q-K alignment starts from random init while the backbone
@@ -849,15 +854,21 @@ class VideoMambaSystem(L.LightningModule):
         ]
 
         trainable_backbones = {"mobilenetv2", "vision_mamba_tiny"}
-        backbone_lr = lr * 0.1 if self.hparams.encoder_type in trainable_backbones else lr * 0.01
+        if self.hparams.encoder_type in trainable_backbones:
+            backbone_lr = learning_rate * self.hparams.trainable_backbone_lr_multiplier
+        else:
+            backbone_lr = learning_rate * self.hparams.frozen_backbone_lr_multiplier
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": prop_params,    "lr": lr * 5},   # 10→5: was overfitting to GT references
-                {"params": base_params,    "lr": lr},
+                {
+                    "params": prop_params,
+                    "lr": learning_rate * self.hparams.propagation_lr_multiplier,
+                },
+                {"params": base_params, "lr": learning_rate},
                 {"params": backbone_params, "lr": backbone_lr},
             ],
-            weight_decay=1e-2,
+            weight_decay=self.hparams.optimizer_weight_decay,
         )
         # CosineAnnealingLR decays LR every epoch regardless of any metric,
         # preventing the overshot that occurs when ReduceLROnPlateau never fires
@@ -868,11 +879,11 @@ class VideoMambaSystem(L.LightningModule):
         if self.trainer is not None and getattr(self.trainer, "max_epochs", None):
             t_max = self.trainer.max_epochs
         else:
-            t_max = getattr(self.hparams, "max_epochs", 20)
+            t_max = self.hparams.max_epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=t_max,
-            eta_min=1e-6,
+            eta_min=self.hparams.scheduler_eta_min,
         )
         return {
             "optimizer": optimizer,

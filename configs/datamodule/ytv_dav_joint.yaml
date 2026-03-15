@@ -23,3 +23,9 @@ max_gap:      3
 num_workers:  8
 resolution:   480p
 val_output_size: 480
+
+# Train-time augmentation hyperparameters
+train_min_scale: 0.7
+train_max_scale: 1.3
+train_flip_prob: 0.5
+train_color_jitter_prob: 0.8

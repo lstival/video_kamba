@@ -1,8 +1,13 @@
 # Default callbacks
-_target_: lightning.pytorch.callbacks.ModelCheckpoint
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  dirpath: ${work_dir}/checkpoints
 
-monitor: val_loss
-mode: min
-save_top_k: 3
-save_last: true
-dirpath: ${work_dir}/checkpoints
+save_hydra_config:
+  _target_: utils.callbacks.SaveHydraConfigCallback
+  config_filename: config.yaml
+  metadata_filename: run_metadata.json

@@ -30,10 +30,13 @@ Reference:
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
 import torch.nn as nn
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -261,12 +264,16 @@ class MobileNetV2Wrapper(nn.Module):
             }
             bb_state.update(matched)
             self.backbone.features.load_state_dict(bb_state, strict=False)
-            print(
-                f"[MobileNetV2Wrapper] ImageNet pretrained: "
-                f"{len(matched)}/{len(bb_state)} param tensors loaded."
+            LOGGER.info(
+                "[MobileNetV2Wrapper] ImageNet pretrained: %d/%d param tensors loaded.",
+                len(matched),
+                len(bb_state),
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[MobileNetV2Wrapper] Warning -- pretrained weights not loaded: {exc}")
+            LOGGER.warning(
+                "[MobileNetV2Wrapper] Warning -- pretrained weights not loaded: %s",
+                exc,
+            )
 
     def forward(
         self, x: torch.Tensor

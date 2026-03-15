@@ -1,12 +1,63 @@
+from __future__ import annotations
+
+import logging
 import os
-import torch
-import lightning as L
+import platform
+import subprocess
+from typing import Any
+
 import hydra
-from omegaconf import DictConfig
-from models.video_mamba import VideoMambaSystem
+import lightning as L
+import torch
+from omegaconf import DictConfig, OmegaConf
+
+LOGGER = logging.getLogger(__name__)
 
 
-def _instantiate_callbacks(cfg: DictConfig) -> list:
+def _safe_command(args: list[str]) -> str:
+    """Return command output or 'unknown' when command execution fails."""
+    try:
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL).decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def _log_run_metadata(cfg: DictConfig) -> None:
+    """Log reproducibility metadata at run start."""
+    git_commit = _safe_command(["git", "rev-parse", "HEAD"])
+    git_branch = _safe_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    try:
+        git_dirty = bool(_safe_command(["git", "status", "--porcelain"]))
+    except Exception:
+        git_dirty = False
+
+    LOGGER.info(
+        "Run metadata | git_commit=%s git_branch=%s git_dirty=%s",
+        git_commit,
+        git_branch,
+        git_dirty,
+    )
+    LOGGER.info(
+        "Environment | python=%s torch=%s lightning=%s cuda_available=%s cuda_version=%s",
+        platform.python_version(),
+        torch.__version__,
+        L.__version__,
+        torch.cuda.is_available(),
+        torch.version.cuda,
+    )
+    LOGGER.info(
+        "System | platform=%s hostname=%s",
+        platform.platform(),
+        platform.node(),
+    )
+    LOGGER.info(
+        "Config | seed=%s trainer.deterministic=%s",
+        cfg.get("seed", None),
+        cfg.trainer.get("deterministic", None),
+    )
+
+
+def _instantiate_callbacks(cfg: DictConfig | None) -> list[Any]:
     """Instantiate callbacks from Hydra config.
 
     Supports a single callback config (`_target_` at root) or a mapping/list
@@ -43,8 +94,18 @@ def main(cfg: DictConfig):
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
     
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        )
+
+    _log_run_metadata(cfg)
+
     # Initialize logger
     logger = hydra.utils.instantiate(cfg.logger) if "logger" in cfg else None
+    if logger is not None and hasattr(logger, "log_hyperparams"):
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
     # Initialize callbacks from config (checkpointing, LR monitor, etc.)
     callbacks = _instantiate_callbacks(cfg.get("callbacks"))
@@ -60,40 +121,18 @@ def main(cfg: DictConfig):
     datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.datamodule)
     
     # Initialize model
+    model: L.LightningModule = hydra.utils.instantiate(cfg.model)
+
+    # Resume full training state from checkpoint when provided.
     checkpoint_path = cfg.get("checkpoint")
     if checkpoint_path:
-        print(f"Loading model from checkpoint: {checkpoint_path}")
-        # Instantiate model from config first, then do a shape-filtered weight
-        # transfer.  This is necessary when the checkpoint was trained with a
-        # different SSM / KAN hyperparameter set (e.g. different N or grid size)
-        # — strict=False alone still raises RuntimeError on shape mismatches.
-        model: L.LightningModule = hydra.utils.instantiate(cfg.model)
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        ckpt_sd   = ckpt["state_dict"]
-        model_sd  = model.state_dict()
-        matched, skipped_shape, skipped_missing = [], [], []
-        filtered_sd = {}
-        for k, v in ckpt_sd.items():
-            if k not in model_sd:
-                skipped_missing.append(k)
-            elif v.shape != model_sd[k].shape:
-                skipped_shape.append(f"{k}: ckpt{tuple(v.shape)} vs model{tuple(model_sd[k].shape)}")
-            else:
-                filtered_sd[k] = v
-                matched.append(k)
-        model.load_state_dict(filtered_sd, strict=False)
-        print(f"[checkpoint] Loaded {len(matched)} matching tensors.")
-        if skipped_shape:
-            print(f"[checkpoint] Skipped {len(skipped_shape)} shape-mismatched tensors "
-                  f"(will init from scratch):")
-            for s in skipped_shape[:10]:
-                print(f"  {s}")
-            if len(skipped_shape) > 10:
-                print(f"  ... and {len(skipped_shape) - 10} more")
-        if skipped_missing:
-            print(f"[checkpoint] Skipped {len(skipped_missing)} keys not in current model.")
-    else:
-        model: L.LightningModule = hydra.utils.instantiate(cfg.model)
+        checkpoint_path = os.path.expanduser(str(checkpoint_path))
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        LOGGER.info(
+            "Resuming training from checkpoint with optimizer state: %s",
+            checkpoint_path,
+        )
     
     # Optional: Automatically find maximum batch size
     if cfg.get("auto_batch_size", False):
@@ -101,15 +140,15 @@ def main(cfg: DictConfig):
         tuner = Tuner(trainer)
         # This automatically modifies model.hparams.batch_size or datamodule.batch_size
         tuner.scale_batch_size(model, datamodule=datamodule, mode="binsearch")
-        print(f"Auto batch size found. Starting training...")
+        LOGGER.info("Auto batch size tuning completed.")
         
     # Train the model
     # If checkpoint is provided, we can either use it to resume training 
     # (including optimizer state) or just as weight initialization.
     # For fine-tuning on a different dataset, we usually want weight init only.
-    trainer.fit(model=model, datamodule=datamodule)
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=checkpoint_path)
     
-    print("Project initialized successfully.")
+    LOGGER.info("Training finished successfully.")
 
 if __name__ == "__main__":
     main()

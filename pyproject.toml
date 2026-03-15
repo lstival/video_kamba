@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-kamba"
+version = "0.1.0"
+description = "Video segmentation with Vision Mamba and KAN-SSM."
+readme = "SOTA.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.0.0",
+  "torchvision",
+  "lightning",
+  "jaxtyping",
+  "hydra-core>=1.3.0",
+  "omegaconf",
+  "comet-ml",
+  "causal-conv1d>=1.4.0",
+  "mamba-ssm",
+  "huggingface_hub",
+  "datasets",
+  "pycocotools",
+  "av",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["video_kamba*", "models*", "utils*", "data*"]
+namespaces = true

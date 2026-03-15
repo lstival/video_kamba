@@ -33,6 +33,7 @@ Author: KANGA Project
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional, Literal, Tuple
 
@@ -43,14 +44,16 @@ from jaxtyping import Float
 
 from .fast_kan_layer import FastKANLayer
 
+LOGGER = logging.getLogger(__name__)
+
 try:
     import mamba_ssm
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
     HAS_MAMBA_KERNELS = True
-    print("Mamba SSM kernels found! 🎉")
+    LOGGER.info("Mamba SSM kernels found.")
 except ImportError:
     HAS_MAMBA_KERNELS = False
-    print("Mamba SSM kernels NOT found. Using slow Python fallback.")
+    LOGGER.warning("Mamba SSM kernels not found. Using slow Python fallback.")
 
 
 
@@ -1037,11 +1040,15 @@ class DiagonalKANSSMCore(nn.Module):
 
 
 if __name__ == "__main__":
-    print("Testing IntricateKANSSMCore...")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    LOGGER.info("Testing IntricateKANSSMCore...")
     
     # Test different modulation modes
     for mode in ["element", "factor", "mixture"]:
-        print(f"\n--- Mode: {mode} ---")
+        LOGGER.info("--- Mode: %s ---", mode)
         core = IntricateKANSSMCore(
             inner_dim=64,
             state_dim=16,
@@ -1054,13 +1061,13 @@ if __name__ == "__main__":
         delta = torch.ones(4, 32, 1) * 0.1
         
         out = core(x, delta)
-        print(f"Input: {x.shape} -> Output: {out.shape}")
-        print(f"Parameters: {sum(p.numel() for p in core.parameters()):,}")
-        print(f"Regularization loss: {core.get_regularization_loss().item():.6f}")
+        LOGGER.info("Input: %s -> Output: %s", x.shape, out.shape)
+        LOGGER.info("Parameters: %s", f"{sum(p.numel() for p in core.parameters()):,}")
+        LOGGER.info("Regularization loss: %.6f", core.get_regularization_loss().item())
         
         # Test gradient flow
         loss = out.sum()
         loss.backward()
-        print("Gradient flow: OK")
+        LOGGER.info("Gradient flow: OK")
     
-    print("\n✅ All tests passed!")
+    LOGGER.info("All tests passed.")

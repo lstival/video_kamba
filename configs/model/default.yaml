@@ -58,3 +58,10 @@ prop_use_dual_scale: true
 
 # Training schedule helper for cosine T_max fallback
 max_epochs: 20
+
+# Optimizer / scheduler hyperparameters
+propagation_lr_multiplier: 5.0
+trainable_backbone_lr_multiplier: 0.1
+frozen_backbone_lr_multiplier: 0.01
+optimizer_weight_decay: 1e-2
+scheduler_eta_min: 1e-6

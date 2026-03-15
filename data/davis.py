@@ -1,4 +1,5 @@
 import os
+import logging
 import torch
 import numpy as np
 from PIL import Image
@@ -7,6 +8,8 @@ import lightning as L
 from torchvision.transforms import functional as F
 import torchvision.transforms as T
 import random
+
+LOGGER = logging.getLogger(__name__)
 
 class DAVISDataset(Dataset):
     """
@@ -25,7 +28,10 @@ class DAVISDataset(Dataset):
         self.split_file = os.path.join(root_dir, 'ImageSets', '2017', f'{image_set}.txt')
         
         if not os.path.exists(self.split_file):
-            print(f"Warning: Cannot find split file {self.split_file}. Ignoring if not needed.")
+            LOGGER.warning(
+                "Cannot find split file %s. Ignoring if not needed.",
+                self.split_file,
+            )
             self.sequences = []
         else:
             with open(self.split_file, 'r') as f:

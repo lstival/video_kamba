@@ -27,6 +27,7 @@ References:
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 from glob import glob
@@ -41,6 +42,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 import lightning as L
+
+LOGGER = logging.getLogger(__name__)
 
 # ── Normalisation constants (ImageNet / DINOv2) ───────────────────────────────
 _MEAN = [0.485, 0.456, 0.406]
@@ -616,6 +619,10 @@ class VOSDataModule(L.LightningDataModule):
         ytv_root: Optional[str] = None,
         davis_sampling_ratio: float = 0.25,
         val_output_size: Optional[int] = None,
+        train_min_scale: float = 0.7,
+        train_max_scale: float = 1.3,
+        train_flip_prob: float = 0.5,
+        train_color_jitter_prob: float = 0.8,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -630,6 +637,10 @@ class VOSDataModule(L.LightningDataModule):
         self.ytv_root             = ytv_root
         self.davis_sampling_ratio = max(0.01, min(0.99, davis_sampling_ratio))
         self.val_output_size      = val_output_size or output_size
+        self.train_min_scale      = train_min_scale
+        self.train_max_scale      = train_max_scale
+        self.train_flip_prob      = train_flip_prob
+        self.train_color_jitter_prob = train_color_jitter_prob
 
         self._train_ds: Optional[Dataset] = None
         self._val_ds:   Optional[Dataset] = None
@@ -638,7 +649,13 @@ class VOSDataModule(L.LightningDataModule):
     # ── setup ──────────────────────────────────────────────────────────────────
 
     def setup(self, stage: Optional[str] = None) -> None:
-        train_aug = ClipAugmentor(output_size=self.output_size)
+        train_aug = ClipAugmentor(
+            output_size=self.output_size,
+            min_scale=self.train_min_scale,
+            max_scale=self.train_max_scale,
+            flip_prob=self.train_flip_prob,
+            color_jitter_prob=self.train_color_jitter_prob,
+        )
         val_aug   = ValTransform(output_size=self.val_output_size)
 
         if stage in ("fit", None):
@@ -676,14 +693,14 @@ class VOSDataModule(L.LightningDataModule):
                     num_samples=len(self._train_ds),
                     replacement=True,
                 )
-                print(
+                LOGGER.info(
                     f"[VOSDataModule] Train: DAVIS({n_d}) + YTV({n_y}) "
                     f"= {len(self._train_ds)} clips | "
                     f"DAVIS sampling ratio={r:.0%} (w_davis={w_d:.2f})"
                 )
             else:
                 self._train_ds = davis_train
-                print(f"[VOSDataModule] Train: DAVIS-only {len(self._train_ds)} clips")
+                LOGGER.info("[VOSDataModule] Train: DAVIS-only %d clips", len(self._train_ds))
 
         if stage in ("fit", "validate", None):
             # Val: return first annotated frame of each DAVIS-val sequence
@@ -694,7 +711,7 @@ class VOSDataModule(L.LightningDataModule):
                 resolution = self.resolution,
                 transform  = val_aug,
             )
-            print(f"[VOSDataModule] Val: {len(self._val_ds)} sequences")
+            LOGGER.info("[VOSDataModule] Val: %d sequences", len(self._val_ds))
 
     # ── loaders ────────────────────────────────────────────────────────────────
 
@@ -785,27 +802,38 @@ class _DAVISValClipDataset(Dataset):
 if __name__ == "__main__":
     import sys
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
     DAVIS_ROOT = Path(__file__).resolve().parent.parent / "data" / "DAVIS" / "DAVIS"
     if not DAVIS_ROOT.exists():
-        print(f"[smoke] DAVIS not found at {DAVIS_ROOT}")
+        LOGGER.error("[smoke] DAVIS not found at %s", DAVIS_ROOT)
         sys.exit(1)
 
-    print(f"[smoke] Loading DAVIS train dataset from {DAVIS_ROOT} ...")
+    LOGGER.info("[smoke] Loading DAVIS train dataset from %s ...", DAVIS_ROOT)
     ds_train = DAVISVOSTrain(str(DAVIS_ROOT), clip_len=4, output_size=224, max_gap=2)
     sample = ds_train[0]
-    print(f"  ref_img:     {sample['ref_img'].shape}")
-    print(f"  ref_mask:    {sample['ref_mask'].shape}  "
-          f"ids={sample['ref_mask'].unique().tolist()}")
-    print(f"  query_imgs:  {sample['query_imgs'].shape}")
-    print(f"  query_masks: {sample['query_masks'].shape}  "
-          f"ids={sample['query_masks'].unique().tolist()}")
+    LOGGER.info("  ref_img:     %s", sample["ref_img"].shape)
+    LOGGER.info(
+        "  ref_mask:    %s  ids=%s",
+        sample["ref_mask"].shape,
+        sample["ref_mask"].unique().tolist(),
+    )
+    LOGGER.info("  query_imgs:  %s", sample["query_imgs"].shape)
+    LOGGER.info(
+        "  query_masks: %s  ids=%s",
+        sample["query_masks"].shape,
+        sample["query_masks"].unique().tolist(),
+    )
 
     loader = DataLoader(ds_train, batch_size=2, collate_fn=_vos_collate)
     ref_img, ref_mask, q_imgs, q_masks = next(iter(loader))
-    print(f"\n[smoke] DataLoader batch:")
-    print(f"  ref_img    {ref_img.shape}   dtype={ref_img.dtype}")
-    print(f"  ref_mask   {ref_mask.shape}  dtype={ref_mask.dtype}")
-    print(f"  q_imgs     {q_imgs.shape}   dtype={q_imgs.dtype}")
-    print(f"  q_masks    {q_masks.shape}  dtype={q_masks.dtype}")
+    LOGGER.info("[smoke] DataLoader batch:")
+    LOGGER.info("  ref_img    %s   dtype=%s", ref_img.shape, ref_img.dtype)
+    LOGGER.info("  ref_mask   %s  dtype=%s", ref_mask.shape, ref_mask.dtype)
+    LOGGER.info("  q_imgs     %s   dtype=%s", q_imgs.shape, q_imgs.dtype)
+    LOGGER.info("  q_masks    %s  dtype=%s", q_masks.shape, q_masks.dtype)
 
-    print("\n[smoke] ✅  data/vos_datamodule.py OK")
+    LOGGER.info("[smoke] data/vos_datamodule.py OK")
