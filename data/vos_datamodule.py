@@ -560,16 +560,19 @@ class YouTubeVOSTrain(Dataset):
 # Collate function — handles optional fields
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _vos_collate(batch: List[Dict]) -> Tuple[torch.Tensor, ...]:
-    """Collate a list of VOS dicts into (ref_img, ref_mask, query_imgs, query_masks).
+def _vos_collate(batch: List[Dict]) -> Tuple:
+    """Collate a list of VOS dicts into (ref_img, ref_mask, query_imgs, query_masks, seq_names).
 
-    The 4-tuple format matches the VideoMambaSystem forward signature.
+    The 5-tuple format extends the VideoMambaSystem forward signature with sequence
+    identifiers used by SpikeDiagnosticsCallback to attribute high-loss batches to
+    specific sequences.
     """
     ref_imgs    = torch.stack([b["ref_img"]     for b in batch])   # [B,3,H,W]
     ref_masks   = torch.stack([b["ref_mask"]    for b in batch])   # [B,H,W]
     query_imgs  = torch.stack([b["query_imgs"]  for b in batch])   # [B,T,3,H,W]
     query_masks = torch.stack([b["query_masks"] for b in batch])   # [B,T,H,W]
-    return ref_imgs, ref_masks, query_imgs, query_masks
+    seq_names   = [b["meta"]["seq"] for b in batch]                # [B] list[str]
+    return ref_imgs, ref_masks, query_imgs, query_masks, seq_names
 
 
 # ══════════════════════════════════════════════════════════════════════════════

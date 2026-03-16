@@ -691,9 +691,10 @@ class VideoMambaSystem(L.LightningModule):
         if self._is_vos_batch(batch):
             return self._vos_step(batch, batch_idx, prefix)
 
-        # Handle DAVIS Semi-Supervised format: (ref_img, ref_mask, query_images, query_masks)
-        if len(batch) == 4 and batch[0].dim() == 4 and batch[1].dim() == 3 and batch[2].dim() == 5:
-            ref_img, ref_mask, query_images, query_masks = batch
+        # Handle DAVIS Semi-Supervised format: (ref_img, ref_mask, query_images, query_masks, seq_names)
+        # seq_names (list[str]) is passed through for spike diagnostics but not used in the loss.
+        if len(batch) == 5 and batch[0].dim() == 4 and batch[1].dim() == 3 and batch[2].dim() == 5:
+            ref_img, ref_mask, query_images, query_masks, _seq_names = batch
             bs = ref_img.shape[0]
             logits_clf, pred_boxes, pred_box_logits, logits_seg = self(
                 query_images, ref_frame=ref_img, ref_mask=ref_mask, query_masks=query_masks

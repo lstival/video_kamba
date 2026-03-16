@@ -151,7 +151,7 @@ class DAVISDataset(Dataset):
         ref_img, ref_mask = images[0], masks[0]
         query_images, query_masks = images[1:], masks[1:]
         
-        return ref_img, ref_mask, query_images, query_masks
+        return ref_img, ref_mask, query_images, query_masks, seq
 
 
 class DAVISDataModule(L.LightningDataModule):

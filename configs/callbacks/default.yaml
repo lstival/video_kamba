@@ -11,3 +11,10 @@ save_hydra_config:
   _target_: utils.callbacks.SaveHydraConfigCallback
   config_filename: config.yaml
   metadata_filename: run_metadata.json
+
+spike_diagnostics:
+  _target_: utils.callbacks.SpikeDiagnosticsCallback
+  spike_z_threshold: 2.5   # flag steps with loss > mean + 2.5 * std
+  rolling_window: 500       # recent steps used to compute statistics
+  warmup_steps: 50          # skip first N steps (loss still descending steeply)
+  log_path: ${work_dir}/logs/spike_diagnostics.jsonl
