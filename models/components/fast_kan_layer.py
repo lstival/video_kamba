@@ -68,12 +68,14 @@ class FastKANLayer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # std=0.1: gates start with meaningful activation rather than collapsing to
-        # sigmoid(≈0) ≈ 0.5 for the entire early training phase (Bug fix: previously 0.02).
-        nn.init.normal_(self.rbf_weight, mean=0.0, std=0.1)
+        # std=0.05: reduced from 0.1 so KAN modulators start closer to identity
+        # (softplus(small) ≈ 1), preventing early gradient explosion through the
+        # SSM multiplicative chain (A_bar * h + alpha_B * B @ u).
+        nn.init.normal_(self.rbf_weight, mean=0.0, std=0.05)
 
-        # Initialize base weights
-        nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
+        # Xavier uniform: matches the SiLU activation used in the base path
+        # (Kaiming with a=sqrt(5) assumes ReLU, causing variance inflation).
+        nn.init.xavier_uniform_(self.base_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., in_features]

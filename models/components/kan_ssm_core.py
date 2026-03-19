@@ -926,6 +926,12 @@ class DiagonalKANSSMCore(nn.Module):
         ModCls: type = MLPModulator if modulator_type == "mlp" else FastKANModulator
         mod_in = inner_dim + (identity_dim if identity_dim is not None else 0)
 
+        # ── BCNorm (Mamba-3, ICLR 2026): RMSNorm after B/C projections ──
+        # Prevents activation magnitude amplification through the SSM scan
+        # which is the root cause of gradient explosion in SSM models.
+        self.B_norm = nn.RMSNorm(state_dim)
+        self.C_norm = nn.RMSNorm(inner_dim)
+
         if modulate_A:
             # [N] positive decay-rate modulator — softplus output near 1 initially
             self.A_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation="softplus")
@@ -984,32 +990,33 @@ class DiagonalKANSSMCore(nn.Module):
             -torch.exp(self.log_A) * delta * alpha_A
         ).view(B, T, self.state_dim)  # [B, T, N]
 
-        # ── State input b_t = alpha_B * (B @ u_t) ─────────────────────
+        # ── State input b_t = alpha_B * BCNorm(B @ u_t) ─────────────────
         # x_flat: [BT, D], B: [N, D] → [BT, N]
-        b_all = (x_flat @ self.B.T) * alpha_B          # [BT, N]
-        b_all = b_all.view(B, T, self.state_dim)        # [B, T, N]
+        b_raw = x_flat @ self.B.T                              # [BT, N]
+        b_all = self.B_norm(b_raw) * alpha_B                   # BCNorm + modulation
+        b_all = b_all.view(B, T, self.state_dim)               # [B, T, N]
 
-        # ── Diagonal state scan ───────────────────────────────────────
+        # ── Diagonal state scan (with clamping for stability) ─────────
         h = initial_state if initial_state is not None else x.new_zeros(B, self.state_dim)
 
         if T == 1:
             # Fast single-step path — dominant in VOS (one frame at a time)
             # Pure element-wise: no loops, no matrix ops
-            h = A_bar[:, 0] * h + b_all[:, 0]  # [B, N]
+            h = (A_bar[:, 0] * h + b_all[:, 0]).clamp(-10.0, 10.0)  # [B, N]
             h_all = h.unsqueeze(1)              # [B, 1, N]
         else:
             # Multi-step sequential scan (Python loop over T, not over patches)
             # O(T * B * N) scalar element-wise ops — fast for T ≤ 36
             h_list: list[torch.Tensor] = []
             for t in range(T):
-                h = A_bar[:, t] * h + b_all[:, t]
+                h = (A_bar[:, t] * h + b_all[:, t]).clamp(-10.0, 10.0)
                 h_list.append(h)
             h_all = torch.stack(h_list, dim=1)  # [B, T, N]
 
-        # ── Output: y = alpha_C * (C @ h_t) + D_skip * u_t ───────────
+        # ── Output: y = alpha_C * BCNorm(C @ h_t) + D_skip * u_t ─────
         # h_all: [B, T, N], C: [D, N] → y_ssm: [B, T, D]
-        y_ssm = torch.einsum("btn,dn->btd", h_all, self.C)
-        y_ssm = y_ssm * alpha_C.view(B, T, self.inner_dim)  # KAN-C readout scale
+        y_raw = torch.einsum("btn,dn->btd", h_all, self.C)
+        y_ssm = self.C_norm(y_raw) * alpha_C.view(B, T, self.inner_dim)
         y = y_ssm + self.D_skip * x                          # skip connection
 
         if return_last_state:

@@ -59,5 +59,9 @@ scheduled_sampling_start: 0.0
 scheduled_sampling_end: 0.25
 scheduled_sampling_warmup_epochs: 5
 
+# LR warmup before cosine decay (set >0 for fine-tuning from pretrained ckpt)
+lr_warmup_epochs: 0
+lr_warmup_start_factor: 0.1
+
 # Scheduler helper
 max_epochs: 50

@@ -1,0 +1,40 @@
+# Full-sequence DAVIS benchmark evaluation — sliding-window SSM inference.
+#
+# Usage (from project root):
+#   python scripts/eval_davis_full_sequence.py \
+#     analysis=davis_full_sequence \
+#     checkpoint=checkpoints/epoch=0-step=1750-v1.ckpt
+#
+# All paths default to the working directory; override on the command line.
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Path to the Lightning checkpoint to evaluate.
+checkpoint: ???
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+davis_root: ${work_dir}/data/DAVIS/DAVIS
+resolution: 480p
+
+# Resize shorter side to this before evaluating.
+# Use 480 to match training resolution; use null for original resolution.
+output_size: 480
+
+# ── Sliding-window inference ─────────────────────────────────────────────────
+# Number of query frames per SSM block.  Must match the training clip_len
+# so the SSM hidden-state never runs beyond its training-time horizon.
+clip_len: 4
+
+# Memory bank persists across all blocks; maximum frames it stores (including
+# the permanent reference frame).  Set to match model.max_mem_frames.
+max_mem_frames: 7
+
+# ── Output ───────────────────────────────────────────────────────────────────
+# Directory where per-sequence prediction PNGs and the JSON results are saved.
+output_dir: ${work_dir}/eval_results/davis_full_sequence
+
+# Save per-frame prediction masks as DAVIS-format palette PNGs.
+save_predictions: true
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+device: cuda  # 'cuda' or 'cpu'
+seed: 42

@@ -1,0 +1,83 @@
+# @package _global_
+
+# Stability Fixes v2 — addresses gradient explosion from vim_stability_fix_v1 (job 65730252):
+#
+# Architecture fixes (code-level, already applied):
+#   - BCNorm (Mamba-3): RMSNorm after B/C projections in DiagonalKANSSMCore
+#   - Post-scan LayerNorm in KangaSSM (stabilises unbounded scan output)
+#   - Hidden state clamping [-10, 10] in SSM scan loop
+#   - KAN init: Xavier for base_weight (was Kaiming/ReLU), rbf_weight std 0.05 (was 0.1)
+#
+# Config fixes (this file):
+#   - gradient_clip_val 0.1 → 1.0 (standard for Mamba; 0.1 killed learning entirely)
+#   - LR 1e-5 → 5e-5 (BCNorm stabilises gradients, so LR can be higher)
+#   - seq_len 3 → 6 (coherent motion trajectory teaches smooth temporal dynamics)
+#
+# Data fixes (code-level, already applied):
+#   - Coherent motion trajectories replace independent random augmentation per frame
+#   - 6 query frames with progressive translation/rotation/zoom in consistent direction
+
+defaults:
+  - override /callbacks: cv_gradient_tracking
+
+# ── Model Configuration Overrides ──────────────────────────────────────────
+model:
+  learning_rate: 5.0e-5
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 5
+  lr_warmup_start_factor: 0.1
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 5.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 5.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+# ── Trainer Configuration Overrides ────────────────────────────────────────
+trainer:
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+  max_epochs: 30
+
+# ── Callback Configuration Overrides ──────────────────────────────────────
+callbacks:
+  layer_gradient_norm_tracker:
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "propagation_attention.W_q"
+      - "propagation_attention.proj_out"
+      - "temporal_model"
+      - "feature_extractor"
+      # New: track BCNorm and post-scan norm directly
+      - "temporal_model.post_scan_norm"
+
+  per_sample_loss_trajectory:
+    log_every_n_steps: 50
+    high_loss_percentile: 90
+    output_dir: ${work_dir}/artifacts/loss_trajectories
+
+  per_sample_gradient_tracker:
+    log_every_n_steps: 50
+    sample_index_key: sample_idx
+    output_dir: ${work_dir}/artifacts/gradient_tracking
+
+  trak_influence:
+    num_val_samples: 0
+    mode: checkpoint
+    checkpoint_steps: []

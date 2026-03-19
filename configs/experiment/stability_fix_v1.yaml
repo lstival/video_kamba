@@ -1,0 +1,76 @@
+# @package _global_
+
+# Stability Fixes v2 — addresses NaN divergence from job 65728996:
+#   - LR 1e-4 → 1e-5 with 10-epoch linear warmup (random-init is too unstable at 1e-4)
+#   - gradient_clip_val 0.25 → 0.1 (pre-clip norms were 10k–30k)
+#   - TRAK disabled (21.7 GB projection matrix caused OOM before epoch 1)
+# Targets: vision_mamba_tiny, ADE20K pretrain, Dynamic Tracker
+
+defaults:
+  - override /callbacks: cv_gradient_tracking
+
+# ── Model Configuration Overrides ──────────────────────────────────────────
+model:
+  learning_rate: 1.0e-5
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 10
+  lr_warmup_start_factor: 0.1
+
+  # Configuration for configure_optimizers in video_mamba.py
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 1.0e-5
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 1.0e-5
+      pct_start: 0.05
+      anneal_strategy: cos
+      div_factor: 25.0
+      final_div_factor: 1000.0
+
+# ── Trainer Configuration Overrides ────────────────────────────────────────
+trainer:
+  gradient_clip_val: 0.1
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+
+# ── Callback Configuration Overrides ──────────────────────────────────────
+callbacks:
+  layer_gradient_norm_tracker:
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "propagation_attention.W_q"
+      - "propagation_attention.proj_out"
+      - "propagation_attention.norm_k"
+      - "propagation_attention.norm_v"
+      - "propagation_attention.qk_norm_q"
+      - "propagation_attention.qk_norm_k"
+      - "temporal_model"
+      - "feature_extractor"
+
+  per_sample_loss_trajectory:
+    log_every_n_steps: 50
+    high_loss_percentile: 90
+    output_dir: ${work_dir}/artifacts/loss_trajectories
+
+  per_sample_gradient_tracker:
+    log_every_n_steps: 50
+    sample_index_key: sample_idx
+    output_dir: ${work_dir}/artifacts/gradient_tracking
+
+  # TRAK disabled: 2.7M-param model × 2048 projection = 21.7 GB matrix caused OOM.
+  # Re-enable once training is stable with a reduced projection_dim.
+  trak_influence:
+    num_val_samples: 0
+    mode: checkpoint
+    checkpoint_steps: []

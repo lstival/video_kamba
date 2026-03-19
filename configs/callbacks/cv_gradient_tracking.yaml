@@ -1,0 +1,61 @@
+# CV Gradient Tracking Callbacks
+# --------------------------------
+# Four production-grade Lightning callbacks for deep analysis of training dynamics.
+# Include in an experiment config via:
+#
+#   defaults:
+#     - callbacks: cv_gradient_tracking
+#
+# Or merge on top of the default callbacks:
+#
+#   defaults:
+#     - callbacks: default
+#     - callbacks: cv_gradient_tracking   # appends the four tracking callbacks
+
+per_sample_gradient_tracker:
+  _target_: training.callbacks.PerSampleGradientTracker
+  output_dir: ${work_dir}/artifacts/gradient_tracking
+  # Record gradient norms every N optimizer steps. Increase for large datasets.
+  log_every_n_steps: 10
+  # Key in the batch dict containing sample indices (falls back to seq_names for VOS).
+  sample_index_key: sample_idx
+  # Restrict tracking to layers whose names contain any of these substrings.
+  # null = track all leaf parameters (verbose but complete).
+  track_layer_names: null
+  comet_prefix: grad_tracking
+
+layer_gradient_norm_tracker:
+  _target_: training.callbacks.LayerGradientNormTracker
+  output_dir: ${work_dir}/artifacts/gradient_norms
+  log_every_n_steps: 10
+  # Pathology thresholds (all configurable).
+  vanishing_threshold: 1.0e-7
+  exploding_threshold: 1.0e3
+  # Consecutive steps with vanishing norm before emitting a WARNING.
+  patience: 10
+  # Restrict to a subset of layers to avoid double-logging with PerSampleGradientTracker.
+  # Example: ["seg_decoder", "memory_bank"] to focus on the heads.
+  track_layer_names: null
+  comet_prefix: layer_grad_norm
+
+per_sample_loss_trajectory_tracker:
+  _target_: training.callbacks.PerSampleLossTrajectoryTracker
+  output_dir: ${work_dir}/artifacts/loss_trajectories
+  log_every_n_steps: 10
+  # Samples above this percentile across the epoch are flagged as hard examples.
+  high_loss_percentile: 90.0
+  sample_index_key: sample_idx
+  comet_prefix: loss_trajectory
+
+trak_influence:
+  _target_: training.callbacks.TRAKInfluenceCallback
+  output_dir: ${work_dir}/artifacts/trak
+  # 2048 = fast, 4096 = standard, 8192 = publication-quality.
+  projection_dim: 2048
+  # "online" projects every step; "checkpoint" projects only at checkpoint_steps.
+  mode: online
+  checkpoint_steps: []
+  # Maximum validation batches to collect for influence computation (0 = disable).
+  num_val_samples: 20
+  seed: 42
+  comet_prefix: trak

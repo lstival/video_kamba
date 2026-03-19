@@ -87,6 +87,10 @@ class KangaSSM(nn.Module):
             ])
 
         self.norm = nn.LayerNorm(d_model)
+        # Post-scan normalization: stabilises the unbounded scan output
+        # before the output projection. Empirically critical for SSM models
+        # (see "Layer-Wise Analysis of Normalization in Mamba", 2025).
+        self.post_scan_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.out_proj = nn.Linear(d_model, d_model)
 
@@ -163,6 +167,7 @@ class KangaSSM(nn.Module):
             if return_last_state:
                 next_states.append(n_state)
 
+        x = self.post_scan_norm(x)
         x = self.dropout(x)
         x = self.out_proj(x)
         out = x + residual

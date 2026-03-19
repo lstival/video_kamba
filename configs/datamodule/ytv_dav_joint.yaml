@@ -24,6 +24,12 @@ num_workers:  8
 resolution:   480p
 val_output_size: 480
 
+# Cap validation sequences at this many query frames so the SSM hidden state
+# never runs beyond its training horizon (clip_len=4).  Full-sequence DAVIS
+# evaluation (benchmark mode) must be run with a dedicated eval script.
+# 16 = 4× training clip_len: enough propagation signal without SSM drift.
+max_val_frames: 16
+
 # Train-time augmentation hyperparameters
 train_min_scale: 0.7
 train_max_scale: 1.3

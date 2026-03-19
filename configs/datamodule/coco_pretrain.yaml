@@ -16,7 +16,8 @@ img_size: 448
 data_dir: ${work_dir}/data/coco
 
 # Number of augmented query frames per COCO image clip
-seq_len: 3
+# 6 frames with coherent motion trajectory teach the SSM smooth temporal dynamics
+seq_len: 6
 
 # Identity bank size (must match model.num_seg_classes - 1)
 n_id: 10

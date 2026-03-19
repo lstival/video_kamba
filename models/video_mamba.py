@@ -1,3 +1,4 @@
+from typing import Any, Tuple, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -116,6 +117,12 @@ class VideoMambaSystem(L.LightningModule):
         frozen_backbone_lr_multiplier: float = 0.01,
         optimizer_weight_decay: float = 1e-2,
         scheduler_eta_min: float = 1e-6,
+        # Linear LR warmup before the cosine decay kicks in.
+        # Set to >0 epochs to ramp LR from (lr * warmup_start_factor) → lr
+        # before handing off to CosineAnnealingLR.  Strongly recommended for
+        # fine-tuning from a pretrained checkpoint on a new domain.
+        lr_warmup_epochs: int = 0,
+        lr_warmup_start_factor: float = 0.1,
         # KAN-SSM Memory Key Adapter
         # When True, a lightweight KANKeyAdapter refines non-reference memory
         # bank keys recurrently over the clip to model appearance drift.
@@ -123,6 +130,7 @@ class VideoMambaSystem(L.LightningModule):
         kan_adapter_d_state: int = 8,
         # Option 1: Dynamic Tracker
         use_identity_modulation: bool = False,
+        **kwargs: Any,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -656,6 +664,21 @@ class VideoMambaSystem(L.LightningModule):
 
         assert not torch.isnan(loss), "_vos_step: NaN loss detected."
 
+        # Per-sample CE proxy for cv-tracking callbacks (PerSampleLossTrajectoryTracker,
+        # TRAKInfluenceCallback).  Averaged over T, H, W per sample in the batch.
+        # Shape: [B] — detached so the computation graph is not retained.
+        if prefix == "train":
+            B, T, C, H, W = logits_seg.shape
+            per_sample_loss = torch.nn.functional.cross_entropy(
+                logits_seg.view(B * T, C, H, W),
+                query_masks.view(B * T, H, W).long(),
+                ignore_index=255,
+                reduction="none",
+            )  # [B*T, H, W]
+            self.last_per_sample_losses = (
+                per_sample_loss.view(B, T, H, W).mean(dim=(1, 2, 3)).detach()
+            )  # [B]
+
         self.log(f"{prefix}_loss_vos", loss, prog_bar=(prefix == "val"), on_epoch=True, on_step=(prefix == "train"), batch_size=ref_img.shape[0])
         self.log(f"{prefix}_loss", loss, prog_bar=True, on_epoch=True, on_step=(prefix == "train"), batch_size=ref_img.shape[0])
 
@@ -835,17 +858,11 @@ class VideoMambaSystem(L.LightningModule):
     def configure_optimizers(self):
         learning_rate = self.hparams.learning_rate
 
-        # Separate propagation parameters — they need a higher LR because
-        # the attention Q-K alignment starts from random init while the backbone
-        # features are already informative.
-        # Diagnostic: attention entropy = 0.978 (near-uniform) confirmed this.
+        # Separate propagation parameters
         prop_params = list(self.memory_bank.parameters()) + list(self.propagation_attention.parameters())
         prop_ids = {id(p) for p in prop_params}
 
-        # For trainable encoders (MobileNetV2 / Vision-Mamba tiny) the backbone must use a much
-        # lower LR than the randomly-initialised heads to preserve the pretrained
-        # ImageNet features.  Applying the full lr=1e-4 corrupts the backbone
-        # early in training and causes the characteristic val-J&F plateau.
+        # For trainable encoders (MobileNetV2 / Vision-Mamba tiny)
         backbone_params = list(self.feature_extractor.parameters())
         backbone_ids = {id(p) for p in backbone_params}
 
@@ -860,39 +877,110 @@ class VideoMambaSystem(L.LightningModule):
         else:
             backbone_lr = learning_rate * self.hparams.frozen_backbone_lr_multiplier
 
-        optimizer = torch.optim.AdamW(
-            [
-                {
-                    "params": prop_params,
-                    "lr": learning_rate * self.hparams.propagation_lr_multiplier,
-                },
-                {"params": base_params, "lr": learning_rate},
-                {"params": backbone_params, "lr": backbone_lr},
-            ],
-            weight_decay=self.hparams.optimizer_weight_decay,
-        )
-        # CosineAnnealingLR decays LR every epoch regardless of any metric,
-        # preventing the overshot that occurs when ReduceLROnPlateau never fires
-        # because val_loss keeps monotonically decreasing even as J&F collapses.
-        # Read T_max robustly: prefer trainer.max_epochs if already bound, else
-        # fall back to the hparam (pass max_epochs=20 via ++model.max_epochs=20)
-        # or a hardcoded default so the schedule is always well-defined.
+        param_groups = [
+            {
+                "params": prop_params,
+                "lr": learning_rate * self.hparams.propagation_lr_multiplier,
+                "name": "propagation",
+            },
+            {"params": base_params, "lr": learning_rate, "name": "base"},
+            {"params": backbone_params, "lr": backbone_lr, "name": "backbone"},
+        ]
+
+        # ── Optimizer ──────────────────────────────────────────────────
+        if "opt" in self.hparams and "optimizer" in self.hparams.opt:
+            import hydra
+            from functools import partial
+            opt_cfg = self.hparams.opt.optimizer
+            if isinstance(opt_cfg, partial):
+                optimizer = opt_cfg(params=param_groups)
+            else:
+                optimizer = hydra.utils.instantiate(opt_cfg, params=param_groups)
+        else:
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                weight_decay=self.hparams.optimizer_weight_decay,
+            )
+
+        # ── LR Scheduler ───────────────────────────────────────────────
         if self.trainer is not None and getattr(self.trainer, "max_epochs", None):
             t_max = self.trainer.max_epochs
         else:
             t_max = self.hparams.max_epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=t_max,
-            eta_min=self.hparams.scheduler_eta_min,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
+
+        if "opt" in self.hparams and "lr_scheduler" in self.hparams.opt:
+            import hydra
+            from functools import partial
+            sched_cfg = self.hparams.opt.lr_scheduler
+            
+            # For OneCycleLR and similar, we need to resolve total_steps
+            is_onecycle = "OneCycleLR" in getattr(sched_cfg, "_target_", "") or (isinstance(sched_cfg, partial) and "OneCycleLR" in str(sched_cfg.func))
+            
+            if is_onecycle:
+                # Calculate total steps if not provided
+                if self.trainer is not None:
+                    try:
+                        dataset_size = len(self.trainer.datamodule.train_dataloader())
+                    except Exception:
+                        dataset_size = 1000
+                    total_steps = dataset_size * t_max
+                else:
+                    total_steps = 1000  # Fallback
+                
+                if isinstance(sched_cfg, partial):
+                    scheduler = sched_cfg(optimizer=optimizer, total_steps=total_steps)
+                else:
+                    scheduler = hydra.utils.instantiate(
+                        sched_cfg, 
+                        optimizer=optimizer,
+                        total_steps=total_steps
+                    )
+            else:
+                if isinstance(sched_cfg, partial):
+                    scheduler = sched_cfg(optimizer=optimizer)
+                else:
+                    scheduler = hydra.utils.instantiate(sched_cfg, optimizer=optimizer)
+            
+            scheduler_config = {
+                "scheduler": scheduler,
+                "interval": "step" if "OneCycleLR" in str(type(scheduler)) else "epoch",
+                "frequency": 1,
+            }
+        else:
+            warmup_epochs = max(0, int(getattr(self.hparams, "lr_warmup_epochs", 0)))
+            warmup_start_factor = float(getattr(self.hparams, "lr_warmup_start_factor", 0.1))
+
+            cosine_t_max = max(1, t_max - warmup_epochs)
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=cosine_t_max,
+                eta_min=self.hparams.scheduler_eta_min,
+            )
+
+            if warmup_epochs > 0:
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=warmup_start_factor,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                scheduler = cosine_scheduler
+            
+            scheduler_config = {
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-            },
+            }
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler_config,
         }
 
     def _get_mask_embedding(self, mask: torch.Tensor, h: int, w: int) -> torch.Tensor:

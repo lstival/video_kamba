@@ -608,6 +608,10 @@ class VOSDataModule(L.LightningDataModule):
                       25 % DAVIS / 75 % YouTube-VOS, matching the AOT PRE_YTB_DAV
                       balance.  Ignored when ``ytv_root`` is None.
         val_output_size: Validation resolution (defaults to ``output_size``).
+        max_val_frames: Maximum query frames per validation sequence.  Cap this
+                      to match the training clip length (``clip_len``) so the
+                      SSM hidden-state never runs beyond its training horizon
+                      during validation.  ``None`` = full sequence (legacy).
     """
 
     def __init__(
@@ -622,6 +626,7 @@ class VOSDataModule(L.LightningDataModule):
         ytv_root: Optional[str] = None,
         davis_sampling_ratio: float = 0.25,
         val_output_size: Optional[int] = None,
+        max_val_frames: Optional[int] = None,
         train_min_scale: float = 0.7,
         train_max_scale: float = 1.3,
         train_flip_prob: float = 0.5,
@@ -640,6 +645,7 @@ class VOSDataModule(L.LightningDataModule):
         self.ytv_root             = ytv_root
         self.davis_sampling_ratio = max(0.01, min(0.99, davis_sampling_ratio))
         self.val_output_size      = val_output_size or output_size
+        self.max_val_frames       = max_val_frames
         self.train_min_scale      = train_min_scale
         self.train_max_scale      = train_max_scale
         self.train_flip_prob      = train_flip_prob
@@ -709,10 +715,11 @@ class VOSDataModule(L.LightningDataModule):
             # Val: return first annotated frame of each DAVIS-val sequence
             # as a flat list of (ref, query) clips — one clip per sequence
             self._val_ds = _DAVISValClipDataset(
-                root       = str(self.davis_root),
-                output_size= self.val_output_size,
-                resolution = self.resolution,
-                transform  = val_aug,
+                root            = str(self.davis_root),
+                output_size     = self.val_output_size,
+                resolution      = self.resolution,
+                transform       = val_aug,
+                max_val_frames  = self.max_val_frames,
             )
             LOGGER.info("[VOSDataModule] Val: %d sequences", len(self._val_ds))
 
@@ -748,10 +755,19 @@ class VOSDataModule(L.LightningDataModule):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _DAVISValClipDataset(Dataset):
-    """Returns each DAVIS-val sequence as a single (ref + all queries) clip.
+    """Returns each DAVIS-val sequence as a single (ref + queries) clip.
 
     Used by :class:`VOSDataModule` for the validation dataloader.
-    One item = one full-length sequence (T = total frames - 1).
+    One item = one sequence, optionally capped at ``max_val_frames`` query
+    frames.
+
+    Args:
+        max_val_frames: Maximum number of query frames returned per sequence.
+            When ``None`` the full sequence is returned (legacy behaviour).
+            Set to a small value (e.g. 16) to match the training clip length
+            distribution and avoid SSM hidden-state drift beyond the training
+            horizon.  The window always starts at the first query frame so the
+            metric reflects early-sequence propagation difficulty.
     """
 
     def __init__(
@@ -760,11 +776,13 @@ class _DAVISValClipDataset(Dataset):
         output_size: int,
         resolution: str = "480p",
         transform: Optional[Callable] = None,
+        max_val_frames: Optional[int] = None,
     ) -> None:
-        self.root        = Path(root)
-        self.output_size = output_size
-        self.resolution  = resolution
-        self.transform   = transform or ValTransform(output_size)
+        self.root           = Path(root)
+        self.output_size    = output_size
+        self.resolution     = resolution
+        self.transform      = transform or ValTransform(output_size)
+        self.max_val_frames = max_val_frames
 
         split_f = self.root / "ImageSets" / "2017" / "val.txt"
         with open(split_f) as f:
@@ -774,11 +792,17 @@ class _DAVISValClipDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> Dict:
-        seq  = self.sequences[idx]
+        seq      = self.sequences[idx]
         imgs_dir = self.root / "JPEGImages"  / self.resolution / seq
         anns_dir = self.root / "Annotations" / self.resolution / seq
 
         frame_names = sorted(p.name for p in imgs_dir.glob("*.jpg"))
+
+        # Cap query length to avoid SSM drift beyond training clip horizon.
+        # Always keep frame 0 as the reference; cap only the query window.
+        if self.max_val_frames is not None:
+            # +1 because frame_names[0] is the reference frame
+            frame_names = frame_names[: self.max_val_frames + 1]
 
         all_imgs  = [_load_image(str(imgs_dir / n)) for n in frame_names]
         all_masks = []

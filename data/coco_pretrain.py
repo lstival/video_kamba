@@ -51,49 +51,122 @@ def _normalize(img: torch.Tensor) -> torch.Tensor:
     return TF.normalize(img, mean=_IMAGENET_MEAN, std=_IMAGENET_STD)
 
 
-def _augment_query_fast(
+def _sample_motion_trajectory(
+    seq_len: int,
+    h: int,
+    w: int,
+) -> List[Dict]:
+    """Sample a coherent motion trajectory for a synthetic pseudo-video.
+
+    Returns per-frame affine parameters that progress smoothly in one direction,
+    simulating a camera pan/zoom or object drift rather than random teleportation.
+
+    The trajectory is built from:
+      - A base direction (translation dx, dy per frame)
+      - A cumulative rotation (small delta per frame, same sign)
+      - A monotonic zoom (gradual scale change)
+      - A smooth colour drift (brightness/contrast change linearly)
+      - Flip is decided ONCE for the whole clip (not per frame)
+
+    Small per-frame jitter is added on top to prevent the SSM from memorising
+    a perfectly linear trajectory.
+    """
+    # ── Spatial trajectory ──────────────────────────────────────────────
+    # Translation: pick a direction and speed, accumulate across frames
+    tx_per_frame = random.uniform(-0.02, 0.02)  # fraction of width per step
+    ty_per_frame = random.uniform(-0.02, 0.02)  # fraction of height per step
+
+    # Rotation: pick a direction (CW or CCW), accumulate
+    rot_per_frame = random.uniform(-3.0, 3.0)  # degrees per step
+
+    # Scale: gentle zoom in or out across the clip
+    scale_start = random.uniform(0.95, 1.0)
+    scale_end = random.uniform(1.0, 1.05)
+
+    # Flip: one decision for the whole clip
+    flip = random.random() < 0.3  # lower prob — flips break temporal coherence
+
+    # ── Colour trajectory ───────────────────────────────────────────────
+    brightness_start = random.uniform(0.85, 1.0)
+    brightness_end = random.uniform(1.0, 1.15)
+    contrast_start = random.uniform(0.85, 1.0)
+    contrast_end = random.uniform(1.0, 1.15)
+    saturation_start = random.uniform(0.85, 1.0)
+    saturation_end = random.uniform(1.0, 1.15)
+    hue_start = random.uniform(-0.03, 0.0)
+    hue_end = random.uniform(0.0, 0.03)
+
+    # ── Random erasing: at most one event placed mid-sequence ───────────
+    erase_frame = random.randint(seq_len // 2, seq_len - 1) if random.random() < 0.3 else -1
+
+    frames = []
+    for t in range(seq_len):
+        # Linear interpolation factor [0, 1] over the clip
+        alpha = t / max(seq_len - 1, 1)
+
+        # Per-frame jitter (small noise on top of the trajectory)
+        jitter_tx = random.uniform(-0.005, 0.005)
+        jitter_ty = random.uniform(-0.005, 0.005)
+        jitter_rot = random.uniform(-0.5, 0.5)
+        jitter_scale = random.uniform(-0.005, 0.005)
+
+        frames.append({
+            "angle": rot_per_frame * (t + 1) + jitter_rot,
+            "translate": [
+                int(w * (tx_per_frame * (t + 1) + jitter_tx)),
+                int(h * (ty_per_frame * (t + 1) + jitter_ty)),
+            ],
+            "scale": scale_start + (scale_end - scale_start) * alpha + jitter_scale,
+            "flip": flip,
+            "brightness": brightness_start + (brightness_end - brightness_start) * alpha,
+            "contrast": contrast_start + (contrast_end - contrast_start) * alpha,
+            "saturation": saturation_start + (saturation_end - saturation_start) * alpha,
+            "hue": hue_start + (hue_end - hue_start) * alpha,
+            "erase": t == erase_frame,
+        })
+
+    return frames
+
+
+def _apply_frame_augment(
     img_raw: torch.Tensor,
     mask_t: torch.Tensor,
+    params: Dict,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Tensor-based query augmentation applied consistently to image and mask."""
+    """Apply a single frame's augmentation from a coherent trajectory."""
     _, h, w = img_raw.shape
 
-    angle = random.uniform(-10, 10)
-    translate = [
-        int(w * random.uniform(-0.05, 0.05)),
-        int(h * random.uniform(-0.05, 0.05)),
-    ]
-    scale = random.uniform(0.95, 1.05)
-    flip = random.random() < 0.5
-
+    # Geometric transform (same for image and mask)
     img = TF.affine(
         img_raw,
-        angle=angle,
-        translate=translate,
-        scale=scale,
+        angle=params["angle"],
+        translate=params["translate"],
+        scale=params["scale"],
         shear=0,
         interpolation=TF.InterpolationMode.BILINEAR,
     )
     mask = TF.affine(
         mask_t.unsqueeze(0).float(),
-        angle=angle,
-        translate=translate,
-        scale=scale,
+        angle=params["angle"],
+        translate=params["translate"],
+        scale=params["scale"],
         shear=0,
         interpolation=TF.InterpolationMode.NEAREST,
     ).squeeze(0).round().long()
 
-    if flip:
+    if params["flip"]:
         img = TF.hflip(img)
         mask = TF.hflip(mask)
 
-    img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
-    img = TF.adjust_contrast(img, random.uniform(0.7, 1.3))
-    img = TF.adjust_saturation(img, random.uniform(0.7, 1.3))
-    img = TF.adjust_hue(img, random.uniform(-0.05, 0.05))
+    # Smooth colour variation
+    img = TF.adjust_brightness(img, params["brightness"])
+    img = TF.adjust_contrast(img, params["contrast"])
+    img = TF.adjust_saturation(img, params["saturation"])
+    img = TF.adjust_hue(img, params["hue"])
     img = img.clamp(0.0, 1.0)
 
-    if random.random() < 0.5:
+    # Sparse random erasing (only on designated frame)
+    if params["erase"]:
         h_e = random.randint(h // 8, h // 4)
         w_e = random.randint(w // 8, w // 4)
         y0 = random.randint(0, h - h_e)
@@ -263,10 +336,13 @@ class COCOPretrainDataset(Dataset):
         ref_img_t = _normalize(img_raw)
         ref_mask_t = mask_t
 
+        # Sample one coherent motion trajectory for the entire clip
+        trajectory = _sample_motion_trajectory(self.seq_len, self.img_size, self.img_size)
+
         query_imgs: List[torch.Tensor] = []
         query_masks: List[torch.Tensor] = []
-        for _ in range(self.seq_len):
-            q_img, q_mask = _augment_query_fast(img_raw, mask_t)
+        for t in range(self.seq_len):
+            q_img, q_mask = _apply_frame_augment(img_raw, mask_t, trajectory[t])
             query_imgs.append(q_img)
             query_masks.append(q_mask)
 
