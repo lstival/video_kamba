@@ -112,8 +112,13 @@ class VideoMambaSystem(L.LightningModule):
         vim_spatial_layers: int = 1,
         # Training schedule
         max_epochs: int = 20,
-        propagation_lr_multiplier: float = 5.0,
-        trainable_backbone_lr_multiplier: float = 0.1,
+        propagation_lr_multiplier: float = 1.0,
+        # Separate multiplier for the temporal SSM (KangaSSM).
+        # Kept lower than the decoder (1.0) because temporal_model.out_proj
+        # is a primary explosion site — giving it less LR reduces the update
+        # magnitude even before gradient clipping intervenes.
+        temporal_lr_multiplier: float = 0.5,
+        trainable_backbone_lr_multiplier: float = 0.05,
         frozen_backbone_lr_multiplier: float = 0.01,
         optimizer_weight_decay: float = 1e-2,
         scheduler_eta_min: float = 1e-6,
@@ -858,17 +863,33 @@ class VideoMambaSystem(L.LightningModule):
     def configure_optimizers(self):
         learning_rate = self.hparams.learning_rate
 
-        # Separate propagation parameters
-        prop_params = list(self.memory_bank.parameters()) + list(self.propagation_attention.parameters())
+        # ── Propagation: memory bank + cross-attention ──────────────────
+        # Kept as a separate group so we can tune its LR independently.
+        # NOTE: propagation_lr_multiplier was reduced from 5.0 → 1.0 (v3)
+        # because PropagationAttention.proj_out was the 2nd largest explosion
+        # site (2.98e+05 peak norm, job 65737509) at 5× LR.
+        prop_params = (
+            list(self.memory_bank.parameters())
+            + list(self.propagation_attention.parameters())
+        )
         prop_ids = {id(p) for p in prop_params}
 
-        # For trainable encoders (MobileNetV2 / Vision-Mamba tiny)
+        # ── Temporal SSM: KangaSSM ────────────────────────────────────
+        # Separate from "base" so temporal_lr_multiplier can throttle it.
+        # out_proj.weight was the #3 explosion site (7.7e+04 at epoch 3).
+        temporal_params = list(self.temporal_model.parameters())
+        temporal_ids = {id(p) for p in temporal_params}
+
+        # ── Encoder backbone ─────────────────────────────────────────
         backbone_params = list(self.feature_extractor.parameters())
         backbone_ids = {id(p) for p in backbone_params}
 
+        # ── Decoder + everything else ────────────────────────────────
         base_params = [
             p for p in self.parameters()
-            if id(p) not in prop_ids and id(p) not in backbone_ids
+            if id(p) not in prop_ids
+            and id(p) not in temporal_ids
+            and id(p) not in backbone_ids
         ]
 
         trainable_backbones = {"mobilenetv2", "vision_mamba_tiny"}
@@ -882,6 +903,11 @@ class VideoMambaSystem(L.LightningModule):
                 "params": prop_params,
                 "lr": learning_rate * self.hparams.propagation_lr_multiplier,
                 "name": "propagation",
+            },
+            {
+                "params": temporal_params,
+                "lr": learning_rate * self.hparams.temporal_lr_multiplier,
+                "name": "temporal",
             },
             {"params": base_params, "lr": learning_rate, "name": "base"},
             {"params": backbone_params, "lr": backbone_lr, "name": "backbone"},

@@ -1,6 +1,9 @@
+import math
 from typing import Optional, List, Tuple
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 from jaxtyping import Float
 
@@ -92,7 +95,21 @@ class KangaSSM(nn.Module):
         # (see "Layer-Wise Analysis of Normalization in Mamba", 2025).
         self.post_scan_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(d_model, d_model)
+
+        # Gated output projection (SwiGLU, Mamba-2 style).
+        # Replaces Linear(D→D) with a split-gate: up * silu(gate).
+        # The sigmoid-like gate bounds the output magnitude, which cuts the
+        # dL/dW = dL/dy ⊗ y gradient explosion observed in out_proj.weight
+        # (peak norm 2.05e+05 in job 65737509 stability_fix_v2).
+        # See: Shazeer (2020) "GLU Variants Improve Transformers".
+        self.out_proj = nn.Linear(d_model, d_model * 2, bias=False)
+        # Small init: 0.02 / sqrt(2 * num_layers) following GPT-2 / Mamba convention
+        # for output projections in residual branches — prevents residual branch from
+        # dominating the skip connection at step 0.
+        nn.init.normal_(
+            self.out_proj.weight,
+            std=0.02 / math.sqrt(2 * max(num_layers, 1)),
+        )
 
     def forward(
         self,
@@ -169,8 +186,10 @@ class KangaSSM(nn.Module):
 
         x = self.post_scan_norm(x)
         x = self.dropout(x)
-        x = self.out_proj(x)
-        out = x + residual
+        # SwiGLU gated projection: out_proj outputs [D*2], split into (gate, up).
+        # up * silu(gate) bounds output scale — see __init__ for motivation.
+        gate, up = self.out_proj(x).chunk(2, dim=-1)
+        out = up * F.silu(gate) + residual
 
         if return_last_state:
             return out, next_states

@@ -219,15 +219,14 @@ class KANModulator(nn.Module):
         scale = self.log_scale.exp()
         modulation = modulation * scale + self.bias
         
-        # Ensure positive output for matrix scaling
+        # Ensure bounded output for matrix scaling
         if self.activation_type == "softplus":
-            # Softplus with offset to ensure modulation ≥ 0.1
             modulation = F.softplus(modulation) + 0.1
+        elif self.activation_type == "tanh_bounded":
+            modulation = 1.0 + 0.5 * torch.tanh(modulation)
         elif self.activation_type == "sigmoid":
-            # Sigmoid scaled to [0.5, 1.5] for mild modulation
             modulation = torch.sigmoid(modulation) + 0.5
         elif self.activation_type == "exp":
-            # Exponential (can be unstable, use with care)
             modulation = torch.exp(modulation.clamp(-5, 5))
         
         return modulation
@@ -286,10 +285,17 @@ class FastKANModulator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # FastKANLayer already includes LayerNorm and RBF+Linear
         out = self.kan(x)
-        
+
         # Apply activation for modulation constraints
         if self.activation_type == "softplus":
             return F.softplus(out) + 0.1
+        elif self.activation_type == "tanh_bounded":
+            # Bounded modulator: output ∈ [0.5, 1.5], centred at 1.0.
+            # Replaces softplus (unbounded, peak norm 1.8e+04 in job 65737509)
+            # with tanh which saturates at ±1 and initialises near 1.0 (identity).
+            # The [0.5, 1.5] range allows ±50% modulation — enough expressiveness
+            # while preventing the KAN from amplifying SSM output arbitrarily.
+            return 1.0 + 0.5 * torch.tanh(out)
         elif self.activation_type == "sigmoid":
             return torch.sigmoid(out) + 0.5
         elif self.activation_type == "exp":
@@ -374,6 +380,8 @@ class MLPModulator(nn.Module):
         out = self.net(x)
         if self.activation_type == "softplus":
             return F.softplus(out) + 0.1
+        elif self.activation_type == "tanh_bounded":
+            return 1.0 + 0.5 * torch.tanh(out)
         elif self.activation_type == "sigmoid":
             return torch.sigmoid(out) + 0.5
         elif self.activation_type == "exp":
@@ -927,20 +935,24 @@ class DiagonalKANSSMCore(nn.Module):
         mod_in = inner_dim + (identity_dim if identity_dim is not None else 0)
 
         # ── BCNorm (Mamba-3, ICLR 2026): RMSNorm after B/C projections ──
-        # Prevents activation magnitude amplification through the SSM scan
-        # which is the root cause of gradient explosion in SSM models.
-        self.B_norm = nn.RMSNorm(state_dim)
-        self.C_norm = nn.RMSNorm(inner_dim)
+        # elementwise_affine=False: removes the learnable gamma that can grow
+        # unboundedly and negate the normalisation effect (job 65737509 analysis
+        # showed layernorm.weight at 1.2e+03 in stage3_ssm after 4 epochs).
+        self.B_norm = nn.RMSNorm(state_dim, elementwise_affine=False)
+        self.C_norm = nn.RMSNorm(inner_dim, elementwise_affine=False)
+
+        # tanh_bounded activation: modulator output ∈ [0.5, 1.5], centred at 1.0.
+        # Replaces softplus (unbounded) which caused C_modulator to reach
+        # norm 1.8e+04 (job 65737509), amplifying the SSM output and driving
+        # out_proj gradient explosion.
+        _mod_activation = "tanh_bounded"
 
         if modulate_A:
-            # [N] positive decay-rate modulator — softplus output near 1 initially
-            self.A_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation="softplus")
+            self.A_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation=_mod_activation)
         if modulate_B:
-            # [N] positive coupling scale
-            self.B_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation="softplus")
+            self.B_modulator = ModCls(mod_in, state_dim, grid_size=grid_size, activation=_mod_activation)
         if modulate_C:
-            # [D] positive readout scale
-            self.C_modulator = ModCls(mod_in, inner_dim, grid_size=grid_size, activation="softplus")
+            self.C_modulator = ModCls(mod_in, inner_dim, grid_size=grid_size, activation=_mod_activation)
 
     # ------------------------------------------------------------------
     # Forward

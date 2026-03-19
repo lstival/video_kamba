@@ -1,0 +1,98 @@
+# @package _global_
+
+# Stability Fixes v3 — addresses persistent gradient explosion from v2 (job 65737509):
+#
+# Root cause (from analyse_gradient_explosion.py on first 4 epochs):
+#   - out_proj.weight was the #1 explosion site: 3.9e+04 → 1.9e+05 (5× in 4 epochs)
+#   - C_modulator.kan.rbf_weight unbounded softplus: reached 1.8e+04
+#   - All 128 tracked steps for out_proj were exploding (100% rate)
+#   - BCNorm layernorm.weight (affine scale) itself growing: 1.2e+03 after 4 epochs
+#   - propagation_lr_multiplier=5.0 exacerbated PropagationAttention explosion
+#
+# Architecture fixes (code-level, applied in this PR):
+#   1. KangaSSM.out_proj: Linear(D→D) → SwiGLU(D→2D), split gate.
+#      Bounds output magnitude via sigmoid-like silu gate.
+#      Init: std=0.02/sqrt(2*n_layers) — GPT-2/Mamba residual branch convention.
+#   2. PropagationAttention.proj_out: same SwiGLU replacement.
+#      Init: std=0.02.
+#   3. DiagonalKANSSMCore modulators: softplus → tanh_bounded → [0.5, 1.5].
+#      C_modulator can no longer amplify SSM output beyond 1.5×.
+#   4. DiagonalKANSSMCore BCNorm: elementwise_affine=False.
+#      Removes the learnable gamma that was itself growing to 1.2e+03.
+#
+# Config fixes (this file):
+#   5. propagation_lr_multiplier: 5.0 → 1.0 (was 5× on explosion site #2)
+#   6. temporal_lr_multiplier: 0.5 (new param — separate KangaSSM LR group)
+#   7. trainable_backbone_lr_multiplier: 0.1 → 0.05
+#      (feature_extractor was 79% of explosions; lower LR reduces update magnitude)
+#   8. gradient_clip_val: 1.0 → 0.5 (more aggressive global clip as safety net)
+#   9. LR: 5e-5 → 3e-5 (gating reduces need for high LR; less overheating early)
+
+defaults:
+  - override /callbacks: cv_gradient_tracking
+
+# ── Model Configuration Overrides ──────────────────────────────────────────
+model:
+  learning_rate: 3.0e-5
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3
+  lr_warmup_start_factor: 0.1
+
+  # LR group multipliers (v3 fixes)
+  propagation_lr_multiplier: 1.0
+  temporal_lr_multiplier: 0.5
+  trainable_backbone_lr_multiplier: 0.05
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+# ── Trainer Configuration Overrides ────────────────────────────────────────
+trainer:
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+  max_epochs: 30
+
+# ── Callback Configuration Overrides ──────────────────────────────────────
+callbacks:
+  layer_gradient_norm_tracker:
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "propagation_attention.W_q"
+      - "propagation_attention.proj_out"
+      - "temporal_model"
+      - "feature_extractor"
+      - "temporal_model.post_scan_norm"
+
+  per_sample_loss_trajectory:
+    log_every_n_steps: 50
+    high_loss_percentile: 90
+    output_dir: ${work_dir}/artifacts/loss_trajectories
+
+  per_sample_gradient_tracker:
+    log_every_n_steps: 50
+    sample_index_key: sample_idx
+    output_dir: ${work_dir}/artifacts/gradient_tracking
+
+  trak_influence:
+    num_val_samples: 0
+    mode: checkpoint
+    checkpoint_steps: []

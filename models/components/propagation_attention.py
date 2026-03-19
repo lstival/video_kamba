@@ -24,7 +24,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: F401 — used in forward (silu gate)
 from jaxtyping import Float
 
 
@@ -103,8 +103,11 @@ class PropagationAttention(nn.Module):
         self.qk_norm_q = nn.LayerNorm(self.head_dim_k, elementwise_affine=False)
         self.qk_norm_k = nn.LayerNorm(self.head_dim_k, elementwise_affine=False)
 
-        # ── Output projection back to d_model ────────────────────────────
-        self.proj_out = nn.Linear(d_value, d_model, bias=False)
+        # ── Gated output projection back to d_model (SwiGLU) ────────────
+        # Dual-output: [d_value → d_model * 2], then gate * silu(up).
+        # This eliminates the out_proj gradient explosion (peak 2.98e+05,
+        # job 65737509) by bounding the output via the sigmoid-like SiLU gate.
+        self.proj_out = nn.Linear(d_value, d_model * 2, bias=False)
         self.norm_out = nn.LayerNorm(d_model)
 
         self.attn_drop = nn.Dropout(dropout)
@@ -128,11 +131,10 @@ class PropagationAttention(nn.Module):
         """
         nn.init.xavier_uniform_(self.W_q.weight)
 
-        # Output projection: scaled down to prevent residual branch
-        # from dominating the skip connection at initialisation.
-        nn.init.xavier_uniform_(self.proj_out.weight)
-        with torch.no_grad():
-            self.proj_out.weight.mul_(0.5)
+        # Output projection: GPT-2 / Mamba convention for residual branch output
+        # projections — std=0.02 prevents the residual branch from dominating
+        # the skip connection at initialisation.
+        nn.init.normal_(self.proj_out.weight, std=0.02)
 
     def forward(
         self,
@@ -192,8 +194,10 @@ class PropagationAttention(nn.Module):
         out = torch.matmul(attn, V)  # [B, H, P, dv/H]
         out = out.transpose(1, 2).contiguous().view(B, P, self.d_value)
 
-        # ── Project to d_model + residual ───────────────────────────────
-        out = self.proj_out(out)               # [B, P, d_model]
-        out = self.norm_out(out + query_feat)  # residual
+        # ── Gated output projection + residual ──────────────────────────
+        # proj_out outputs [B, P, d_model * 2]; split into (gate, up).
+        # up * silu(gate) bounds the magnitude — see __init__ for motivation.
+        gate, up = self.proj_out(out).chunk(2, dim=-1)  # [B, P, d_model] each
+        out = self.norm_out(up * F.silu(gate) + query_feat)
 
         return out
