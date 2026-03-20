@@ -1,0 +1,76 @@
+# @package _global_
+#
+# Phase 1 — COCO Pre-training with MobileNetV2 + KAN-SSM Temporal
+#
+# Objective:
+#   Train the propagation + temporal + decoder components using COCO static images
+#   converted to pseudo-video via coherent affine motion trajectories.
+#   MobileNetV2 early stages (stride-4, stride-8) are frozen — ImageNet features
+#   are already good; only the deeper features + temporal components adapt.
+#
+# Frozen stages (mv2_freeze_at=2):
+#   stage_0 (24-ch, stride-4): generic edges/textures — frozen
+#   stage_1 (32-ch, stride-8): mid-level features — frozen
+#   stage_2 (96-ch, stride-16): semantic — trainable (backbone_lr_multiplier)
+#   projection (1280→256): trainable (backbone_lr_multiplier)
+#   KangaSSM temporal: trainable (temporal_lr_multiplier)
+#   PropagationAttention + MemoryBank: trainable (propagation_lr_multiplier)
+#   SegmentationDecoder: trainable (base lr)
+#
+# Scheduled sampling: 0.0 (always GT) — learn to segment before self-teaching.
+# Success criterion: val_loss < 0.5 at epoch 5.
+#
+# Memory budget (16GB GPU):
+#   batch_size=8, accumulate=1 → effective batch=8 (A100 80GB, ~33GB)
+#   use_checkpointing=true: ~30% memory saving
+#   Callbacks: default only (no gradient hooks — were blocking on_train_start for 13+ min)
+#
+defaults:
+  - override /callbacks: default     # ← plain checkpoint + spike diagnostics only
+
+# ── Datamodule overrides ─────────────────────────────────────────────────────
+datamodule:
+  batch_size: 8                 # 8 clips × 6 frames × 480p — ~33GB on A100 80GB (safe)
+
+model:
+  learning_rate: 1.0e-4
+  mv2_freeze_at: 2
+  optimizer_weight_decay: 0.05
+  use_checkpointing: true       # gradient checkpointing: ~30% memory saving
+
+  scheduled_sampling_rate: 0.0
+  scheduled_sampling_start: -1.0
+  scheduled_sampling_end: -1.0
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 1.0e-4
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 1.0e-4
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 20
+  limit_train_batches: 3000
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+  accumulate_grad_batches: 1    # batch=8 × accum=1 → effective batch=8 (A100 80GB)
+
+callbacks:
+  model_checkpoint:
+    monitor: val_loss
+    mode: min
+    filename: "best_mv2_phase1_coco"
+    save_top_k: 1

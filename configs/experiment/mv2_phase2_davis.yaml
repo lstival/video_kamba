@@ -1,0 +1,75 @@
+# @package _global_
+#
+# Phase 2 — DAVIS Fine-tuning (MobileNetV2 + KAN-SSM Temporal)
+#
+# Initialise from Phase 1 checkpoint (best_mv2_phase1_coco.ckpt).
+# Unfreeze all MobileNetV2 stages (mv2_freeze_at=0) with a very low
+# backbone LR (0.05× base = 1.5e-6) to avoid destroying ImageNet features.
+#
+# Scheduled sampling ramp 0.0 → 0.3 over 100 epochs with 5-epoch warmup:
+#   - Teaches the model to propagate masks robustly when memory is imperfect
+#   - Stops at 0.3 (not 0.5) to keep memory contamination error bounded on
+#     the smaller DAVIS dataset (only 60 training sequences)
+#
+# Gate decision @ epoch 50 (check Comet):
+#   val_J_and_F > 0.55 → proceed to Phase 3
+#   val_J_and_F < 0.55 → diagnose before continuing
+#
+defaults:
+  - override /callbacks: cv_gradient_tracking
+
+model:
+  learning_rate: 3.0e-5
+  mv2_freeze_at: 0              # unfreeze all MobileNetV2 stages
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3           # 3-epoch LR warmup after domain shift from COCO→DAVIS
+  lr_warmup_start_factor: 0.1
+
+  # Scheduled sampling ramp: 0.0 → 0.3 over 100 epochs, starting after 5 warmup epochs
+  scheduled_sampling_start: 0.0
+  scheduled_sampling_end: 0.3
+  scheduled_sampling_warmup_epochs: 5
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 100
+  limit_train_batches: 500      # DAVIS is small — 500 steps/epoch ≈ 12 min/epoch
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+  accumulate_grad_batches: 2    # effective batch = 4×2 = 8
+
+callbacks:
+  model_checkpoint:
+    monitor: val_J_and_F
+    mode: max
+    filename: "best_mv2_phase2_davis"
+    save_top_k: 1
+
+  layer_gradient_norm_tracker:
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "propagation_attention.proj_out"
+      - "temporal_model"
+      - "feature_extractor"
+      - "temporal_model.post_scan_norm"

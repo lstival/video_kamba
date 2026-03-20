@@ -1,0 +1,97 @@
+# MobileNetV2 + KAN-SSM Temporal — Production VOS Model Config
+#
+# Architecture:
+#   Encoder  : MobileNetV2 (ImageNet-1K pretrained, torchvision)
+#              Multi-scale: stride-4 (24-ch), stride-8 (32-ch), stride-16 (96-ch → 256-ch)
+#   Temporal : KangaSSM (DiagonalKANSSMCore, ssm_layers=2) — runs over T frames
+#   Memory   : MemoryBank + PropagationAttention (cross-attention to stored K/V)
+#   Decoder  : SegmentationDecoder with genuine multi-scale skip connections
+#
+# Key difference from vision_mamba_tiny_sota_light:
+#   - Encoder is MobileNetV2 (ImageNet pretrained) not a custom CNN from scratch
+#   - No spatial KAN-SSM inside the encoder — KAN-SSM is purely temporal
+#   - This isolates the KAN-SSM contribution (temporal modeling novelty)
+#   - Enables fair comparison with MobileVOS (CVPR 2023) which uses same backbone
+#
+# Stability fixes (v3) applied as defaults:
+#   - gradient_clip_val: 0.5 (via experiment override)
+#   - temporal_lr_multiplier: 0.5 (KangaSSM gets half the base LR)
+#   - trainable_backbone_lr_multiplier: 0.05 (backbone gets 1/20 base LR)
+#   - propagation_lr_multiplier: 1.0 (was 5.0 in v1/v2)
+#
+_target_: models.video_mamba.VideoMambaSystem
+
+# ── Encoder ───────────────────────────────────────────────────────────────────
+encoder_type: mobilenetv2
+dim_in: 256               # stage_3: 1280 → 256 projection (AOT convention)
+dim_out: 256
+
+# Multi-scale dims (fixed by MobileNetV2 architecture)
+dim_in_fine: 96           # stage_2: pre-projection stride-16 features (dual-scale mem key)
+dim_in_s2: 32             # stage_1: stride-8  → 28×28 decoder up2 skip
+dim_in_s1: 24             # stage_0: stride-4  → 56×56 decoder up3 skip
+
+# Backbone settings
+mv2_output_stride: 16     # stride-16 via dilation (AOT default, 30×30 tokens at 480p)
+mv2_freeze_at: 0          # 0 = all stages trainable; controlled per-phase via experiment
+mv2_pretrained: true      # ImageNet-1K weights from torchvision
+
+# ── Task heads ────────────────────────────────────────────────────────────────
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+
+# ── Resolution ────────────────────────────────────────────────────────────────
+# 480×480 → 30×30 tokens at stride-16 (AOT native resolution)
+target_size: 480
+
+# ── Memory + Propagation Attention ────────────────────────────────────────────
+prop_d_key: 256           # matches dim_in (256 → 256 attention)
+prop_d_value: 256
+prop_n_heads: 8           # 256 / 8 = 32-dim per head
+prop_dropout: 0.1
+max_mem_frames: 5
+memory_update_freq: 1
+prop_use_dual_scale: true # coarse stage_3 (256-ch) + fine stage_2 (96-ch)
+use_kan_key_adapter: true
+kan_adapter_d_state: 8
+
+# ── KAN-SSM Temporal ──────────────────────────────────────────────────────────
+# Runs over T frames AFTER encoder + PropagationAttention.
+# No spatial SSM in encoder — clean separation of concerns.
+ssm_d_state: 16
+ssm_layers: 2
+modulator_type: kan       # DiagonalKANSSMCore with tanh_bounded modulators (v3)
+use_checkpointing: false
+use_ref_context: true
+use_identity_modulation: false
+consistency_weight: 0.0
+fusion_mode: kan_spatial
+
+# ── Decoder ───────────────────────────────────────────────────────────────────
+# Genuine multi-scale: 30×30 → 60×60 → 120×120 → 480×480
+dec_dim_up1: 192          # SSM output (256) + fine skip (96) → fused to 192
+dec_dim_up2: 96           # stride-8 skip (32) → 96
+dec_dim_up3: 48           # stride-4 skip (24) → 48
+
+# ── LR Groups (v3 stability defaults) ────────────────────────────────────────
+learning_rate: 1.0e-4
+propagation_lr_multiplier: 1.0    # was 5.0 — reduced to prevent proj_out explosion
+temporal_lr_multiplier: 0.5       # KangaSSM gets half LR (out_proj explosion site)
+trainable_backbone_lr_multiplier: 0.05  # ImageNet features need small perturbations
+frozen_backbone_lr_multiplier: 0.0     # frozen stages get zero LR
+optimizer_weight_decay: 0.05
+scheduler_eta_min: 1.0e-6
+
+# ── Scheduled Sampling ────────────────────────────────────────────────────────
+# Default: no scheduled sampling. Each experiment overrides this.
+scheduled_sampling_rate: 0.0
+scheduled_sampling_start: -1.0
+scheduled_sampling_end: -1.0
+scheduled_sampling_warmup_epochs: 0
+
+# ── Training schedule defaults ────────────────────────────────────────────────
+max_epochs: 50
+lr_warmup_epochs: 0
+lr_warmup_start_factor: 0.1
+vos_loss_beta: 0.5
