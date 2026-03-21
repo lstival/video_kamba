@@ -1,0 +1,64 @@
+_target_: models.video_mamba.VideoMambaSystem
+
+# ── Encoder ───────────────────────────────────────────────────────────────────
+encoder_type: mobilenetv2
+dim_in: 256               # stage_3: 1280 → 256 projection (AOT convention)
+dim_out: 256
+
+# Multi-scale dims (fixed by MobileNetV2 architecture)
+dim_in_fine: 96           # stage_2: pre-projection stride-16 features (dual-scale mem key)
+dim_in_s2: 32             # stage_1: stride-8  → 28×28 decoder up2 skip
+dim_in_s1: 24             # stage_0: stride-4  → 56×56 decoder up3 skip
+
+# Backbone settings
+mv2_output_stride: 16     # stride-16 via dilation (AOT default, 30×30 tokens at 480p)
+mv2_freeze_at: 0          # 0 = all stages trainable; controlled per-phase via experiment
+mv2_pretrained: true      # ImageNet-1K weights from torchvision
+
+# ── Task heads ────────────────────────────────────────────────────────────────
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+
+# ── Resolution ────────────────────────────────────────────────────────────────
+# 480×480 → 30×30 tokens at stride-16 (AOT native resolution)
+target_size: 480
+
+# ── Memory + Feature Fusion ────────────────────────────────────────────
+# SSM-memory architecture — MemoryStateBank, no PropagationAttention
+memory_update_freq: 1          # deprecated no-op; kept for ckpt compat
+
+# ── KAN-SSM Temporal ──────────────────────────────────────────────────────────
+ssm_d_state: 16
+ssm_layers: 2
+modulator_type: kan       # DiagonalKANSSMCore with tanh_bounded modulators (v3)
+use_checkpointing: false
+use_ref_context: true
+use_identity_modulation: false
+consistency_weight: 0.0
+fusion_mode: kan_spatial
+
+# ── Decoder ───────────────────────────────────────────────────────────────────
+dec_dim_up1: 192          # SSM output (256) + fine skip (96) → fused to 192
+dec_dim_up2: 96           # stride-8 skip (32) → 96
+dec_dim_up3: 48           # stride-4 skip (24) → 48
+
+# ── LR Groups (v3 stability defaults) ────────────────────────────────────────
+learning_rate: 1.0e-4
+temporal_lr_multiplier: 0.5       # KangaSSM gets half LR (out_proj explosion site)
+trainable_backbone_lr_multiplier: 0.05  # ImageNet features need small perturbations
+frozen_backbone_lr_multiplier: 0.0     # frozen stages get zero LR
+optimizer_weight_decay: 0.05
+scheduler_eta_min: 1.0e-6
+
+# ── Scheduled Sampling ────────────────────────────────────────────────────────
+scheduled_sampling_rate: 0.0
+scheduled_sampling_start: -1.0 # disabled — SSM state is mask-independent
+scheduled_sampling_end: -1.0
+scheduled_sampling_warmup_epochs: 0
+
+# ── Training schedule defaults ────────────────────────────────────────────────
+max_epochs: 50
+lr_warmup_epochs: 0
+lr_warmup_start_factor: 0.1
+vos_loss_beta: 0.5

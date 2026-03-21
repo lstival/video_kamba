@@ -12,12 +12,11 @@ from models.components.dinov3_wrapper import DinoV3Wrapper
 from models.components.mobilenetv2_wrapper import MobileNetV2Wrapper
 from models.components.vision_mamba_tiny_wrapper import VisionMambaTinyWrapper
 from models.components.kanga_ssm import KangaSSM
-from models.components.kan_key_adapter import KANKeyAdapter
 from models.components.classification_head import ClassificationHead
 from models.components.detection_head import DetectionHead
 from models.components.segmentation_decoder import SegmentationDecoder
-from models.components.memory_bank import MemoryBank
-from models.components.propagation_attention import PropagationAttention
+from models.components.memory_state_bank import MemoryStateBank
+from models.components.feature_fusion import FeatureFusion
 
 class VideoMambaSystem(L.LightningModule):
     """Multi-task video understanding model — Phase 2 (Hiera backbone).
@@ -70,12 +69,7 @@ class VideoMambaSystem(L.LightningModule):
         # Decoder up3 skip dim (-1 → same as dim_in).
         # MobileNetV2: 24, Vision-Mamba tiny: usually 48.
         dim_in_s1: int = -1,
-        # Memory-attention propagation
-        prop_d_key: int = 256,
-        prop_d_value: int = 256,
-        prop_n_heads: int = 8,
-        prop_dropout: float = 0.1,
-        max_mem_frames: int = 5,
+        # Memory update frequency (kept for compat)
         memory_update_freq: int = 1,
         # Scheduled sampling: 0.0 = always use GT mask for memory update (teacher
         # forcing), 1.0 = always use predicted mask (pure autoregressive).
@@ -98,7 +92,6 @@ class VideoMambaSystem(L.LightningModule):
         # Regularisation
         consistency_weight: float = 0.0,
         # Phase 2: dual-scale memory keys (Stage 3 semantic + Stage 2 fine-grained)
-        prop_use_dual_scale: bool = True,
         # MobileNetV2-specific
         mv2_output_stride: int = 16,
         mv2_freeze_at: int = 0,
@@ -128,11 +121,6 @@ class VideoMambaSystem(L.LightningModule):
         # fine-tuning from a pretrained checkpoint on a new domain.
         lr_warmup_epochs: int = 0,
         lr_warmup_start_factor: float = 0.1,
-        # KAN-SSM Memory Key Adapter
-        # When True, a lightweight KANKeyAdapter refines non-reference memory
-        # bank keys recurrently over the clip to model appearance drift.
-        use_kan_key_adapter: bool = True,
-        kan_adapter_d_state: int = 8,
         # Option 1: Dynamic Tracker
         use_identity_modulation: bool = False,
         **kwargs: Any,
@@ -182,7 +170,7 @@ class VideoMambaSystem(L.LightningModule):
                 f"Unsupported encoder_type '{encoder_type}'. "
                 "Expected one of {'dino', 'mobilenetv2', 'vision_mamba_tiny'}."
             )
-        self.temporal_model = KangaSSM(
+        self.temporal_model_local = KangaSSM(
             d_model=dim_in,
             d_state=ssm_d_state,
             num_layers=ssm_layers,
@@ -190,6 +178,17 @@ class VideoMambaSystem(L.LightningModule):
             modulator_type=modulator_type,
             identity_dim=dim_in if use_identity_modulation else None,
         )
+        self.temporal_model_global = KangaSSM(
+            d_model=dim_in,
+            d_state=ssm_d_state,
+            num_layers=ssm_layers,
+            use_checkpointing=use_checkpointing,
+            modulator_type=modulator_type,
+            identity_dim=dim_in if use_identity_modulation else None,
+        )
+        self.ssm_output_fusion = nn.Linear(dim_in * 2, dim_in)
+        self.memory_bank_local = MemoryStateBank()
+        self.memory_bank_global = MemoryStateBank()
         self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
         # For multi-scale trainable encoders the decoder skips use
@@ -207,34 +206,10 @@ class VideoMambaSystem(L.LightningModule):
             target_size=target_size,
             fusion_mode=fusion_mode,
         )
-        # Propagation: MemoryBank holds explicit K/V pairs per frame;
-        # PropagationAttention cross-attends query patches to the bank.
-        # ── KAN Key Adapter (optional) ──────────────────────────────────
-        _key_adapter = None
-        if use_kan_key_adapter:
-            _key_adapter = KANKeyAdapter(
-                d_key=prop_d_key,
-                d_state=kan_adapter_d_state,
-                num_layers=1,
-            )
-
-        self.memory_bank = MemoryBank(
-            d_model=dim_in,
-            d_model_fine=_dim_fine,
-            d_key=prop_d_key,
-            d_value=prop_d_value,
-            n_objects=num_seg_classes - 1,
-            max_mem_frames=max_mem_frames,
-            use_dual_scale=prop_use_dual_scale,
-            key_adapter=_key_adapter,
-        )
-        self.propagation_attention = PropagationAttention(
-            d_model=dim_in,
-            d_key=prop_d_key,
-            d_value=prop_d_value,
-            n_heads=prop_n_heads,
-            dropout=prop_dropout,
-        )
+        # Note: self.memory_bank is now replaced by dual local/global banks.
+        # Keeping self.memory_bank as a reference to self.memory_bank_local for compat if needed.
+        self.memory_bank = self.memory_bank_local
+        self.feature_fusion = FeatureFusion(d_model=dim_in)
 
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
 
@@ -472,21 +447,18 @@ class VideoMambaSystem(L.LightningModule):
                 denom = m_down.sum(dim=1, keepdim=True) + 1e-6
                 identity_vec = (ref_patch_p * m_down.unsqueeze(-1)).sum(dim=1) / denom # [B, D]
 
-            # Fine-scale reference features for dual-scale memory key.
-            # DINOv2: layer_9 | multi-scale encoders: stage_2
-            ref_patch_fine, ref_patch_fine_hw = self._get_fine_features(
-                _ref_features_raw,
-                t=0,
-            )  # [B, P2, Ch]
-
             # ── 3. Initialise memory bank with reference frame ──────────
-            self.memory_bank.encode_reference(
-                ref_patch_p,
-                ref_mask,
-                ref_patch_fine,
-                feat_hw=ref_patch_hw,
-                feat_hw_fine=ref_patch_fine_hw,
-            )
+            # Seed both SSM states from reference frame
+            ref_fused = self.feature_fusion(ref_patch_p, ref_patch_p)  # self-fusion
+            ref_flat = ref_fused.reshape(B * P, 1, D)
+            
+            _, ref_h_local = self.temporal_model_local(ref_flat, prev_states=None, return_last_state=True)
+            _, ref_h_global = self.temporal_model_global(ref_flat, prev_states=None, return_last_state=True)
+            
+            self.memory_bank_local.reset()
+            self.memory_bank_global.reset()
+            self.memory_bank_local.set_state(ref_h_local)
+            self.memory_bank_global.set_state(ref_h_global)
 
             # Spatial decoder guidance: binary objectness from reference mask
             ref_mask_safe = ref_mask.clone()
@@ -500,33 +472,32 @@ class VideoMambaSystem(L.LightningModule):
             for t in range(T):
                 # Current frame patches: [B, D, P] → [B, P, D]
                 curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, dim_in]
-                # Fine-scale patches for dual-scale memory update.
-                # DINOv2: layer_9 | multi-scale encoders: stage_2
-                curr_patch_fine, curr_patch_fine_hw = self._get_fine_features(
-                    query_features_raw,
-                    t=t,
-                )  # [B, P2, Ch]
+                # ── 4 & 5. Feature fusion and KAN-SSM temporal refinement ─────
+                fused = self.feature_fusion(curr_patch, ref_patch_p)    # [B, P, D]
+                fused_flat = fused.reshape(B * P, 1, D)
 
-                # ── 4. Propagation: cross-attend to memory bank ─────────
-                K_mem, V_mem = self.memory_bank.get_memory()
-                prop_feat = self.propagation_attention(
-                    curr_patch, K_mem, V_mem
-                )  # [B, P, 384]
-
-                # ── 5. KAN-SSM temporal refinement (patch-parallel) ─────
-                # Feed as [B*P, 1, D] — one token per step preserves the
-                # SSM's recurrent hidden-state across the clip.
-                prop_flat = prop_feat.reshape(B * P, 1, -1)  # [B*P, 1, 384]
-                
                 # Broadcast identity_vec if present: [B, D] -> [B*P, D]
                 curr_identity = None
                 if identity_vec is not None:
                     curr_identity = identity_vec.unsqueeze(1).repeat(1, P, 1).reshape(B * P, -1)
 
-                ssm_out_flat, ssm_states = self.temporal_model(
-                    prop_flat, prev_states=ssm_states, return_last_state=True,
+                prev_h_local = self.memory_bank_local.get_state()
+                prev_h_global = self.memory_bank_global.get_state()
+                
+                out_local, next_h_local = self.temporal_model_local(
+                    fused_flat, prev_states=prev_h_local, return_last_state=True,
                     identity=curr_identity
                 )
+                out_global, next_h_global = self.temporal_model_global(
+                    fused_flat, prev_states=prev_h_global, return_last_state=True,
+                    identity=curr_identity
+                )
+                
+                self.memory_bank_local.update_state(next_h_local)
+                self.memory_bank_global.update_state(next_h_global)
+                
+                ssm_out_flat = self.ssm_output_fusion(torch.cat([out_local, out_global], dim=-1))
+
                 # [B*P, 1, D] → [B, 1, D, P] for decoder
                 last_feat = (
                     ssm_out_flat.squeeze(1)   # [B*P, D]
@@ -545,30 +516,7 @@ class VideoMambaSystem(L.LightningModule):
                 )  # [B, 1, num_classes, H, W]
                 all_preds_seg.append(logits_t)
 
-                # ── 7. Update memory bank ───────────────────────────────
-                if t % self.hparams.memory_update_freq == 0:
-                    use_gt = (
-                        self.training
-                        and query_masks is not None
-                        and torch.rand(1).item() > ss_rate
-                    )
-                    if use_gt:
-                        gt_t = query_masks[:, t]
-                        if gt_t.ndim == 4:  # [B, 1, H, W]
-                            gt_t = gt_t.squeeze(1)
-                        mem_mask = gt_t  # [B, H, W]
-                    else:
-                        # Soft predicted mask — detached to prevent graph growth
-                        mem_mask = (
-                            torch.softmax(logits_t, dim=2).squeeze(1).detach()
-                        )  # [B, C, H, W]
-                    self.memory_bank.add_frame(
-                        curr_patch.detach(),
-                        mem_mask,
-                        curr_patch_fine.detach(),
-                        feat_hw=query_patch_hw,
-                        feat_hw_fine=curr_patch_fine_hw,
-                    )
+                # No add_frame needed
 
                 # Update spatial guide: total objectness across all object channels
                 pred_soft = torch.softmax(logits_t, dim=2)  # [B, 1, C, H, W]
@@ -863,21 +811,13 @@ class VideoMambaSystem(L.LightningModule):
     def configure_optimizers(self):
         learning_rate = self.hparams.learning_rate
 
-        # ── Propagation: memory bank + cross-attention ──────────────────
-        # Kept as a separate group so we can tune its LR independently.
-        # NOTE: propagation_lr_multiplier was reduced from 5.0 → 1.0 (v3)
-        # because PropagationAttention.proj_out was the 2nd largest explosion
-        # site (2.98e+05 peak norm, job 65737509) at 5× LR.
-        prop_params = (
-            list(self.memory_bank.parameters())
-            + list(self.propagation_attention.parameters())
-        )
-        prop_ids = {id(p) for p in prop_params}
-
-        # ── Temporal SSM: KangaSSM ────────────────────────────────────
+        # ── Temporal SSM: KangaSSM (Local + Global) ───────────────────
         # Separate from "base" so temporal_lr_multiplier can throttle it.
-        # out_proj.weight was the #3 explosion site (7.7e+04 at epoch 3).
-        temporal_params = list(self.temporal_model.parameters())
+        temporal_params = (
+            list(self.temporal_model_local.parameters()) 
+            + list(self.temporal_model_global.parameters())
+            + list(self.ssm_output_fusion.parameters())
+        )
         temporal_ids = {id(p) for p in temporal_params}
 
         # ── Encoder backbone ─────────────────────────────────────────
@@ -887,8 +827,7 @@ class VideoMambaSystem(L.LightningModule):
         # ── Decoder + everything else ────────────────────────────────
         base_params = [
             p for p in self.parameters()
-            if id(p) not in prop_ids
-            and id(p) not in temporal_ids
+            if id(p) not in temporal_ids
             and id(p) not in backbone_ids
         ]
 
@@ -899,11 +838,6 @@ class VideoMambaSystem(L.LightningModule):
             backbone_lr = learning_rate * self.hparams.frozen_backbone_lr_multiplier
 
         param_groups = [
-            {
-                "params": prop_params,
-                "lr": learning_rate * self.hparams.propagation_lr_multiplier,
-                "name": "propagation",
-            },
             {
                 "params": temporal_params,
                 "lr": learning_rate * self.hparams.temporal_lr_multiplier,
