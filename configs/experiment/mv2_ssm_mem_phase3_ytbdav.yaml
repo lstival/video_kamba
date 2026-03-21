@@ -58,5 +58,7 @@ callbacks:
     patience: 50
     track_layer_names:
       - "feature_fusion"
-      - "temporal_model"
+      - "temporal_model_local"
+      - "temporal_model_global"
       - "feature_extractor"
+      - "ssm_output_fusion"

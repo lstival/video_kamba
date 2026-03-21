@@ -79,7 +79,8 @@ callbacks:
     vanishing_threshold: 1.0e-07
     patience: 50
     track_layer_names:
-      - "feature_fusion"           # replaces propagation_attention.proj_out
-      - "temporal_model"
+      - "feature_fusion"
+      - "temporal_model_local"
+      - "temporal_model_global"
       - "feature_extractor"
-      - "temporal_model.post_scan_norm"
+      - "ssm_output_fusion"

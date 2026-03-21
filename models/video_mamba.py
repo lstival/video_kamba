@@ -189,6 +189,15 @@ class VideoMambaSystem(L.LightningModule):
         self.ssm_output_fusion = nn.Linear(dim_in * 2, dim_in)
         self.memory_bank_local = MemoryStateBank()
         self.memory_bank_global = MemoryStateBank()
+        
+        # AOT-style Gated Temporal Fusion (Double-SSM Integration)
+        self.temporal_gate = nn.Sequential(
+            nn.Linear(dim_in * 2, dim_in),
+            nn.Sigmoid()
+        )
+        
+        # Object ID Embedding for associative identity tracking
+        self.obj_id_embedding = nn.Embedding(num_seg_classes, dim_in)
         self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
         # For multi-scale trainable encoders the decoder skips use
@@ -446,6 +455,10 @@ class VideoMambaSystem(L.LightningModule):
                 # We use sum / (sum + eps) for stabilization
                 denom = m_down.sum(dim=1, keepdim=True) + 1e-6
                 identity_vec = (ref_patch_p * m_down.unsqueeze(-1)).sum(dim=1) / denom # [B, D]
+                
+                # Associative ID mixing: Enhance visual identity with learned object-ID tokens
+                id_tokens = self.obj_id_embedding(torch.arange(B, device=self.device) % self.hparams.num_seg_classes)
+                identity_vec = identity_vec + id_tokens # [B, D]
 
             # ── 3. Initialise memory bank with reference frame ──────────
             # Seed both SSM states from reference frame
@@ -496,11 +509,14 @@ class VideoMambaSystem(L.LightningModule):
                 self.memory_bank_local.update_state(next_h_local)
                 self.memory_bank_global.update_state(next_h_global)
                 
-                ssm_out_flat = self.ssm_output_fusion(torch.cat([out_local, out_global], dim=-1))
+                # Gated Temporal Fusion: Dynamic mix of local (motion) and global (re-id) context
+                ssm_cat = torch.cat([out_local, out_global], dim=-1)
+                ssm_gate = self.temporal_gate(ssm_cat)
+                ssm_fused = (ssm_gate * out_global) + ((1 - ssm_gate) * out_local)
 
                 # [B*P, 1, D] → [B, 1, D, P] for decoder
                 last_feat = (
-                    ssm_out_flat.squeeze(1)   # [B*P, D]
+                    ssm_fused.squeeze(1)      # [B*P, D]
                     .reshape(B, P, D)         # [B, P, D]
                     .permute(0, 2, 1)         # [B, D, P]
                     .unsqueeze(1)             # [B, 1, D, P]
