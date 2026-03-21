@@ -2,9 +2,19 @@
 #
 # Phase 2 — DAVIS Fine-tuning (MobileNetV2 + KAN-SSM Temporal)
 #
-# Initialise from Phase 1 checkpoint (best_mv2_phase1_coco.ckpt).
-# Unfreeze all MobileNetV2 stages (mv2_freeze_at=0) with a very low
-# backbone LR (0.05× base = 1.5e-6) to avoid destroying ImageNet features.
+# Initialise from Phase 1b checkpoint (best_mv2_phase1b_bl30k.ckpt).
+# If Phase 1b was skipped, fall back to best_mv2_phase1_coco.ckpt.
+#
+# Backbone freeze: keep mv2_freeze_at=2 (matching Phase 1).
+# Stages 0 and 1 (stride-4/8, low-level edges/textures) were never exposed to
+# the VOS task — unfreezing them immediately causes gradient explosion across
+# ALL layers on step 1 (observed: norms 1e3–4e4 on first backward pass).
+# Stage 2 (stride-16 semantic features) and the projection are already
+# trainable from Phase 1 and adapt cleanly.  Full unfreeze happens in Phase 3.
+#
+# use_checkpointing: true — carried over from Phase 1 (reduces GPU activation
+# memory ~30%).  Was inadvertently dropped from the Phase 2 config, which
+# contributed to the OOM in job 65763809.
 #
 # Scheduled sampling ramp 0.0 → 0.3 over 100 epochs with 5-epoch warmup:
 #   - Teaches the model to propagate masks robustly when memory is imperfect
@@ -16,11 +26,12 @@
 #   val_J_and_F < 0.55 → diagnose before continuing
 #
 defaults:
-  - override /callbacks: cv_gradient_tracking
+  - override /callbacks: default
 
 model:
   learning_rate: 3.0e-5
-  mv2_freeze_at: 0              # unfreeze all MobileNetV2 stages
+  mv2_freeze_at: 2              # keep stages 0+1 frozen — match Phase 1 to avoid step-1 explosion
+  use_checkpointing: true       # re-add: was in Phase 1, dropped from Phase 2 (contributed to OOM)
   optimizer_weight_decay: 0.05
   lr_warmup_epochs: 3           # 3-epoch LR warmup after domain shift from COCO→DAVIS
   lr_warmup_start_factor: 0.1
@@ -53,7 +64,8 @@ trainer:
   limit_train_batches: 500      # DAVIS is small — 500 steps/epoch ≈ 12 min/epoch
   gradient_clip_val: 0.5
   gradient_clip_algorithm: norm
-  precision: "16-mixed"
+  precision: "bf16-mixed"       # A100 supports bf16 natively; fp16 overflows at grad norms >65504
+                                # (observed proj_out norm 7.88e+04 → Inf in fp16 → OOM cascade)
   accumulate_grad_batches: 2    # effective batch = 4×2 = 8
 
 callbacks:
@@ -64,6 +76,8 @@ callbacks:
     save_top_k: 1
 
   layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms
     log_every_n_steps: 50
     exploding_threshold: 1.0e+03
     vanishing_threshold: 1.0e-07

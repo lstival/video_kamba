@@ -1,0 +1,77 @@
+# @package _global_
+#
+# Phase 1b — BL30K Synthetic VOS Pre-training (MobileNetV2 + KAN-SSM Temporal)
+#
+# Initialise from Phase 1 COCO checkpoint (best_mv2_phase1_coco.ckpt).
+#
+# Purpose:
+#   Bridge the domain gap between COCO kinematic pseudo-videos (simple affine
+#   motion on static images) and real VOS sequences.  BL30K provides synthetic
+#   video clips with rendered objects on complex backgrounds and per-frame
+#   pixel-accurate masks — the same pre-training data used by TrickVOS,
+#   WarpFormer-S, and AOTT, ensuring fair comparison.
+#
+# Frozen stages (mv2_freeze_at=2):  same as Phase 1.
+#   Stages 0+1 remain frozen; stage 2 + projection are trainable.
+#   Full unfreeze is reserved for Phase 3 (YouTube-VOS joint training).
+#
+# Scheduled sampling: 0.0 (GT masks only) — BL30K has clean synthetic masks,
+#   so recursive error is less of a concern, but keeping λ=0 ensures stable
+#   feature learning before introducing self-teaching on real video.
+#
+# Success criterion: val_J_and_F > 0.45 at epoch 15
+#   (synthetic data J&F is lower than real VOS — ~0.50 is a good ceiling)
+#
+# Budget: 30 epochs × 3000 steps × ~12s/step ≈ 30h
+# Output: checkpoints/best_mv2_phase1b_bl30k.ckpt
+#
+
+defaults:
+  - override /callbacks: default
+
+# ── Datamodule overrides ─────────────────────────────────────────────────────
+datamodule:
+  batch_size: 8                 # match Phase 1 (BL30K clips are same length/resolution)
+
+model:
+  learning_rate: 5.0e-5         # lower than Phase 1 — preserve COCO-learned dynamics
+  mv2_freeze_at: 2              # keep stages 0+1 frozen — match Phase 1
+  optimizer_weight_decay: 0.05
+  use_checkpointing: true
+
+  scheduled_sampling_rate: 0.0
+  scheduled_sampling_start: -1.0
+  scheduled_sampling_end: -1.0
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 5.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 5.0e-5
+      pct_start: 0.05           # short warmup — weights already adapted from Phase 1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 30
+  limit_train_batches: 3000     # BL30K is large; cap steps/epoch for budget
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+  accumulate_grad_batches: 1
+
+callbacks:
+  model_checkpoint:
+    monitor: val_J_and_F
+    mode: max
+    filename: "best_mv2_phase1b_bl30k"
+    save_top_k: 1

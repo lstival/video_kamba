@@ -18,13 +18,11 @@ mkdir -p logs/slurm
 
 python - <<'EOF'
 import torch, math
-from omegaconf import DictConfig, ListConfig
-torch.serialization.add_safe_globals([DictConfig, ListConfig])
 from models.video_mamba import VideoMambaSystem
 
 device = torch.device("cuda")
 m = VideoMambaSystem.load_from_checkpoint(
-    "checkpoints/best_mv2_phase1_coco.ckpt", map_location=device
+    "checkpoints/best_mv2_phase1_coco.ckpt", map_location=device, weights_only=False
 )
 m.eval().to(device)
 

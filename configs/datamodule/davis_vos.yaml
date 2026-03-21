@@ -1,0 +1,41 @@
+# DAVIS 2017 datamodule using the production VOSDataModule loader.
+#
+# Replaces the legacy data/davis.py (DAVISDataModule) for Phase 2 fine-tuning.
+# That loader used seq_len=16 (17 frames/sample) which at 480p with 8 workers
+# consumed ≥15 GB in DataLoader shared-memory buffers — causing OOM on 80 GB
+# nodes before the first backward pass.
+#
+# VOSDataModule uses clip_len=4 (5 frames/sample), which proved stable during
+# the joint DAVIS+YouTube-VOS runs.  Setting ytv_root=null gives DAVIS-only
+# training; Phase 3 switches to datamodule=ytv_dav_joint.
+#
+# Memory budget at output_size=480, batch_size=4, num_workers=4:
+#   prefetch workers  : 4 × 2 prefetch × 4 samples × 5 frames × 480×480×3
+#                       ≈ 2.8 GB in shared memory  (vs. ≥15 GB with seq_len=16)
+#   GPU activations   : ~8 GB  (AMP fp16, batch=4, clip=4, stride-16 → 30×30 tokens)
+#   Gradients + state : ~6 GB
+#   Total estimate    : ~17 GB  (safely within 80 GB A100 node RAM + GPU VRAM)
+#
+# Augmentation parameters match the AOT PRE_YTB_DAV training protocol.
+_target_: data.vos_datamodule.VOSDataModule
+
+davis_root: ${work_dir}/data/DAVIS/DAVIS
+ytv_root: null                    # DAVIS-only; set path here for joint training
+
+batch_size: 4
+clip_len: 4                       # 4 query frames + 1 reference = 5 frames/sample
+output_size: 480                  # 480×480 → 30×30 stride-16 tokens (AOT native)
+max_gap: 3
+num_workers: 4
+resolution: 480p
+val_output_size: 480
+
+# Cap validation sequences so the SSM hidden state never drifts beyond its
+# training horizon.  16 = 4× clip_len provides enough propagation signal.
+max_val_frames: 16
+
+# AOT-compatible augmentation
+train_min_scale: 0.7
+train_max_scale: 1.3
+train_flip_prob: 0.5
+train_color_jitter_prob: 0.8

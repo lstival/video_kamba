@@ -36,6 +36,8 @@ def visualize_sequence(model, dataset, clip_idx, save_dir):
     if len(batch) == 6:
         ref_img, ref_mask, query_images, query_masks, _, meta = batch
         seq_name = meta['video_id']
+    elif len(batch) == 5:
+        ref_img, ref_mask, query_images, query_masks, seq_name = batch
     else:
         ref_img, ref_mask, query_images, query_masks = batch
         seq_name = dataset.clips[clip_idx]['seq']
@@ -127,6 +129,7 @@ def main(cfg: DictConfig):
     
     model = VideoMambaSystem.load_from_checkpoint(
         checkpoint_path, 
+        weights_only=False,
         strict=False,
         num_seg_classes=num_seg,
         num_clf_classes=num_clf

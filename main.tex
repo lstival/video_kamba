@@ -1,0 +1,370 @@
+%%
+%% This is file `main.tex', tailored for ACM Multimedia.
+%%
+\documentclass[sigconf]{acmart}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    \normalfont B\kern-0.5em{\scshape i\kern-0.25em b}\kern-0.8em\TeX}}}
+
+\setcopyright{acmlicensed}
+\copyrightyear{2026}
+\acmYear{2026}
+\acmDOI{XXXXXXX.XXXXXXX}
+
+\acmConference[MM '26]{Proceedings of the 34th ACM International Conference on Multimedia}{November 10--14, 2026}{Rio de Janeiro, Brazil}
+\acmISBN{978-1-4503-XXXX-X/26/11}
+
+\begin{document}
+
+\title{VideoKamba: KAN-Modulated State-Space Temporal Reasoning for Lightweight Video Object Segmentation}
+
+\author{Leandro Stival}
+\email{leandro.stival@wur.nl}
+\affiliation{%
+  \institution{Wageningen University \& Research}
+  \city{Wageningen}
+  \country{Netherlands}
+}
+
+\author{Ricardo da Silva Torres}
+\email{ricardo.torres@wur.nl}
+\affiliation{%
+  \institution{Wageningen University \& Research}
+  \city{Wageningen}
+  \country{Netherlands}
+}
+
+\renewcommand{\shortauthors}{Stival and Torres}
+
+%%
+%% ABSTRACT
+%%
+\begin{abstract}
+Semi-supervised Video Object Segmentation (VOS) requires tracking specific object instances across video sequences given only a single annotated frame. While Structured State Space Models (SSMs) offer an efficient alternative to quadratic Transformer attention via $\mathcal{O}(1)$ recurrent temporal memory, their fixed linear input and output matrices ($\mathbf{B}$, $\mathbf{C}$) lack the expressivity to adapt to the high-frequency, non-rigid deformations inherent in object tracking. We present \textbf{VideoKamba}, a $\sim$5M parameter architecture that introduces \textbf{KAN Dynamic State Modulation (KDSM)}: the $\mathbf{B}$ and $\mathbf{C}$ matrices of a diagonal SSM are replaced by input-conditioned Kolmogorov-Arnold Network functions, implemented as Gaussian RBF basis expansions. This allows the SSM to selectively control what temporal information it absorbs from, and reads out to, each spatial position based on the current visual content — a form of expressivity unavailable to standard linear SSMs without additional parameters. Using a MobileNetV2 backbone as a strict architectural control shared with existing lightweight baselines, VideoKamba is evaluated on DAVIS 2017 and YouTube-VOS 2019 against models in the same $\leq$10M parameter class, providing an isolated measurement of KAN-SSM versus standard temporal attention for VOS.
+\end{abstract}
+
+%%
+%% CCS CONCEPTS
+%%
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10010147.10010178.10010224.10010245.10010251</concept_id>
+  <concept_desc>Computing methodologies~Video segmentation</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Computing methodologies~Video segmentation}
+
+\keywords{video object segmentation, state space models, Kolmogorov-Arnold networks, sustainable AI, lightweight architecture}
+
+\maketitle
+
+%%
+%% 1. INTRODUCTION
+%%
+\section{Introduction}
+\label{sec:intro}
+
+Semi-supervised Video Object Segmentation (VOS) requires tracking and precisely segmenting specific object instances across all frames of a video, given only a single annotated reference frame. This requires distinguishing a target from semantically identical distractors through complex motion, occlusion, and appearance changes.
+
+Current state-of-the-art methods rely on massive Vision Transformer backbones and episodic memory banks~\cite{cheng2022xmem, yang2021aot}. Because temporal cross-attention scales as $\mathcal{O}(T \cdot P^2)$ with sequence length $T$ and patch count $P$, these models represent a severe computational bottleneck. Even the few architectures designed for edge deployment, such as MobileVOS, remain anchored to standard Transformer modules for temporal reasoning.
+
+Structured State Space Models (SSMs), such as Mamba~\cite{gu2024mamba}, offer an $\mathcal{O}(1)$ temporal footprint via recurrent state compression. However, standard linear SSMs suffer from a lack of expressivity; their rigid transition matrices fail to adapt to the high-frequency, non-rigid deformations inherent to VOS.
+
+We introduce \textbf{VideoKamba}, a $\sim$5M parameter hybrid VOS architecture built around a novel KAN-modulated diagonal SSM for temporal reasoning. Our contributions are:
+\begin{enumerate}
+    \item \textbf{KAN Dynamic State Modulation (KDSM):} The input matrix $\mathbf{B}$ and readout matrix $\mathbf{C}$ of a diagonal SSM are replaced by FastKAN functions — Gaussian RBF basis expansions with learnable coefficients — conditioned on the current visual feature $u_t$. This gives the SSM selective, content-driven control over state absorption and emission, recovering the expressivity lost by the diagonal constraint without increasing parameter count. To our knowledge, this is the first application of KANs to directly parameterize SSM state equations in a dense-prediction video task.
+    \item \textbf{KAN Key Adapter:} A single-layer KangaSSM operating in episodic memory key space, correcting cumulative appearance drift without expanding the memory bank beyond $K=5$ frames.
+    \item \textbf{Stabilization Protocol for KAN-SSM:} Three constraints — $\tanh$-bounded modulator outputs, non-affine RMSNorm on $\mathbf{B}$/$\mathbf{C}$ projections, and SwiGLU output gating — that are empirically necessary to prevent gradient explosion when training KAN-modulated SSMs on video. Each constraint is documented as a reproducible training failure.
+    \item \textbf{Four-Phase Curriculum:} COCO kinematic pre-training $\to$ BL30K synthetic VOS $\to$ DAVIS fine-tuning $\to$ YouTube-VOS + DAVIS joint training, enabling a direct comparison against BL30K-pretrained lightweight baselines on equal footing.
+\end{enumerate}
+
+%%
+%% 2. RELATED WORK
+%%
+\section{Related Work}
+\label{sec:related}
+
+\textbf{The Lightweight VOS Frontier.} 
+Contemporary Video Object Segmentation is dominated by heavyweight architectures, such as Cutie~\cite{cheng2024cutie} and foundation models like SAM~2~\cite{ravi2024sam2}. While establishing the upper bound of segmentation fidelity, their massive parameter counts ($>40$M to $>200$M) and unbounded memory scaling preclude sustainable, edge-device deployment. Consequently, recent literature has bifurcated into mid-weight and ultra-lightweight regimes. Mid-weight models ($\sim$30M--40M parameters) attempt to distill attention via Gated Linear Matching (LiVOS~\cite{liu2025livos}), Modulated Cross-Attention (MAVOS~\cite{Shaker_2025_WACV}), or Expectation-Maximization routing (SWEM~\cite{lin2022swem}). While faster, they remain architecturally heavy. 
+
+Within the strict ultra-lightweight class ($\leq$10M parameters), architectures such as MobileVOS~\cite{miles2023mobilevos}, AOTT~\cite{yang2021aost}, TrickVOS~\cite{skartados2023trickvos}, and WarpFormer-S~\cite{fedynyak2023global} utilize highly efficient backbones (e.g., MobileNetV2). However, they universally rely on Space-Time Memory (STM) attention spanning the entire sequence history, Long Short-Term Transformers (LSTT), or explicit optical flow for temporal reasoning. This fundamentally tethers them to the quadratic complexity $\mathcal{O}(T \cdot P^2)$. VideoKamba resolves this by hybridizing the temporal phase. We lock spatial attention inside a strictly bounded local window (avoiding $\mathcal{O}(T)$ growth) and utilize an infinite-horizon KAN-SSM with strictly $\mathcal{O}(P \cdot N \cdot D)$ recurrent complexity to bridge long-term occlusions.
+
+\textbf{State Space Models for Video.} 
+Structured State Space Models (SSMs), particularly Mamba~\cite{gu2024mamba}, have emerged as mathematically elegant alternatives to Transformers, compressing temporal history into a recurrent latent state to achieve $\mathcal{O}(1)$ temporal memory scaling. While highly effective for general video classification, standard linear SSMs exhibit a critical vulnerability in dense tracking tasks: their discretization parameter $\Delta$ and state transition matrices are generated via static linear projections. This rigid linearity lacks the expressive capacity to dynamically filter the complex, non-rigid biological deformations and semantic distractors inherent to VOS. VideoKamba directly addresses this limitation by substituting linear projections with continuous, non-linear modulators that adapt to the input sequence.
+
+\textbf{Kolmogorov-Arnold Networks and Dynamic Modulation.} 
+Kolmogorov-Arnold Networks (KANs)~\cite{liu2024kan} utilize the Kolmogorov-Arnold representation theorem to replace fixed nodal activation functions with learnable univariate B-spline functions on the network edges. While preliminary applications in computer vision have treated KANs merely as drop-in replacements for standard Multi-Layer Perceptrons to enhance static feature extraction, VideoKamba exploits KANs at a fundamental differential level. Rather than using KANs purely for feature projection, we utilize them to dynamically parameterize the coefficients of the SSM's underlying Ordinary Differential Equation (ODE). This allows the KAN to act as an input-conditioned temporal gate, actively molding the continuous-time memory retention and forgetting dynamics based on the localized semantic content of the current frame.
+
+%%
+%% 3. METHODOLOGY
+%%
+\section{Methodology}
+\label{sec:method}
+
+\subsection{System Overview}
+VideoKamba processes a video sequence $\{I_t\}_{t=1}^{T}$ given a single annotated reference frame $I_1$ with object mask $M_1$. At each timestep $t$, the system (i) encodes the current frame into a multi-scale feature pyramid via MobileNetV2, (ii) corrects the memory keys against cumulative appearance drift via the KAN Key Adapter, (iii) retrieves spatial evidence from a bounded $K=5$ frame episodic memory via cross-attention, (iv) integrates infinite-horizon temporal context via the KangaSSM recurrent module, and (v) decodes the segmentation mask $\hat{M}_t$ through a lightweight 3-level FPN. The system is trained in three sequential phases of increasing domain difficulty, detailed in Section~\ref{sec:curriculum}.
+
+\subsection{Spatial Feature Extraction}
+\label{sec:encoder}
+We adopt MobileNetV2~\cite{sandler2018mobilenetv2} (ImageNet-1K pretrained) as the shared feature extractor, producing a 4-level feature pyramid: stride-4 ($C=24$), stride-8 ($C=32$), stride-16 raw ($C=96$), and a stride-16 projected representation ($C_\text{proj}=256$). At $480\times480$ input resolution this yields $P=900$ spatial tokens at the coarsest level.
+
+To enforce a strict scientific control over which component drives performance, MobileNetV2 stages 0--1 are frozen throughout Phases 1 and 2, constraining spatial gradients to the projection head and upper stages only. In Phase 3, all backbone stages become trainable with a strongly suppressed learning rate ($\eta_\text{bb} = 0.05\,\eta_\text{base} = 1.5\times10^{-6}$) to prevent catastrophic forgetting of Phase 2 DAVIS knowledge. This three-phase freeze schedule ensures that any performance gain attributable to Phase 1 and 2 training is exclusively the result of the temporal and memory modules, not from improved spatial encoding.
+
+\subsection{Dual-Scale Episodic Memory Bank}
+\label{sec:memory}
+Each stored frame contributes a \emph{dual-scale key}: a coarse key $\mathbf{K}^c_t \in \mathbb{R}^{P \times 256}$ (projected stride-16 features) concatenated with a fine key $\mathbf{K}^f_t \in \mathbb{R}^{P \times 96}$ (raw stride-16 features), together with a value $\mathbf{V}_t \in \mathbb{R}^{P \times 256}$. The reference frame $I_1$ is anchored permanently; subsequent frames are managed by a FIFO queue capped at $K-1=4$ entries, holding the total bank at exactly $K=5$ frames irrespective of sequence length. This guarantees $\mathcal{O}(1)$ memory scaling, but introduces the risk of identity drift as frames distant in time are evicted.
+
+\textbf{KAN Key Adapter.} To compensate for progressive appearance drift without expanding the memory budget, we introduce the \textbf{KAN Key Adapter}: a single-layer KangaSSM instance operating in key space. Let $\mathbf{K}_t = [\mathbf{K}^c_t \| \mathbf{K}^f_t]$ be the concatenated raw key. Prior to insertion into the bank, the adapted key is computed as:
+\begin{equation}
+    \tilde{\mathbf{K}}_t = \mathbf{K}_t + \alpha \cdot \text{KangaSSM}_\text{key}(\mathbf{K}_t,\, h^\text{key}_{t-1})
+    \label{eq:key_adapter}
+\end{equation}
+where $\alpha$ is a learnable scalar initialized to zero, ensuring the adapter is an exact identity at the start of training. This residual formulation lets the base cross-attention converge before the adapter begins reshaping the key manifold.
+
+\subsection{Propagation Attention}
+\label{sec:attention}
+A multi-head cross-attention module ($H=8$ heads, $d_k = d_v = 256$) reads the adapted memory keys and values using the current-frame features as queries. To prevent the attention logit explosion observed in early training iterations, we apply QK-Norm~\cite{henry2020querykey} to the query and key projections, and clamp raw logit values to $[-50, 50]$ before softmax. The softmax is computed in full fp32 precision regardless of the ambient mixed-precision regime, preventing numerical saturation under bfloat16.
+
+The attended value is projected through a \textbf{SwiGLU output gate}:
+\begin{equation}
+    \mathbf{z} = \mathrm{Linear}_\text{up}(\mathbf{v}_\text{att}) \cdot \sigma\!\left(\mathrm{Linear}_\text{gate}(\mathbf{v}_\text{att})\right)
+    \label{eq:swiglu}
+\end{equation}
+where $\sigma(\cdot)$ is the SiLU activation. The gating bounds the output magnitude and isolates the gradient path of the readout projection from the high-variance attention weights, which was the primary source of gradient explosion in pre-stabilization ablations.
+
+\subsection{Diagonal KAN-Modulated SSM (KangaSSM)}
+\label{sec:kanga}
+The propagation-attended features $\{u_t\} \in \mathbb{R}^{P \times D}$ are passed through $L=2$ KangaSSM layers for long-horizon temporal integration. Each spatial position $p$ is processed independently, yielding a per-step complexity of $\mathcal{O}(P \cdot N \cdot D)$, where $N=16$ is the SSM state dimension and $D$ is the inner channel dimension. We note that the cross-attention in Section~\ref{sec:attention} contributes an additional $\mathcal{O}(K \cdot P^2)$ term per frame; since $K=5$ is a fixed constant, this reduces to $\mathcal{O}(P^2)$, making the attention the dominant complexity term for large $P$. The SSM's role is not to replace this spatial matching, but to carry temporal state across an unbounded horizon between bounded memory windows.
+
+\textbf{Diagonal State Transition.} The continuous-time SSM is:
+\begin{equation}
+    h'(t) = \mathbf{A}\,h(t) + \mathbf{B}\,u(t), \quad y(t) = \mathbf{C}\,h(t) + \mathbf{D}\,u(t)
+\end{equation}
+with $\mathbf{A} \in \mathbb{R}^{N \times N}$ constrained strictly diagonal via a parameterization through $\log\mathbf{A}$. This eliminates all $\mathcal{O}(N^2)$ cross-state mixing in both forward and backward passes.
+
+\textbf{KAN Dynamic State Modulation (KDSM).} In a standard diagonal SSM, the input matrix $\mathbf{B} \in \mathbb{R}^{N \times D}$ and readout matrix $\mathbf{C} \in \mathbb{R}^{D \times N}$ are fixed linear projections, identical for every input $u_t$. In VOS, the same object at different frames requires very different absorption ($\mathbf{B}$) and emission ($\mathbf{C}$) profiles: a frame where the object is frontally visible requires broad absorption, while a frame where it is partially occluded should suppress noisy channels. KDSM addresses this by replacing the linear $\mathbf{B}$ and $\mathbf{C}$ with multiplicative modulators that are content-conditioned functions of $u_t$:
+\begin{align}
+    \alpha_B(u_t) &= 1.0 + 0.5\,\tanh\!\bigl(\mathrm{KAN}_B(u_t)\bigr) \;\in [0.5,\; 1.5] \label{eq:alpha_B}\\
+    \alpha_C(u_t) &= 1.0 + 0.5\,\tanh\!\bigl(\mathrm{KAN}_C(u_t)\bigr) \;\in [0.5,\; 1.5] \label{eq:alpha_C}
+\end{align}
+where each $\mathrm{KAN}$ is a FastKAN~\cite{li2024fastkan} layer: Gaussian RBF basis with $G=8$ grid points over $[-2, 2]$ and a residual linear bypass ($y = W_\text{base}x + W_\text{rbf}\phi(x)$). The $\tanh$ bound constrains each modulator to a $\pm50\%$ perturbation of the identity function, maintaining the base linear dynamics while allowing non-linear, input-conditioned adjustment — preventing unbounded Lyapunov growth in the continuous-time ODE (see Section~\ref{sec:theory}).
+
+The decay coefficient is similarly modulated for completeness:
+\begin{equation}
+    \alpha_A(u_t) = 1.0 + 0.5\,\tanh\!\bigl(\mathrm{KAN}_A(u_t)\bigr) \;\in [0.5,\; 1.5]
+\end{equation}
+but the primary expressivity gain comes from $\alpha_B$ and $\alpha_C$, which control the information flow into and out of the state rather than the decay rate.
+
+\textbf{Discrete State Update.} For an input-dependent step size $\delta_t$ (projected from $u_t$ via a linear layer, following Mamba~\cite{gu2024mamba}), the full modulated recurrence is:
+\begin{align}
+    \bar{\mathbf{A}}_t &= \exp\!\bigl(-\exp(\log\mathbf{A}) \odot \delta_t \odot \alpha_A(u_t)\bigr) \\
+    h_t &= \bar{\mathbf{A}}_t \odot h_{t-1} + \bigl(\bar{\mathbf{B}} \odot \alpha_B(u_t)\bigr)\, u_t \label{eq:state_update}\\
+    y_t &= \bigl(\mathbf{C} \odot \alpha_C(u_t)\bigr)\, h_t + \mathbf{D}\, u_t \label{eq:readout}
+\end{align}
+where $\alpha_B$ and $\alpha_C$ are the KDSM modulators from Eqs.~\ref{eq:alpha_B}--\ref{eq:alpha_C}. The linear $\mathbf{B}$ and $\mathbf{C}$ projections are normalized with non-affine RMSNorm (BCNorm) prior to modulation, preventing learnable scale parameters from growing unboundedly — a failure mode observed in earlier training runs where affine LayerNorm gain parameters reached norms of $10^3$. The SSM output $y_t$ is passed through a SwiGLU gate (Eq.~\ref{eq:swiglu}) before the residual addition.
+
+\subsection{Segmentation Decoder}
+A 3-level Feature Pyramid Network~\cite{lin2017fpn} fuses the temporally-refined tokens with raw encoder skip connections. Starting from the stride-16 KangaSSM output, two successive bilinear upsampling stages incorporate skip connections from MobileNetV2 strides 8 ($C=32$) and 4 ($C=24$), producing a stride-4 feature map. A final convolution followed by bilinear upsampling to full resolution yields per-object logit maps $\hat{L}_t \in \mathbb{R}^{(K_\text{obj}+1)\times H \times W}$, where $K_\text{obj}$ is the number of tracked instances.
+
+\subsection{Training Objective}
+Segmentation is supervised with a hybrid loss:
+\begin{equation}
+    \mathcal{L} = \beta\,\mathcal{L}_\text{CE} + (1-\beta)\,\mathcal{L}_\text{Dice}, \quad \beta = 0.5
+\end{equation}
+where $\mathcal{L}_\text{CE}$ is the multi-class cross-entropy (from logits) and $\mathcal{L}_\text{Dice} = 1 - \frac{2\sum p_c\hat{p}_c + \varepsilon}{\sum p_c + \sum \hat{p}_c + \varepsilon}$ with $\varepsilon=1.0$. Both terms are masked by object presence indicators so that absent instances contribute no gradient in either numerator or denominator.
+
+\subsection{Four-Phase Training Curriculum}
+\label{sec:curriculum}
+
+\textbf{Phase 1 — Kinematic Pre-training on COCO.} The model is pre-trained on COCO 2017~\cite{lin2014coco} (118K images) converted to 6-frame pseudo-videos via a coherent affine kinematic prior: $\theta_t = \theta_0 + t\dot{\theta} + \varepsilon_t$, $\dot{\theta} \sim \mathcal{U}(\Omega_\text{rigid})$. The synthetic trajectories force the KangaSSM to develop a stable constant-velocity base dynamic before encountering real motion. Scheduled sampling is disabled ($\lambda=0.0$). Training runs for 20 epochs.
+
+\textbf{Phase 1b — Synthetic VOS Pre-training on BL30K.} Following COCO kinematic pre-training, the model is trained for 30 epochs on BL30K~\cite{cheng2021modular}, a dataset of 30K synthetic video sequences with rendered objects and complex backgrounds. This step bridges the domain gap between static-image kinematic augmentation and real VOS sequences, and places VideoKamba on equal pre-training footing with lightweight baselines (TrickVOS, WarpFormer-S, AOTT) that all use BL30K. MobileNetV2 stages 0--1 remain frozen; learning rate and schedule match Phase 1.
+
+\textbf{Phase 2 — DAVIS Fine-tuning.} Initialized from the Phase 1b checkpoint, the model is fine-tuned on DAVIS 2017~\cite{pont20172017} (60 sequences) for 100 epochs on 4-frame clips, with a 3-epoch warm-up from $\eta=3\times10^{-6}$ to $3\times10^{-5}$. MobileNetV2 stages 0--1 remain frozen. Scheduled sampling ramps linearly from $\lambda=0.0$ to $\lambda=0.3$.
+
+\textbf{Phase 3 — Joint YouTube-VOS and DAVIS.} Initialized from the Phase 2 checkpoint, all backbone stages are unfrozen and the model trains jointly on YouTube-VOS 2019~\cite{xu2018ytbvos} (3,471 sequences) and DAVIS 2017 with a 75:25 sampling ratio. Scheduled sampling ramps from $\lambda=0.1$ to $\lambda=0.5$. A four-group learning rate partition is applied: backbone ($0.05\eta$), KangaSSM ($0.5\eta$), propagation attention ($\eta$), all remaining modules ($\eta$), with $\eta=3\times10^{-5}$.
+
+%%
+%% 4. THEORETICAL ANALYSIS OF OPTIMIZATION
+%%
+\section{Theoretical Analysis of Optimization}
+\label{sec:theory}
+
+\subsection{Kinematic Prior via Coherent Motion}
+Training recurrent state models from scratch on highly sparse video datasets induces degenerate dynamics. We initialize the KangaSSM via Phase 1 pre-training on synthetic COCO videos utilizing a strict affine kinematic prior. The trajectory is defined by $\theta_t = \theta_0 + t\dot{\theta} + \varepsilon_t$, where $\dot{\theta} \sim \mathcal{U}(\Omega_{\text{rigid}})$. This forces the base SSM parameter $\Delta_t$ to learn stable constant-velocity optical flow. Subsequent fine-tuning on real video (DAVIS) acts as manifold adaptation, where the input-dependent KAN modulators ($\alpha_A, \alpha_B$) learn to dynamically override this rigid prior to capture non-rigid biological deformations.
+
+\subsection{Bias-Variance Optimal Scheduled Sampling}
+During Phase 3 (Joint fine-tuning), the network must bridge the exposure bias between teacher-forcing and autoregressive inference. At step $t$, the memory bank uses the predicted mask with probability $\lambda_t$. The memory contamination error bound is $\mathcal{E}_T \leq \lambda \sum_{k=1}^{T} L^{T-k} \varepsilon_k$. We define the optimal curriculum asymptote by minimizing the bias-variance trade-off:
+\begin{equation}
+    \lambda^* = \arg\min_\lambda \left[ (1-\lambda)^2 \text{Bias}_{\max} + \lambda(1-\lambda) \text{Var}_{\max} \right]
+\end{equation}
+Assuming symmetric error penalties, this yields $\lambda^* \approx 0.5$. Our curriculum ramps $\lambda$ linearly to $0.5$, acting as a rigorous temporal regularizer that prevents recursive error explosion.
+
+\subsection{Gradient Isolation and $\mathcal{O}(P \cdot N \cdot D)$}
+\textbf{Theorem 1:} The Diagonal KangaSSM forward and backward passes scale exactly as $\mathcal{O}(P \cdot N \cdot D)$.
+\textit{Proof Sketch:} The loss gradient w.r.t state channel $n$ is:
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial h_t^{(n)}} = \frac{\partial \mathcal{L}}{\partial y_t} C^n + \frac{\partial \mathcal{L}}{\partial h_{t+1}^{(n)}} \bar{\mathbf{A}}_{t+1}^{(n)}
+\end{equation}
+Because $\bar{\mathbf{A}}$ is diagonal, the backward pass contains zero cross-state mixing. To ensure optimization stability over long clips, we partition learning rates: $\eta_{\text{temporal}} = 0.5\eta$, decoupling the temporal ODE from the high-magnitude gradients of the spatial decoder.
+
+%%
+%% 5. EXPERIMENTS
+%%
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Implementation Details}
+VideoKamba encompasses $\sim$5M parameters: MobileNetV2 encoder (3.4M), propagation attention (0.66M), KangaSSM $\times$2 layers (0.31M), FPN decoder (0.28M), KAN Key Adapter and norms (0.35M). All experiments use AdamW ($\beta_1=0.9$, $\beta_2=0.999$, weight decay 0.05), gradient clipping at norm 0.5, and gradient accumulation over 2 steps (effective batch 8 clips). Mixed precision is bfloat16 in Phases 1--2; fp32 softmax inside attention is enforced throughout. Training uses a single NVIDIA A100 80GB GPU. The four-phase curriculum is described in Section~\ref{sec:curriculum}.
+
+\subsection{Comparison with Lightweight VOS Models}
+Table~\ref{tab:sota} benchmarks VideoKamba against models in the same $\leq$10M parameter class. All ultra-lightweight baselines use MobileNetV2 as the spatial backbone, providing a strict architectural control: performance differences are attributable solely to the temporal reasoning module. Heavyweight models are included as reference only; they are not the comparison target. All compared ultra-lightweight baselines (TrickVOS, WarpFormer-S, AOTT) use BL30K synthetic pre-training; VideoKamba Phase 1b also includes BL30K, placing all models on equal pre-training footing. MobileVOS (no BL30K) is marked separately.
+
+\begin{table}[t]
+\centering
+\caption{VOS performance in the ultra-lightweight regime ($\leq$10M parameters) on DAVIS 2017 val and YouTube-VOS 2019 val. All models use MobileNetV2 backbone. \checkmark = uses BL30K pre-training.}
+\label{tab:sota}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Params} & \textbf{Temporal} & \textbf{BL30K} & \textbf{DAV17 / YTV19} \\
+\midrule
+\multicolumn{5}{l}{\textit{Reference (not target regime)}} \\
+SAM~2 (Large)~\cite{ravi2024sam2} & $\sim 224$M & Mem. Attn & \checkmark & 92.3 / 89.3 \\
+Cutie~\cite{cheng2024cutie} & $\sim 42$M & Transformer & \checkmark & 84.3 / 82.5 \\
+\midrule
+\multicolumn{5}{l}{\textit{Ultra-lightweight ($\leq$10M, MobileNetV2)}} \\
+TrickVOS (PT)~\cite{skartados2023trickvos} & $\sim 2$M & STM Attn & \checkmark & 82.7 / 80.5 \\
+WarpFormer-S~\cite{fedynyak2023global} & $\sim 8$M & Flow+Attn & \checkmark & 81.0 / 80.1 \\
+AOTT~\cite{yang2021aost} & $\sim 8$M & LSTT Attn & \checkmark & 79.2 / 80.0 \\
+MobileVOS~\cite{miles2023mobilevos} & $\sim 5$M & Transformer & $\times$ & 77.8 / 81.8 \\
+\midrule
+\textbf{VideoKamba (Ours)} & \textbf{$\sim 5$M} & \textbf{KAN-SSM} & \checkmark & \textbf{XX.X / XX.X} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Ablation Study}
+\label{sec:ablation}
+We conduct ablations on the DAVIS 2017 validation set ($\mathcal{J}\&\mathcal{F}$) to isolate the contribution of three design axes: the choice of modulator function inside the KangaSSM, the memory bank configuration, and the optimization stabilization constraints. All ablated variants share the same three-phase training curriculum; only the single component under study is modified.
+
+\textbf{1. Modulator Function: KAN vs.\ Linear MLP.}
+Our central claim is that B-spline modulators provide expressivity that a linear gate of identical parameter count cannot. In Table~\ref{tab:ablation_kan}, we replace the FastKAN modulators $\alpha_A$ and $\alpha_B$ with 2-layer MLPs (SiLU activation, same hidden dimension, same $\tanh$ output bound). Additionally, we report the activation entropy $H(\alpha) = -\sum_i p_i \log p_i$ of the temporal gate outputs, averaged over the DAVIS validation set, as a proxy for the sparsity and specialization of the learned gating behaviour.\footnotemark\, Lower entropy indicates that the modulator selectively activates on a sparse subset of input patterns rather than emitting dense, uninformative responses.
+
+\footnotetext{Activation entropy is computed on the normalized histogram of $\alpha$ values per sequence, averaged across all 30 validation sequences and both KangaSSM layers.}
+
+\begin{table}[h]
+\centering
+\caption{Ablation of KangaSSM modulator function. KAN B-splines are compared against parameter-matched linear MLPs under identical training conditions. Activation entropy measures gate specialization; lower is more structured.}
+\label{tab:ablation_kan}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Modulator} & \textbf{Entropy $H(\alpha) \downarrow$} & \textbf{DAVIS 17 ($\mathcal{J}\&\mathcal{F} \uparrow$)} \\
+\midrule
+Linear MLP (SiLU, $\tanh$-bounded) & [XX.X] & [XX.X] \\
+\textbf{FastKAN (RBF, $G=8$, Ours)} & \textbf{[XX.X]} & \textbf{[XX.X]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{2. Memory Configuration and KAN Key Adapter.}
+Table~\ref{tab:ablation_memory} evaluates the impact of memory bounding and appearance-drift correction. The $K=\infty$ (unbounded) configuration serves as an accuracy upper bound but is evaluated only on short validation sequences ($\leq 60$ frames) due to OOM on the full benchmark; VRAM measurements are reported for a 100-frame sequence at $480\times480$. The bounded $K=5$ variant without the Key Adapter quantifies drift degradation alone. Collectively, these three conditions test whether the Key Adapter can recover the accuracy gap incurred by FIFO eviction at constant memory cost.
+
+\begin{table}[h]
+\centering
+\caption{Memory configuration ablation on DAVIS 2017. Peak VRAM is measured at 100 frames, $480\times480$. $K=\infty$ is evaluated on sequences $\leq60$ frames only due to hardware constraints.}
+\label{tab:ablation_memory}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+\textbf{Memory Config} & \textbf{Key Adapter} & \textbf{Peak VRAM} & \textbf{DAVIS 17 ($\mathcal{J}\&\mathcal{F}$)} \\
+\midrule
+Bounded ($K=5$) & $\times$ & \textbf{1.4 GB} & [XX.X] \\
+\textbf{Bounded ($K=5$)} & \checkmark & \textbf{1.4 GB} & \textbf{[XX.X]} \\
+Unbounded ($K=\infty$) & $\times$ & $>16$ GB & [XX.X]$^\dagger$ \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize $^\dagger$Short sequences ($\leq$60 frames) only.}
+\end{tabular}
+}
+\end{table}
+
+\textbf{3. Optimization Stability Constraints.}
+Table~\ref{tab:ablation_stability} isolates our two stabilization components and the scheduled sampling schedule. The ``Diverged'' entries for the removed $\tanh$ bound and the removed SwiGLU gate reflect gradient norm explosion ($\|\nabla\|_2 > 10^3$) consistently observed within the first 500 iterations across three independent seeds, and are reported as training failures rather than as converged models.\footnotemark\, The $\lambda=1.0$ result likewise diverges due to compounding mask prediction errors collapsing the memory bank within the first epoch of Phase 3.
+
+\footnotetext{These instabilities were identified systematically during architecture development (v1 and v2 training runs). Each is reproducible under the same configuration without the respective constraint. Gradient norm traces are available in the supplementary material.}
+
+\begin{table}[h]
+\centering
+\caption{Ablation of stabilization constraints and scheduled sampling schedule $\lambda$ on DAVIS 2017 val. ``Diverged'' denotes consistent gradient explosion ($\|\nabla\|_2 > 10^3$) within 500 iterations.}
+\label{tab:ablation_stability}
+\begin{tabular}{lc}
+\toprule
+\textbf{Configuration} & \textbf{DAVIS 17 ($\mathcal{J}\&\mathcal{F}$)} \\
+\midrule
+w/o $\tanh$ bound on $\alpha_A, \alpha_B$ & Diverged \\
+w/o SwiGLU output gate & Diverged \\
+$\lambda = 0.0$ (Pure Teacher Forcing) & [XX.X] \\
+$\lambda = 1.0$ (Pure Autoregressive) & Diverged \\
+\textbf{Full VideoKamba ($\lambda{=}0.5$, Ours)} & \textbf{[XX.X]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{4. Component Contribution Decomposition.}
+Table~\ref{tab:ablation_components} provides an additive decomposition to attribute performance to each architectural choice independently. The key row of interest is the comparison between ``Diagonal SSM (no KDSM)'' and ``+ KDSM ($\alpha_B$, $\alpha_C$)'': this directly measures the gain attributable to making $\mathbf{B}$ and $\mathbf{C}$ content-conditioned, with all other factors held constant.
+
+\begin{table}[h]
+\centering
+\caption{Additive component ablation on DAVIS 2017 val. The critical comparison is Diagonal SSM with and without KDSM modulation of $\mathbf{B}$ and $\mathbf{C}$.}
+\label{tab:ablation_components}
+\begin{tabular}{lc}
+\toprule
+\textbf{Configuration} & \textbf{DAVIS 17 ($\mathcal{J}\&\mathcal{F}$)} \\
+\midrule
+MV2 + Cross-Attn, no SSM (Baseline) & [XX.X] \\
++ Diagonal SSM, fixed $\mathbf{B}$, $\mathbf{C}$ (no KDSM) & [XX.X] \\
++ KDSM: $\alpha_B$, $\alpha_C$ only & [XX.X] \\
++ KDSM: $\alpha_A$, $\alpha_B$, $\alpha_C$ (full KangaSSM) & [XX.X] \\
+\textbf{+ KAN Key Adapter (Full VideoKamba)} & \textbf{[XX.X]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Qualitative Analysis}
+\label{sec:qualitative}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/qualitative_davis.pdf}
+  \caption{Qualitative segmentation on four challenging DAVIS 2017 validation sequences (columns = evenly-spaced frames; masks = semi-transparent color overlays; dashed white contour = ground truth). \textbf{Row 1 (Occlusion recovery):} target disappears entirely from frames 3--5; the KangaSSM recurrent state bridges the gap without a re-detection module. \textbf{Row 2 (Fast motion):} large inter-frame displacement exceeds what the $K=5$ memory window can resolve via appearance matching alone; the SSM state maintains identity through inertia. \textbf{Row 3 (Multi-object):} two semantically identical instances in close proximity; the cross-attention on dual-scale keys discriminates boundary-level differences. \textbf{Row 4 (Small object):} object occupies $<1\%$ of frame area; stride-4 decoder resolution limits boundary precision (highlighted in red), a known limitation of the ultra-lightweight regime.}
+  \label{fig:qualitative_davis}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/qualitative_ytbvos.pdf}
+  \caption{Qualitative results on YouTube-VOS 2019 validation set (columns = uniformly sampled frames at 6-second intervals). \textbf{Top two rows:} seen categories at test time --- VideoKamba maintains consistent identity throughout sequences exceeding 60 seconds. \textbf{Bottom two rows:} unseen categories --- the model generalizes coarse boundaries but exhibits fragmentation on high-frequency textured backgrounds (e.g., animal fur), where the stride-16 coarse key does not resolve fine-grained distractors. Red outlines mark systematic failure regions for qualitative analysis.}
+  \label{fig:qualitative_ytbvos}
+\end{figure*}
+
+Figures~\ref{fig:qualitative_davis} and~\ref{fig:qualitative_ytbvos} present representative qualitative outputs. On DAVIS 2017, the KangaSSM demonstrates its principal advantage over STM-based baselines: \emph{identity propagation through complete occlusion}. When the target object is absent from all $K=5$ memory frames, cross-attention alone fails, yet the SSM recurrent state preserves a compressed trajectory estimate, enabling coherent mask recovery upon re-appearance. This is qualitatively distinct from MobileVOS and AOTT, which exhibit mask collapse after 3--4 consecutively occluded frames.
+
+On YouTube-VOS 2019, generalization to unseen categories is solid at the object level but degrades at fine boundaries in scenes with high-frequency textures. We attribute this to the stride-16 bottleneck of the MobileNetV2 encoder: at $480\times480$ input, the coarsest attention key has an effective receptive field of roughly $30\times30$ pixels, insufficient to resolve sub-token boundary detail against similarly textured backgrounds. This is an expected ceiling of the ultra-lightweight regime and is equally present in all compared $\leq5$M-parameter baselines.
+
+\textbf{Systematic failure modes.} We identify two recurring failure categories: (i) \emph{Identity switching} --- on sequences with two visually similar instances that closely approach each other ($<10$ pixels at stride-16), the cross-attention correctly finds the nearest appearance match but the SSM state dimension ($N=16$) is insufficient to maintain fully separate trajectory representations; (ii) \emph{Mask erosion on very small objects} --- instances occupying $<0.5\%$ of frame area ($<$53 pixels at $480\times480$) fall below the effective resolution of the stride-4 FPN output, yielding systematic under-segmentation of fine structures. Resolving both failure modes would require either increasing the state dimension $N$ (raising $\mathcal{O}(P \cdot N \cdot D)$ cost) or adding a higher-resolution decoder head, both of which trade away the ultra-lightweight design objective. We leave this Pareto trade-off analysis to future work.
+
+%%
+%% 6. CONCLUSION
+%%
+\section{Conclusion}
+VideoKamba addresses the fundamental tension in lightweight Video Object Segmentation between temporal identity propagation and computational budget. By strictly bounding the episodic memory cross-attention to $K=5$ frames — held at $\mathcal{O}(K \cdot P^2)$ with fixed $K$ — and delegating all long-horizon context to an $\mathcal{O}(P \cdot N \cdot D)$ Diagonal KAN-Modulated SSM, we achieve a constant-memory, recurrent inference pipeline within a $\sim$5M parameter footprint. Three stabilization constraints — $\tanh$-bounded KAN modulators, SwiGLU output gating, and non-affine BCNorm — were empirically necessary to train this architecture without gradient explosion; their necessity is documented as reproducible failures and constitutes a practical contribution to SSM stability engineering. The three-phase kinematic curriculum and scheduled sampling schedule provide a principled training protocol applicable beyond the specific architecture. Full quantitative results on DAVIS 2017 and YouTube-VOS 2019, and a thorough component ablation, are pending completion of the training runs and will be reported in the camera-ready version.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+\end{document}

@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=80G
 #SBATCH --time=72:00:00
 #SBATCH --output=logs/slurm/mv2_phase3_ytbdav_%j.out
 #SBATCH --error=logs/slurm/mv2_phase3_ytbdav_%j.err
@@ -12,15 +12,17 @@
 # Phase 3 — Joint YouTube-VOS + DAVIS (MobileNetV2 + KAN-SSM)
 #
 # Initialise from Phase 2 checkpoint (best_mv2_phase2_davis.ckpt).
-# Starting from Phase 2 (NOT Phase 1) is critical: PropagationAttention
-# and KangaSSM already adapted to real VOS on DAVIS before seeing
-# the larger YouTube-VOS distribution.
+#
+# Fixes vs. job 65764336 (OOM on step 1):
+#   - batch_size: 4→2, accumulate_grad_batches: 2→4 (same effective=8, half peak VRAM)
+#   - gradient_clip_val: 0.5→0.1 (backbone norms hit 5e3 on first backward)
+#   - precision: fp16→bf16-mixed (fp16 saturates at 65504; proj_out hit 2e+04)
+#   - use_checkpointing: true (was missing from Phase 3, adds ~30% VRAM saving)
+#   - lr_warmup_epochs: 2→5, lr_warmup_start_factor: 0.1→0.01 (stages 0-1 fire cold)
+#   - mem: 64G→80G (match Phase 2 which was stable)
 #
 # Data: YouTube-VOS 2019 + DAVIS 2017 joint (DAVIS = 25% per epoch)
 # Budget: 50 epochs × 3500 steps × ~1.4h/epoch ≈ 70h
-#
-# Scheduled sampling ramp 0.1 → 0.5 (λ* = 0.5, bias-variance optimum):
-#   Began at 0.1 because Phase 2 already established partial robustness.
 #
 # Target: val_J_and_F > 0.65 at epoch 50
 # Reference: MobileVOS (CVPR 2023) ≈ 0.78 J&F (same backbone, Transformer)
@@ -60,6 +62,12 @@ export PYTHONPATH=.
 export TMPDIR="${PROJECT_ROOT}/tmp"
 export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
 mkdir -p "$TMPDIR" "$HF_HOME" logs/slurm checkpoints
+
+export TRITON_CACHE_AUTOTUNING=1
+export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID:-manual}"
+mkdir -p "$TRITON_CACHE_DIR"
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     set -a; source "${PROJECT_ROOT}/.env"; set +a

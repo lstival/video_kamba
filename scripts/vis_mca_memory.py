@@ -44,13 +44,8 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from jaxtyping import Float
-from omegaconf import DictConfig, ListConfig
 from PIL import Image
 from torch import Tensor
-
-# PyTorch ≥ 2.6 defaults weights_only=True; OmegaConf configs stored in
-# Lightning checkpoints are not plain tensors — whitelist them globally.
-torch.serialization.add_safe_globals([DictConfig, ListConfig])
 
 # ── Local ────────────────────────────────────────────────────────────────────
 from models.video_mamba import VideoMambaSystem
@@ -451,8 +446,11 @@ def main() -> None:
     log.info("Device: %s", device)
 
     log.info("Loading checkpoint: %s", args.checkpoint)
+    # weights_only=False: Lightning checkpoints embed OmegaConf DictConfig /
+    # ContainerMetadata objects that PyTorch ≥ 2.6 rejects under the new
+    # weights_only=True default.  We own these checkpoints, so False is safe.
     model: VideoMambaSystem = VideoMambaSystem.load_from_checkpoint(
-        args.checkpoint, map_location=device
+        args.checkpoint, map_location=device, weights_only=False
     )
     model.eval().to(device)
 

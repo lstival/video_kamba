@@ -21,9 +21,15 @@ defaults:
 
 model:
   learning_rate: 3.0e-5
-  mv2_freeze_at: 0
+  mv2_freeze_at: 2              # keep stages 0+1 frozen — same as Phase 2
+                                # use_checkpointing only covers KangaSSM, not MobileNetV2;
+                                # unfreezing the full backbone stores activations for 18 layers
+                                # and OOMs before backward even runs (jobs 65764336, 65766138).
+                                # The temporal/memory/decoder modules are what generalise to
+                                # YouTube-VOS scale — the backbone does not need to change here.
   optimizer_weight_decay: 0.05
-  lr_warmup_epochs: 2           # short warmup after Phase 2 domain distribution shift
+  use_checkpointing: true
+  lr_warmup_epochs: 3
   lr_warmup_start_factor: 0.1
 
   # Full scheduled sampling curriculum to λ*=0.5
@@ -51,11 +57,11 @@ model:
 
 trainer:
   max_epochs: 50
-  limit_train_batches: 3500     # 3500 steps × 4 × 2 = 28k clips/epoch; ~1.4h/epoch
+  limit_train_batches: 3500
   gradient_clip_val: 0.5
   gradient_clip_algorithm: norm
-  precision: "16-mixed"
-  accumulate_grad_batches: 2
+  precision: "bf16-mixed"       # Phase 2 was stable in bf16; keep consistent
+  accumulate_grad_batches: 2    # batch=4 × accum=2 → effective batch=8
 
 callbacks:
   model_checkpoint:

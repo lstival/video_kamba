@@ -102,8 +102,13 @@ def main(cfg: DictConfig):
 
     _log_run_metadata(cfg)
 
-    # Initialize logger
-    logger = hydra.utils.instantiate(cfg.logger) if "logger" in cfg else None
+    # Initialize logger using plain Python containers to avoid ListConfig
+    # leaking into third-party APIs (e.g. Comet add_tags expects list).
+    logger_cfg: Any = cfg.get("logger") if "logger" in cfg else None
+    if isinstance(logger_cfg, DictConfig):
+        logger_cfg = OmegaConf.to_container(logger_cfg, resolve=True)
+
+    logger = hydra.utils.instantiate(logger_cfg) if logger_cfg is not None else None
     if logger is not None and hasattr(logger, "log_hyperparams"):
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 

@@ -33,6 +33,7 @@ def main(cfg: DictConfig):
 
     model = VideoMambaSystem.load_from_checkpoint(
         checkpoint_path, 
+        weights_only=False,
         strict=False,
         num_seg_classes=num_seg,
         num_clf_classes=num_clf
@@ -64,6 +65,9 @@ def main(cfg: DictConfig):
             # batch unpacking for MultiObjectVOSDataset (metas as list of dicts)
             if len(batch) == 6:
                 ref_img, ref_mask, query_images, query_masks, _, metas = batch
+            elif len(batch) == 5:
+                ref_img, ref_mask, query_images, query_masks, seq_names = batch
+                metas = [{"video_id": seq} for seq in seq_names]
             else:
                 # Fallback for old/other datasets
                 ref_img, ref_mask, query_images, query_masks = batch
