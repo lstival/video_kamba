@@ -43,8 +43,6 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 import lightning as L
 
-from .bl30k import BL30KVOSTrain
-
 LOGGER = logging.getLogger(__name__)
 
 # ── Normalisation constants (ImageNet / DINOv2) ───────────────────────────────
@@ -698,6 +696,7 @@ class VOSDataModule(L.LightningDataModule):
                 ratios.append(1.0 - self.davis_sampling_ratio) # Simplified for 2 datasets
             
             if self.bl30k_root is not None and Path(self.bl30k_root).exists():
+                from .bl30k import BL30KVOSTrain
                 bl30k_train = BL30KVOSTrain(
                     root       = str(self.bl30k_root),
                     clip_len   = self.clip_len,
