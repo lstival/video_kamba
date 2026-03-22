@@ -631,6 +631,8 @@ class VOSDataModule(L.LightningDataModule):
         train_max_scale: float = 1.3,
         train_flip_prob: float = 0.5,
         train_color_jitter_prob: float = 0.8,
+        bl30k_root: Optional[str] = None,
+        bl30k_sampling_ratio: float = 0.25,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -650,6 +652,8 @@ class VOSDataModule(L.LightningDataModule):
         self.train_max_scale      = train_max_scale
         self.train_flip_prob      = train_flip_prob
         self.train_color_jitter_prob = train_color_jitter_prob
+        self.bl30k_root           = bl30k_root
+        self.bl30k_sampling_ratio = bl30k_sampling_ratio
 
         self._train_ds: Optional[Dataset] = None
         self._val_ds:   Optional[Dataset] = None
@@ -676,6 +680,9 @@ class VOSDataModule(L.LightningDataModule):
                 max_gap    = self.max_gap,
                 augmentor  = train_aug,
             )
+            datasets = [davis_train]
+            ratios = [self.davis_sampling_ratio]
+
             if self.ytv_root is not None and Path(self.ytv_root).exists():
                 from torch.utils.data import ConcatDataset
                 ytv_train = YouTubeVOSTrain(
@@ -685,27 +692,59 @@ class VOSDataModule(L.LightningDataModule):
                     max_gap    = self.max_gap,
                     augmentor  = train_aug,
                 )
-                self._train_ds = ConcatDataset([davis_train, ytv_train])
+                datasets.append(ytv_train)
+                ratios.append(1.0 - self.davis_sampling_ratio) # Simplified for 2 datasets
+            
+            if self.bl30k_root is not None and Path(self.bl30k_root).exists():
+                from .bl30k import BL30KVOSTrain
+                bl30k_train = BL30KVOSTrain(
+                    root       = str(self.bl30k_root),
+                    clip_len   = self.clip_len,
+                    output_size= self.output_size,
+                    max_gap    = self.max_gap,
+                    augmentor  = train_aug,
+                )
+                datasets.append(bl30k_train)
+                # If we have DAVIS, YTV and BL30K, we need to balance them.
+                # Assume bl30k_sampling_ratio is applied from the total.
 
-                # WeightedRandomSampler so DAVIS is not drowned by YouTube-VOS.
-                # With naive ConcatDataset DAVIS would be ~1.8 % of samples;
-                # the sampler ensures it contributes davis_sampling_ratio of
-                # every epoch (default 25 %, matching AOT PRE_YTB_DAV balance).
+            if len(datasets) > 1:
+                from torch.utils.data import ConcatDataset
+                self._train_ds = ConcatDataset(datasets)
+
+                # Dynamic weights based on target ratios
+                # Suppose we want: 
+                # DAVIS: r_d, BL30K: r_bl, YTV: 1 - r_d - r_bl
+                r_d = self.davis_sampling_ratio
+                r_bl = self.bl30k_sampling_ratio if self.bl30k_root else 0.0
+                r_y = 1.0 - r_d - r_bl
+                
+                # Normalize ratios if they exceed 1.0
+                total_r = r_d + r_bl + (r_y if self.ytv_root else 0.0)
+                r_d /= total_r
+                r_bl /= total_r
+                r_y /= total_r
+
                 n_d = len(davis_train)
-                n_y = len(ytv_train)
-                r   = self.davis_sampling_ratio
-                # w_d / (w_d + 1) = r  →  w_d = r * n_y / ((1-r) * n_d)
-                w_d = r * n_y / ((1.0 - r) * n_d)
-                weights = [w_d] * n_d + [1.0] * n_y
+                n_bl = len(bl30k_train) if self.bl30k_root else 1
+                n_y = len(ytv_train) if self.ytv_root else 1
+
+                weights = []
+                if self.davis_root:
+                    weights += [r_d / n_d] * n_d
+                if self.ytv_root and Path(self.ytv_root).exists():
+                    weights += [r_y / n_y] * n_y
+                if self.bl30k_root and Path(self.bl30k_root).exists():
+                    weights += [r_bl / n_bl] * n_bl
+
                 self._sampler = WeightedRandomSampler(
                     weights,
                     num_samples=len(self._train_ds),
                     replacement=True,
                 )
                 LOGGER.info(
-                    f"[VOSDataModule] Train: DAVIS({n_d}) + YTV({n_y}) "
-                    f"= {len(self._train_ds)} clips | "
-                    f"DAVIS sampling ratio={r:.0%} (w_davis={w_d:.2f})"
+                    f"[VOSDataModule] Joint Training: {[len(ds) for ds in datasets]} samples | "
+                    f"Ratios: DAVIS={r_d:.1%}, YTV={r_y:.1%}, BL30K={r_bl:.1%}"
                 )
             else:
                 self._train_ds = davis_train

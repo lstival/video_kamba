@@ -1,27 +1,20 @@
-_target_: data.bl30k_pretrain.BL30KPretrainDataModule
+_target_: data.vos_datamodule.VOSDataModule
 
-# BL30K: ~30K synthetic video sequences, rendered objects on complex backgrounds.
-# Per-frame pixel-accurate binary masks (one object per sequence).
-# Used by TrickVOS, WarpFormer-S, AOTT as standard lightweight VOS pre-training.
-#
-# Expected data layout:
-#   data/BL30K/
-#     BL30K_part1/          # ~15K sequences
-#       <seq_id>/
-#         <frame_idx>.jpg
-#         <frame_idx>.png   # binary mask
-#     BL30K_part2/          # ~15K sequences
-#       <seq_id>/
-#         ...
-#
-# Download: https://henghuiding.github.io/MIVOS/ (BL30K section)
+# BL30K: ~30K synthetic video sequences
+# This config uses the integrated VOSDataModule with BL30K as the primary source.
 
-data_dir: ${work_dir}/data/BL30K
-output_size: 480              # resize shorter side to 480, then random crop
-clip_len: 6                   # 1 reference + 5 query frames per clip
-max_gap: 5                    # max frame stride within a clip
+davis_root: ${work_dir}/data/DAVIS
+bl30k_root: ${work_dir}/data/BL30K
+ytv_root: null
+
+davis_sampling_ratio: 0.1     # We still keep a little DAVIS for diversity
+bl30k_sampling_ratio: 0.9     # Focus on BL30K pre-training
+
+output_size: 448              # Professional resolution
+clip_len: 4
+max_gap: 3
 num_workers: 8
-batch_size: 8
+batch_size: 4
 
 # Augmentation (same as COCO pretrain)
 train_min_scale: 0.7
