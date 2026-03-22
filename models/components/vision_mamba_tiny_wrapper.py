@@ -67,6 +67,7 @@ class _SpatialKangaBlock(nn.Module):
         d_state: int,
         layers: int,
         modulator_type: str,
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.ssm = KangaSSM(
@@ -75,6 +76,7 @@ class _SpatialKangaBlock(nn.Module):
             num_layers=layers,
             dropout=0.0,
             modulator_type=modulator_type,
+            bidirectional=bidirectional,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,6 +104,7 @@ class VisionMambaTinyWrapper(nn.Module):
         ssm_d_state: int = 8,
         ssm_layers: int = 1,
         modulator_type: str = "kan",
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
 
@@ -124,6 +127,7 @@ class VisionMambaTinyWrapper(nn.Module):
             d_state=ssm_d_state,
             layers=ssm_layers,
             modulator_type=modulator_type,
+            bidirectional=bidirectional,
         )
 
         self.project = nn.Sequential(
@@ -137,6 +141,7 @@ class VisionMambaTinyWrapper(nn.Module):
             d_state=ssm_d_state,
             layers=ssm_layers,
             modulator_type=modulator_type,
+            bidirectional=bidirectional,
         )
 
     def forward(

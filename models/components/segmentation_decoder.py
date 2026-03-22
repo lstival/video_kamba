@@ -451,6 +451,21 @@ class SegmentationDecoder(nn.Module):
         self.up2 = _make_up_block(dec1, skip2, dec2)
         self.up3 = _make_up_block(dec2, skip3, dec3)
 
+        # AOT-inspired Hierarchical Temporal Projections
+        # These project the stride-16 SSM context into stride-8 and stride-4 skip scales.
+        # stride-8 skip (skip2) channel dim: skip2
+        # stride-4 skip (skip3) channel dim: skip3
+        self.temporal_proj_s8 = nn.Sequential(
+            nn.ConvTranspose2d(dim_ssm, skip2, kernel_size=2, stride=2),
+            nn.BatchNorm2d(skip2),
+            nn.ReLU(inplace=True)
+        )
+        self.temporal_proj_s4 = nn.Sequential(
+            nn.ConvTranspose2d(skip2, skip3, kernel_size=2, stride=2),
+            nn.BatchNorm2d(skip3),
+            nn.ReLU(inplace=True)
+        )
+
         self.final_head = nn.Sequential(
             nn.Conv2d(dec3, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -604,14 +619,19 @@ class SegmentationDecoder(nn.Module):
             else:
                 return block(current_x, skip_feat)
 
-        # up1: 14×14 semantics + Stage-3 skip  → [BT, 256, 14×14]
-        # up2: 14→28 first genuine upsample   + Stage-2 skip  → [BT, 128, 28×28]
-        # up3: 28→56 second genuine upsample  + Stage-1 skip  → [BT,  64, 56×56]
-        x = execute_up(self.up1, x, s3, ref_s3, r_mask)
-        x = execute_up(self.up2, x, s2, ref_s2, r_mask)
-        x = execute_up(self.up3, x, s1, ref_s1, r_mask)
+        # top-down pyramid with AOT-style multi-scale temporal injection
+        # up1: 14×14 semantics + Stage-3 skip  → [BT, dec1, 28, 28]
+        x1 = execute_up(self.up1, x, s3, ref_s3, r_mask)
+        
+        # Inject temporal context into Stride-8 (Detailed) skip-connection
+        t_s8 = self.temporal_proj_s8(x)
+        x2 = execute_up(self.up2, x1, s2 + t_s8, ref_s2, r_mask)
+        
+        # Inject temporal context into Stride-4 (Edge) skip-connection
+        t_s4 = self.temporal_proj_s4(t_s8)
+        x3 = execute_up(self.up3, x2, s1 + t_s4, ref_s1, r_mask)
 
-        logits = self.final_head(x)   # [BT, num_classes, 56, 56]
+        logits = self.final_head(x3)   # [BT, num_classes, 56, 56]
 
         # Final upscale to target_size (e.g. 56→224).
         if logits.shape[-1] != self.target_size:

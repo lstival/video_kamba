@@ -14,6 +14,7 @@ model:
   mv2_freeze_at: 2
   optimizer_weight_decay: 0.05
   use_checkpointing: true
+  use_identity_modulation: true
 
   opt:
     optimizer:
@@ -45,5 +46,6 @@ callbacks:
   model_checkpoint:
     monitor: val_loss
     mode: min
-    filename: "best_mv2_ssmmem_phase1_coco"
+    filename: "best_slim_v2_phase1_coco"
     save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot

@@ -29,10 +29,13 @@ defaults:
   - override /callbacks: default
   - override /model: mv2_ssm_memory
 
+checkpoint_path: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase1_coco.ckpt
+
 model:
   learning_rate: 3.0e-5
   mv2_freeze_at: 2              # keep stages 0+1 frozen — match Phase 1 to avoid step-1 explosion
   use_checkpointing: true       # re-add: was in Phase 1, dropped from Phase 2 (contributed to OOM)
+  use_identity_modulation: true
   optimizer_weight_decay: 0.05
   lr_warmup_epochs: 3           # 3-epoch LR warmup after domain shift from COCO→DAVIS
   lr_warmup_start_factor: 0.1
@@ -68,8 +71,9 @@ callbacks:
   model_checkpoint:
     monitor: val_J_and_F
     mode: max
-    filename: "best_mv2_ssmmem_phase2_davis"
+    filename: "best_slim_v2_phase2_davis"
     save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
 
   layer_gradient_norm_tracker:
     _target_: training.callbacks.LayerGradientNormTracker

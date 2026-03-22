@@ -17,6 +17,7 @@ from models.components.detection_head import DetectionHead
 from models.components.segmentation_decoder import SegmentationDecoder
 from models.components.memory_state_bank import MemoryStateBank
 from models.components.feature_fusion import FeatureFusion
+from models.components.fast_kan_layer import FastKANLayer
 
 class VideoMambaSystem(L.LightningModule):
     """Multi-task video understanding model — Phase 2 (Hiera backbone).
@@ -85,9 +86,9 @@ class VideoMambaSystem(L.LightningModule):
         ssm_layers: int = 1,
         use_checkpointing: bool = False,
         fusion_mode: str = "kan_spatial",
-        dec_dim_up1: int = 256,
-        dec_dim_up2: int = 128,
-        dec_dim_up3: int = 64,
+        dec_dim_up1: int = 128,
+        dec_dim_up2: int = 64,
+        dec_dim_up3: int = 32,
         modulator_type: str = "kan",
         # Regularisation
         consistency_weight: float = 0.0,
@@ -103,6 +104,7 @@ class VideoMambaSystem(L.LightningModule):
         vim_stage2_dim: int = 96,
         vim_spatial_d_state: int = 8,
         vim_spatial_layers: int = 1,
+        vim_bidirectional: bool = True, # Item 3: Enable bidirectional spatial scan by default
         # Training schedule
         max_epochs: int = 20,
         propagation_lr_multiplier: float = 1.0,
@@ -123,6 +125,7 @@ class VideoMambaSystem(L.LightningModule):
         lr_warmup_start_factor: float = 0.1,
         # Option 1: Dynamic Tracker
         use_identity_modulation: bool = False,
+        modulator_grid_size: int = 4,
         **kwargs: Any,
     ):
         super().__init__()
@@ -162,6 +165,7 @@ class VideoMambaSystem(L.LightningModule):
                 ssm_d_state=vim_spatial_d_state,
                 ssm_layers=vim_spatial_layers,
                 modulator_type=modulator_type,
+                bidirectional=vim_bidirectional, # Item 3
             )
         elif encoder_type == "dino":
             self.feature_extractor = DinoV3Wrapper(freeze=True)
@@ -177,6 +181,8 @@ class VideoMambaSystem(L.LightningModule):
             use_checkpointing=use_checkpointing,
             modulator_type=modulator_type,
             identity_dim=dim_in if use_identity_modulation else None,
+            grid_size=modulator_grid_size,
+            bidirectional=True, # Item 3: Temporal bidirectional for offline/fallback
         )
         self.temporal_model_global = KangaSSM(
             d_model=dim_in,
@@ -185,16 +191,16 @@ class VideoMambaSystem(L.LightningModule):
             use_checkpointing=use_checkpointing,
             modulator_type=modulator_type,
             identity_dim=dim_in if use_identity_modulation else None,
+            grid_size=modulator_grid_size,
+            bidirectional=True, # Item 3
         )
         self.ssm_output_fusion = nn.Linear(dim_in * 2, dim_in)
         self.memory_bank_local = MemoryStateBank()
         self.memory_bank_global = MemoryStateBank()
         
-        # AOT-style Gated Temporal Fusion (Double-SSM Integration)
-        self.temporal_gate = nn.Sequential(
-            nn.Linear(dim_in * 2, dim_in),
-            nn.Sigmoid()
-        )
+        # Item 2: KAN Dynamic Temporal Fusion (Local vs Global)
+        # Replacing Linear with FastKANLayer for higher expressivity
+        self.temporal_gate = FastKANLayer(dim_in * 2, dim_in, grid_size=modulator_grid_size)
         
         # Object ID Embedding for associative identity tracking
         self.obj_id_embedding = nn.Embedding(num_seg_classes, dim_in)
@@ -465,8 +471,13 @@ class VideoMambaSystem(L.LightningModule):
             ref_fused = self.feature_fusion(ref_patch_p, ref_patch_p)  # self-fusion
             ref_flat = ref_fused.reshape(B * P, 1, D)
             
-            _, ref_h_local = self.temporal_model_local(ref_flat, prev_states=None, return_last_state=True)
-            _, ref_h_global = self.temporal_model_global(ref_flat, prev_states=None, return_last_state=True)
+            # Broadcast identity_vec for seeding: [B, D] -> [B*P, D]
+            id_seeding = None
+            if identity_vec is not None:
+                id_seeding = identity_vec.unsqueeze(1).repeat(1, P, 1).view(B * P, D)
+
+            _, ref_h_local = self.temporal_model_local(ref_flat, prev_states=None, return_last_state=True, identity=id_seeding)
+            _, ref_h_global = self.temporal_model_global(ref_flat, prev_states=None, return_last_state=True, identity=id_seeding)
             
             self.memory_bank_local.reset()
             self.memory_bank_global.reset()
@@ -509,12 +520,14 @@ class VideoMambaSystem(L.LightningModule):
                 self.memory_bank_local.update_state(next_h_local)
                 self.memory_bank_global.update_state(next_h_global)
                 
-                # Gated Temporal Fusion: Dynamic mix of local (motion) and global (re-id) context
-                ssm_cat = torch.cat([out_local, out_global], dim=-1)
-                ssm_gate = self.temporal_gate(ssm_cat)
+                # KAN Dynamic Temporal Fusion: Dynamic mix of local (motion) and global (re-id) context
+                ssm_cat = torch.cat([out_local, out_global], dim=-1) # [B*P, 1, D*2]
+                ssm_gate_flat = torch.sigmoid(self.temporal_gate(ssm_cat.reshape(-1, D*2)))
+                ssm_gate = ssm_gate_flat.view(B * P, 1, D)
                 ssm_fused = (ssm_gate * out_global) + ((1 - ssm_gate) * out_local)
 
                 # [B*P, 1, D] → [B, 1, D, P] for decoder
+                # We pass the raw fused temporal context to enable hierarchical injection.
                 last_feat = (
                     ssm_fused.squeeze(1)      # [B*P, D]
                     .reshape(B, P, D)         # [B, P, D]

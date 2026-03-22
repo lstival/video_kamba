@@ -53,6 +53,8 @@ class KangaSSM(nn.Module):
         modulate_A: bool = True,   # diagonal only
         modulate_B: bool = True,
         modulate_C: bool = True,
+        grid_size: int = 8,
+        bidirectional: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -60,34 +62,45 @@ class KangaSSM(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.modulator_type = modulator_type
         self.use_diagonal = use_diagonal
+        self.bidirectional = bidirectional
 
-        if use_diagonal:
-            self.layers = nn.ModuleList([
-                DiagonalKANSSMCore(
-                    inner_dim=d_model,
-                    state_dim=d_state,
-                    modulate_A=modulate_A,
-                    modulate_B=modulate_B,
-                    modulate_C=modulate_C,
-                    modulator_type=modulator_type,
-                    identity_dim=identity_dim,
-                ) for _ in range(num_layers)
-            ])
-        else:
-            # Legacy dense backend — kept for ablation comparison
-            self.layers = nn.ModuleList([
-                IntricateKANSSMCore(
-                    inner_dim=d_model,
-                    state_dim=d_state,
-                    modulate_B=modulate_B,
-                    modulate_C=modulate_C,
-                    modulation_mode="factor",
-                    use_fast_kan=True,
-                    modulator_type=modulator_type,
-                    use_mamba_kernels=True,
-                    identity_dim=identity_dim,
-                ) for _ in range(num_layers)
-            ])
+        def _make_layers():
+            if use_diagonal:
+                return nn.ModuleList([
+                    DiagonalKANSSMCore(
+                        inner_dim=d_model,
+                        state_dim=d_state,
+                        modulate_A=modulate_A,
+                        modulate_B=modulate_B,
+                        modulate_C=modulate_C,
+                        modulator_type=modulator_type,
+                        identity_dim=identity_dim,
+                        grid_size=grid_size,
+                    ) for _ in range(num_layers)
+                ])
+            else:
+                return nn.ModuleList([
+                    IntricateKANSSMCore(
+                        inner_dim=d_model,
+                        state_dim=d_state,
+                        modulate_B=modulate_B,
+                        modulate_C=modulate_C,
+                        modulation_mode="factor",
+                        use_fast_kan=True,
+                        modulator_type=modulator_type,
+                        use_mamba_kernels=True,
+                        identity_dim=identity_dim,
+                        grid_size=grid_size,
+                    ) for _ in range(num_layers)
+                ])
+
+        self.layers = _make_layers()
+        if bidirectional:
+            self.layers_bw = _make_layers()
+            # KAN-based bidirectional fusion: [D*2] -> [D]
+            # Replacing linear concat with KAN for higher expressivity as per suggestion 2.
+            from .fast_kan_layer import FastKANLayer
+            self.fusion = FastKANLayer(d_model * 2, d_model, grid_size=grid_size)
 
         self.norm = nn.LayerNorm(d_model)
         # Post-scan normalization: stabilises the unbounded scan output
@@ -129,14 +142,51 @@ class KangaSSM(nn.Module):
 
         Returns:
             Contextualised ``[B, T, C]`` or ``(output, states)``.
+            If ``bidirectional=True``, states is a tuple (states_f, states_b).
         """
+        if self.bidirectional:
+            out_f, states_f = self._forward_scan(
+                self.layers, x, prev_states[0] if prev_states else None,
+                return_last_state=True, identity=identity
+            )
+            # Backward path: flip T dimension
+            x_bw = x.flip(dims=(1,))
+            # Reverse identity over time if it were multi-step (not implemented for static identity)
+            
+            # Use backward layers with their own states
+            out_b, states_b = self._forward_scan(
+                self.layers_bw, x_bw, prev_states[1] if prev_states else None,
+                return_last_state=True, identity=identity
+            )
+            out_b = out_b.flip(dims=(1,)) # flip back
+            
+            # Fusing using KAN for non-linear expressivity (Item 2)
+            # out_f/b: [B, T, D]
+            B, T, D = out_f.shape
+            fused = torch.cat([out_f, out_b], dim=-1) # [B, T, D*2]
+            out = self.fusion(fused.reshape(B * T, D * 2)).reshape(B, T, D)
+            
+            if return_last_state:
+                return out, (states_f, states_b)
+            return out
+
+        return self._forward_scan(self.layers, x, prev_states, return_last_state, identity)
+
+    def _forward_scan(
+        self,
+        layers: nn.ModuleList,
+        x: Float[torch.Tensor, "B T C"],
+        prev_states: Optional[list[torch.Tensor]] = None,
+        return_last_state: bool = False,
+        identity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         B, T, C = x.shape
         residual = x
         x = self.norm(x)
 
         next_states: list[torch.Tensor] = []
 
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(layers):
             p_state = prev_states[i] if prev_states is not None else None
 
             if self.use_diagonal:
