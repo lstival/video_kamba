@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+import math
 from typing import Any, Tuple, Dict, List, Optional, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -126,6 +130,15 @@ class VideoMambaSystem(L.LightningModule):
         # Option 1: Dynamic Tracker
         use_identity_modulation: bool = False,
         modulator_grid_size: int = 4,
+        # ── Dual-Timescale State Memory (DTSM) ─────────────────────────────
+        # A slow SSM path that accumulates long-range context within a video
+        # without any attention mechanism.  The slow path is strictly causal
+        # (unidirectional) with near-1 state decay so it acts as a persistent
+        # memory consolidator over hundreds of frames.
+        # See design note: "Dual-Timescale State Memory for Long-Range VOS".
+        use_dual_timescale_memory: bool = False,
+        slow_ssm_d_state: int = 64,           # larger state for long-range capacity
+        slow_ssm_log_a_init: float = -3.0,    # log_A init: A_bar ≈ exp(-exp(-3)*δ) ≈ 0.995
         **kwargs: Any,
     ):
         super().__init__()
@@ -197,10 +210,45 @@ class VideoMambaSystem(L.LightningModule):
         self.ssm_output_fusion = nn.Linear(dim_in * 2, dim_in)
         self.memory_bank_local = MemoryStateBank()
         self.memory_bank_global = MemoryStateBank()
-        
+
         # Item 2: KAN Dynamic Temporal Fusion (Local vs Global)
         # Replacing Linear with FastKANLayer for higher expressivity
         self.temporal_gate = FastKANLayer(dim_in * 2, dim_in, grid_size=modulator_grid_size)
+
+        # ── Dual-Timescale State Memory (DTSM) ──────────────────────────────
+        # Slow consolidation path: unidirectional KangaSSM with near-1 decay.
+        # Key design decisions:
+        #   - bidirectional=False: state must flow forward causally to persist
+        #     across clips; bidirectional would require seeing future frames.
+        #   - d_state=slow_ssm_d_state (64): 4× the fast paths (16) for capacity.
+        #   - num_layers=1: one layer is sufficient; the fast paths already
+        #     provide multi-layer temporal refinement.
+        #   - grid_size=4: smaller KAN basis reduces params on the slow path.
+        #   - log_A init to slow_ssm_log_a_init (-3.0): gives A_bar ≈ 0.995,
+        #     near-lossless carry — the slow SSM "forgets" at ~0.5% per frame.
+        #   - slow_residual_proj near-zero init: slow path starts as a null
+        #     correction and learns to contribute incrementally.
+        # No cross-attention or softmax anywhere in this path.
+        self.use_dual_timescale_memory = use_dual_timescale_memory
+        if use_dual_timescale_memory:
+            self.temporal_model_slow = KangaSSM(
+                d_model=dim_in,
+                d_state=slow_ssm_d_state,
+                num_layers=1,
+                use_checkpointing=use_checkpointing,
+                modulator_type=modulator_type,
+                grid_size=4,
+                bidirectional=False,
+            )
+            for layer in self.temporal_model_slow.layers:
+                if hasattr(layer, "log_A"):
+                    nn.init.constant_(layer.log_A, slow_ssm_log_a_init)
+            self.memory_bank_slow = MemoryStateBank()
+            self.slow_residual_proj = nn.Linear(dim_in, dim_in, bias=False)
+            nn.init.normal_(
+                self.slow_residual_proj.weight,
+                std=0.02 / math.sqrt(2),
+            )
         
         # Object ID Embedding for associative identity tracking
         self.obj_id_embedding = nn.Embedding(num_seg_classes, dim_in)
@@ -484,6 +532,13 @@ class VideoMambaSystem(L.LightningModule):
             self.memory_bank_local.set_state(ref_h_local)
             self.memory_bank_global.set_state(ref_h_global)
 
+            if self.use_dual_timescale_memory:
+                _, ref_h_slow = self.temporal_model_slow(
+                    ref_flat, prev_states=None, return_last_state=True
+                )
+                self.memory_bank_slow.reset()
+                self.memory_bank_slow.set_state(ref_h_slow)
+
             # Spatial decoder guidance: binary objectness from reference mask
             ref_mask_safe = ref_mask.clone()
             ref_mask_safe[ref_mask == 255] = 0
@@ -525,6 +580,19 @@ class VideoMambaSystem(L.LightningModule):
                 ssm_gate_flat = torch.sigmoid(self.temporal_gate(ssm_cat.reshape(-1, D*2)))
                 ssm_gate = ssm_gate_flat.view(B * P, 1, D)
                 ssm_fused = (ssm_gate * out_global) + ((1 - ssm_gate) * out_local)
+
+                # ── DTSM slow consolidation path ─────────────────────────
+                # The slow SSM carries a persistent hidden state across all
+                # frames of the video.  Its output is injected as a residual
+                # correction on the fast-path fusion — contributing long-range
+                # context without any attention / softmax operation.
+                if self.use_dual_timescale_memory:
+                    prev_h_slow = self.memory_bank_slow.get_state()
+                    out_slow, next_h_slow = self.temporal_model_slow(
+                        fused_flat, prev_states=prev_h_slow, return_last_state=True
+                    )
+                    self.memory_bank_slow.update_state(next_h_slow)
+                    ssm_fused = ssm_fused + self.slow_residual_proj(out_slow)
 
                 # [B*P, 1, D] → [B, 1, D, P] for decoder
                 # We pass the raw fused temporal context to enable hierarchical injection.
@@ -855,10 +923,15 @@ class VideoMambaSystem(L.LightningModule):
         # ── Temporal SSM: KangaSSM (Local + Global) ───────────────────
         # Separate from "base" so temporal_lr_multiplier can throttle it.
         temporal_params = (
-            list(self.temporal_model_local.parameters()) 
+            list(self.temporal_model_local.parameters())
             + list(self.temporal_model_global.parameters())
             + list(self.ssm_output_fusion.parameters())
         )
+        if self.use_dual_timescale_memory:
+            temporal_params = temporal_params + (
+                list(self.temporal_model_slow.parameters())
+                + list(self.slow_residual_proj.parameters())
+            )
         temporal_ids = {id(p) for p in temporal_params}
 
         # ── Encoder backbone ─────────────────────────────────────────

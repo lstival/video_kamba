@@ -10,8 +10,11 @@ output_size: 448
 # Expected data layout: data/BL30K/BL30K_part1/, etc.
 data_dir: ${work_dir}/data/BL30K
 
-# Clip settings: 6 frames teach the SSM smooth temporal dynamics
-clip_len: 6
+# Clip length increased from 6 → 12 to give the DTSM slow SSM path enough
+# temporal context for gradients to flow through meaningful long-range spans.
+# At clip_len=6 the slow and fast SSMs see identical horizons — no learning
+# signal differentiates the two timescales.
+clip_len: 12
 max_gap: 5
 
 # Training schedule

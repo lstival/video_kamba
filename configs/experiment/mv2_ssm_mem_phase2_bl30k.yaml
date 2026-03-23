@@ -23,6 +23,13 @@ model:
   optimizer_weight_decay: 0.05
   lr_warmup_epochs: 2
   lr_warmup_start_factor: 0.1
+  # ── DTSM: enable slow consolidation path for long-range VOS ────────────
+  # Slow SSM is new (random init); existing weights load via pretrained_weights.
+  # COCO warmup is skipped intentionally — static images give no temporal signal
+  # for the slow path.  BL30K synthetic sequences are the right training domain.
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
 
   opt:
     optimizer:
