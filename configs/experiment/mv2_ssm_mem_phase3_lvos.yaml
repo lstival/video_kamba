@@ -1,0 +1,98 @@
+# @package _global_
+#
+# Phase 3 — LVOS V2 Long-range Fine-tuning (MobileNetV2 + KAN-SSM + DTSM)
+#
+# Goal: adapt the DTSM model (BL30K Phase 1b) to the distribution of real
+# long-term VOS videos (average 408 frames).  LVOS is the primary benchmark
+# for which DTSM was designed; this phase is the critical test of the
+# "SSM replaces attention for long-range propagation" thesis.
+#
+# Initialise from Phase 1b checkpoint (best_slim_v2_phase2_bl30k.ckpt).
+# Uses pretrained_weights (not checkpoint) to reset the optimizer.
+#
+# Key decisions vs Phase 1b (BL30K):
+#   ── LR 5e-5 → 3e-5: LVOS is real data; smaller LR reduces catastrophic
+#      forgetting of the synthetic temporal priors learned on BL30K.
+#   ── mv2_freeze_at: 2 → 1: LVOS has harder appearance variation than BL30K;
+#      unfreezing stage 2 helps adapt mid-level features while keeping stage 0+1
+#      frozen (low-level edges/textures are dataset-agnostic).
+#   ── accumulate_grad_batches: 4 → 2: LVOS clips are harder per step so
+#      a smaller accumulation reduces gradient variance.
+#   ── limit_train_batches: 2000 (same as BL30K — LVOS train ~220 seqs is
+#      much smaller so we repeat with shuffle; 2000 steps/epoch is stable).
+#   ── max_gap: 10 (set in datamodule config): exercises clips spanning up to
+#      120 frames, directly stressing the DTSM slow SSM path.
+#
+# Gate decision @ epoch 30 (check Comet):
+#   val_J_and_F > 0.45 → proceed to Phase 4 (joint DAVIS + YouTube-VOS)
+#   val_J_and_F < 0.45 → investigate slow SSM gradient flow
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: lvos
+
+# Weight-only transfer from Phase 1b (BL30K) checkpoint.
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase2_bl30k.ckpt
+
+model:
+  learning_rate: 3.0e-5
+  mv2_freeze_at: 1              # unfreeze stage 2 vs Phase 1b (which kept freeze_at=2)
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3           # warmup after BL30K → real-video domain shift
+  lr_warmup_start_factor: 0.1
+  # ── DTSM: keep enabled (inherited from Phase 1b pre-training) ───────────
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 60
+  limit_train_batches: 2000     # LVOS train is ~220 seqs; repeat with shuffle
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2    # batch 2 × 2 = 4 effective
+
+callbacks:
+  model_checkpoint:
+    monitor: val_loss
+    mode: min
+    filename: "best_slim_v2_phase3_lvos"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "temporal_model_slow"
+      - "memory_bank_slow"
+      - "slow_residual_proj"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_fusion"

@@ -1,0 +1,38 @@
+# LVOS V2 fine-tuning DataModule configuration
+# Usage: python train.py datamodule=lvos +experiment=mv2_ssm_mem_phase3_lvos
+#
+# LVOS V2 — 720 long-term VOS videos, average ~408 frames (~68 s @ 6 fps).
+# Designed to evaluate and train long-range temporal propagation, which is
+# the primary motivation for the DTSM slow SSM path.
+#
+# References:
+#   Hong et al., "LVOS: A Long-term Video Object Segmentation Benchmark",
+#   ICCV 2023.  https://github.com/LingyiHongfd/lvos-evaluation
+_target_: data.lvos_finetune.LVOSFinetuneDataModule
+
+# Expected data layout: data/LVOS/train/ and data/LVOS/valid/
+# Symlinked from Lustre by scripts/slurm_setup_lvos_lustre.sh
+data_dir: ${work_dir}/data/LVOS
+
+# Spatial resolution — 480 × 480 matches DAVIS / BL30K training resolution
+output_size: 480
+
+# Clip sampling strategy
+# ── clip_len=12 keeps VRAM consistent with Phase 1b BL30K training.
+# ── max_gap=10 gives effective span 12 × 10 = 120 frames per clip,
+#    which exercises the DTSM slow SSM path with meaningful long-range context.
+#    (BL30K used max_gap=5; increasing to 10 for LVOS's much longer sequences.)
+clip_len: 12
+max_gap: 10
+
+# Multi-object: LVOS tracks up to 10 objects simultaneously (same as YouTube-VOS)
+n_id: 10
+
+# Training schedule
+batch_size: 2        # 480p clips at T=12; same VRAM budget as BL30K Phase 1b
+num_workers: 8
+
+# Validation clip length cap — full-sequence LVOS eval is done offline via
+# scripts/lvos_evaluate.sh using the official LVOS evaluation toolkit.
+# 24 frames (2× clip_len) is enough to track gradient propagation quality.
+max_val_frames: 24
