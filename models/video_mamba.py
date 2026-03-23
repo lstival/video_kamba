@@ -642,6 +642,18 @@ class VideoMambaSystem(L.LightningModule):
         )
         # logits_seg: [B, T, num_seg_classes, H, W]
 
+        # Pad obj_present from [B, T, n_data] to [B, T, n_model] when the dataset has
+        # fewer object slots than the model (e.g. BL30K single-object vs DAVIS 10-object).
+        # Extra channels are False (0.0), so the loss masks them out automatically.
+        n_model = logits_seg.shape[2] - 1  # n_id = C - 1 (background excluded)
+        if obj_present.shape[2] < n_model:
+            pad = torch.zeros(
+                obj_present.shape[0], obj_present.shape[1],
+                n_model - obj_present.shape[2],
+                dtype=obj_present.dtype, device=obj_present.device,
+            )
+            obj_present = torch.cat([obj_present, pad], dim=2)
+
         loss = self.vos_loss_fn(logits_seg, query_masks, obj_present)
 
         assert not torch.isnan(loss), "_vos_step: NaN loss detected."

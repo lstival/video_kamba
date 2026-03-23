@@ -9,7 +9,16 @@ from typing import Any
 import hydra
 import lightning as L
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.base import ContainerMetadata, Node
+
+# PyTorch 2.6 changed weights_only default to True, breaking checkpoints saved with older
+# versions that contain builtins (dict, typing.Any, etc.) via Hydra/OmegaConf pickling.
+# Our checkpoints are internally produced and trusted, so we revert the default to False.
+_torch_load_orig = torch.load
+torch.load = lambda *args, **kwargs: _torch_load_orig(  # type: ignore[assignment]
+    *args, **{**kwargs, "weights_only": False}
+)
 
 LOGGER = logging.getLogger(__name__)
 

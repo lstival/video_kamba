@@ -1,104 +1,281 @@
-"""Script to download and extract a 100GB subset of BL30K Segment 1.
+"""Download and extract the full BL30K dataset (all 6 segments, ~700 GB).
 
-Since the full Segment 1 is ~110GB, this script streams the download and
-stops extracting after a specified number of sequences to fit within disk 
-space constraints (e.g., 100GB).
+All segments are downloaded sequentially: each tar is fetched, extracted into
+``extract_dir``, then deleted before the next segment starts — keeping peak
+disk usage to one segment at a time (~120 GB).
+
+Official dataset page: https://henghuiding.github.io/MIVOS/ (BL30K section)
+Illinois Data Bank:    https://databank.illinois.edu/datasets/IDB-4930082
+
+Usage (SLURM / non-interactive):
+    python scripts/download_bl30k_subset.py \\
+        --download-dir  /lustre/scratch/WUR/AIN/stiva001/video_kamba_data/tars \\
+        --extract-dir   /lustre/scratch/WUR/AIN/stiva001/video_kamba_data/BL30K \\
+        --cleanup
+
+Usage (single segment, backward-compatible):
+    python scripts/download_bl30k_subset.py \\
+        --segments a \\
+        --download-dir  /tmp/stiva001 \\
+        --extract-dir   /home/WUR/stiva001/WUR/video_kamba/data/BL30K \\
+        --cleanup
 """
 
-import os
-import sys
-import requests
-import tarfile
+from __future__ import annotations
+
+import argparse
 import logging
+import os
+import tarfile
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger(__name__)
-
-# Official Illinois Data Bank link for BL30K Segment 1 (BL30K_a.tar)
-BL30K_A_URL = "https://databank.illinois.edu/datafiles/rvqd3/download"
-
-"""Script to download BL30K Segment 1 from Disk E and extract to project folder.
-
-Features:
-- Downloads Segment 1 (BL30K_a.tar) to Disk E (~108GB required).
-- Extracts files to the project's data/BL30K directory (~115GB required).
-- Cleans up the .tar file after successful extraction to free space on Disk E.
-"""
-
-import os
-import sys
 import requests
-import tarfile
-import logging
-from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 LOGGER = logging.getLogger(__name__)
 
-# Official Illinois Data Bank link for BL30K Segment 1 (BL30K_a.tar)
-BL30K_A_URL = "https://databank.illinois.edu/datafiles/rvqd3/download"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-def download_and_extract_bl30k(download_path, extract_dir):
-    """
-    Downloads the tar file to download_path and extracts it to extract_dir.
-    """
-    download_path = Path(download_path)
-    extract_dir = Path(extract_dir)
-    
-    os.makedirs(download_path.parent, exist_ok=True)
-    os.makedirs(extract_dir, exist_ok=True)
-    
-    # 1. Download
-    if not download_path.exists():
-        LOGGER.info(f"Downloading BL30K Segment 1 to {download_path}...")
-        try:
-            with requests.get(BL30K_A_URL, stream=True) as r:
-                r.raise_for_status()
-                with open(download_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024*1024): # 1MB chunks
-                        f.write(chunk)
-            LOGGER.info("Download complete.")
-        except Exception as e:
-            LOGGER.error(f"Download failed: {e}")
-            return
-    else:
-        LOGGER.info(f"Download found at {download_path}. Skipping download.")
+# ── Illinois Data Bank download links ────────────────────────────────────────
+# All links are from: https://databank.illinois.edu/datasets/IDB-4930082
+# Verify current links on the dataset page if any redirect fails.
+BL30K_URLS: dict[str, str] = {
+    "a": "https://databank.illinois.edu/datafiles/rvqd3/download",
+    "b": "https://databank.illinois.edu/datafiles/ximzd/download",
+    "c": "https://databank.illinois.edu/datafiles/4r7qf/download",
+    "d": "https://databank.illinois.edu/datafiles/y4cdl/download",
+    "e": "https://databank.illinois.edu/datafiles/3sp7e/download",
+    "f": "https://databank.illinois.edu/datafiles/qopvs/download",
+}
 
-    # 2. Extract
-    LOGGER.info(f"Extracting to {extract_dir}...")
+ALL_SEGMENTS: list[str] = ["a", "b", "c", "d", "e", "f"]
+
+DEFAULT_DOWNLOAD_DIR = Path("/lustre/scratch/WUR/AIN/stiva001/video_kamba_data/tars")
+DEFAULT_EXTRACT_DIR  = Path("/lustre/scratch/WUR/AIN/stiva001/video_kamba_data/BL30K")
+
+
+# ── Core helpers ─────────────────────────────────────────────────────────────
+
+def download_segment(segment: str, download_dir: Path, url: str | None = None) -> Path | None:
+    """Download one BL30K segment tar; skip if already present.
+
+    Args:
+        segment:      Segment letter, e.g. ``"a"``.
+        download_dir: Directory to save the tar file into.
+        url:          Override download URL; falls back to ``BL30K_URLS[segment]``.
+
+    Returns:
+        Path to the downloaded tar, or ``None`` on failure.
+    """
+    resolved_url = url or BL30K_URLS.get(segment)
+    if not resolved_url:
+        LOGGER.error("No URL configured for segment '%s'. Add it to BL30K_URLS.", segment)
+        return None
+
+    tar_path = download_dir / f"BL30K_{segment}.tar"
+    if tar_path.exists():
+        LOGGER.info("[%s] Archive already exists at %s — skipping download.", segment, tar_path)
+        return tar_path
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("[%s] Downloading: %s → %s", segment, resolved_url, tar_path)
+
     try:
-        with tarfile.open(download_path, 'r') as tar:
-            tar.extractall(path=extract_dir)
-        LOGGER.info("Extraction complete.")
-    except Exception as e:
-        LOGGER.error(f"Extraction failed: {e}")
-        return
+        with requests.get(resolved_url, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            total_bytes = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 8 * 1024 * 1024  # 8 MB — larger chunks for Lustre throughput
 
-    # 3. Cleanup (Optional)
-    choice = input(f"Delete temporary tar file {download_path} to free space on Disk E? (y/n): ")
-    if choice.lower() == 'y':
-        os.remove(download_path)
-        LOGGER.info("Temporary file deleted.")
+            with open(tar_path, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total_bytes:
+                        LOGGER.info(
+                            "[%s]  %.1f%%  (%d / %d MB)",
+                            segment,
+                            100 * downloaded / total_bytes,
+                            downloaded // (1024 ** 2),
+                            total_bytes // (1024 ** 2),
+                        )
+
+        LOGGER.info("[%s] Download complete: %s", segment, tar_path)
+        return tar_path
+
+    except Exception as exc:
+        LOGGER.error("[%s] Download failed: %s", segment, exc)
+        if tar_path.exists():
+            tar_path.unlink()
+        return None
+
+
+def extract_segment(tar_path: Path, extract_dir: Path) -> bool:
+    """Extract one BL30K segment tar into ``extract_dir``.
+
+    Args:
+        tar_path:    Path to the .tar archive.
+        extract_dir: Destination directory.
+
+    Returns:
+        ``True`` on success, ``False`` on failure.
+    """
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Extracting %s → %s …", tar_path.name, extract_dir)
+    try:
+        with tarfile.open(tar_path, "r") as tar:
+            members = tar.getmembers()
+            LOGGER.info("  Members in archive: %d", len(members))
+            tar.extractall(path=extract_dir)
+        LOGGER.info("Extraction complete: %s", tar_path.name)
+        return True
+    except Exception as exc:
+        LOGGER.error("Extraction failed for %s: %s", tar_path.name, exc)
+        return False
+
+
+def process_segment(
+    segment: str,
+    download_dir: Path,
+    extract_dir: Path,
+    cleanup: bool,
+    url: str | None = None,
+) -> bool:
+    """Download, extract, and optionally delete one segment.
+
+    Args:
+        segment:      Segment letter.
+        download_dir: Where to save the tar.
+        extract_dir:  Where to extract.
+        cleanup:      Delete tar after successful extraction.
+        url:          Optional URL override.
+
+    Returns:
+        ``True`` if the segment was fully processed, ``False`` otherwise.
+    """
+    tar_path = download_dir / f"BL30K_{segment}.tar"
+    already_extracted = _segment_already_extracted(segment, extract_dir)
+
+    if already_extracted:
+        LOGGER.info("[%s] Already extracted — skipping.", segment)
+        return True
+
+    # Download if tar not already on disk
+    if not tar_path.exists():
+        tar_path = download_segment(segment, download_dir, url=url)
+        if tar_path is None:
+            return False
+
+    ok = extract_segment(tar_path, extract_dir)
+    if not ok:
+        return False
+
+    if cleanup:
+        LOGGER.info("[%s] Removing tar %s …", segment, tar_path)
+        tar_path.unlink()
+
+    return True
+
+
+def _segment_already_extracted(segment: str, extract_dir: Path) -> bool:
+    """Heuristic: segment is extracted if its top-level subdir exists and is non-empty."""
+    candidate = extract_dir / f"BL30K_{segment}"
+    if candidate.is_dir() and any(candidate.iterdir()):
+        return True
+    # Also handle flat layout where all sequences land directly in extract_dir
+    # (for segment 'a' only, as older tarballs may not have a subdirectory).
+    return False
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download + extract the full BL30K dataset (all 6 segments)."
+    )
+    parser.add_argument(
+        "--segments",
+        nargs="+",
+        default=ALL_SEGMENTS,
+        choices=ALL_SEGMENTS,
+        metavar="SEGMENT",
+        help="Which segments to download (default: all — a b c d e f).",
+    )
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=DEFAULT_DOWNLOAD_DIR,
+        help=f"Directory to save .tar files (default: {DEFAULT_DOWNLOAD_DIR}).",
+    )
+    parser.add_argument(
+        "--extract-dir",
+        type=Path,
+        default=DEFAULT_EXTRACT_DIR,
+        help=f"Where to extract the dataset (default: {DEFAULT_EXTRACT_DIR}).",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Delete each .tar after successful extraction (saves ~120 GB per segment).",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip download; go straight to extraction (tars must already exist).",
+    )
+    # Backward-compat alias: --download-path maps to --download-dir
+    parser.add_argument(
+        "--download-path",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,  # legacy; use --download-dir
+    )
+    args = parser.parse_args()
+
+    # Legacy compatibility: if --download-path passed, derive download-dir from it
+    if args.download_path is not None:
+        args.download_dir = args.download_path.parent
+
+    LOGGER.info("=== BL30K Full Dataset Downloader ===")
+    LOGGER.info("  Segments  : %s", args.segments)
+    LOGGER.info("  Download  : %s", args.download_dir)
+    LOGGER.info("  Extract   : %s", args.extract_dir)
+    LOGGER.info("  Cleanup   : %s", args.cleanup)
+    LOGGER.info("  Total     : ~%d GB", 120 * len(args.segments))
+
+    failed: list[str] = []
+
+    for seg in args.segments:
+        LOGGER.info("")
+        LOGGER.info("─── Segment %s (%d / %d) ───", seg, args.segments.index(seg) + 1, len(args.segments))
+
+        if args.skip_download:
+            tar_path = args.download_dir / f"BL30K_{seg}.tar"
+            ok = extract_segment(tar_path, args.extract_dir)
+            if not ok:
+                failed.append(seg)
+            elif args.cleanup and tar_path.exists():
+                tar_path.unlink()
+        else:
+            ok = process_segment(
+                segment=seg,
+                download_dir=args.download_dir,
+                extract_dir=args.extract_dir,
+                cleanup=args.cleanup,
+            )
+            if not ok:
+                failed.append(seg)
+
+    LOGGER.info("")
+    if failed:
+        LOGGER.error("=== FAILED segments: %s ===", failed)
+        raise SystemExit(1)
+
+    LOGGER.info("=== Done — all segments processed successfully ===")
+
 
 if __name__ == "__main__":
-    # Settings based on user request (Disk E for download, project dir for extraction)
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    project_root = Path(base_dir).parent
-    
-    # Target file on disk E
-    download_dir_e = Path("E:/")
-    download_file_e = download_dir_e / "BL30K_a.tar"
-    
-    # Target extraction dir in project
-    target_extract_dir = project_root / "data" / "BL30K"
-    
-    print(f"--- BL30K Downloader (Disk E -> Disk C) ---")
-    print(f"TEMP DOWNLOAD: {download_file_e} (Needs ~108GB on Disk E)")
-    print(f"EXTRACTION: {target_extract_dir} (Needs ~115GB on Disk C)")
-    
-    choice = input(f"Proceed? (y/n): ")
-    if choice.lower() == 'y':
-        download_and_extract_bl30k(download_file_e, target_extract_dir)
-    else:
-        print("Aborted.")
+    main()

@@ -1,0 +1,59 @@
+# @package _global_
+#
+# Phase 2 (Optional) — BL30K Synthetic Video Pre-training
+#
+# Bridge between COCO (static) and DAVIS/YTVOS (real video).
+# Initialise from Phase 1 (COCO) checkpoint from job 65777196.
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: bl30k
+
+# Weight-only transfer from Phase 1 (COCO) checkpoint.
+# Uses pretrained_weights (not checkpoint) so optimizer state and epoch counter
+# are reset — BL30K is a new training phase, not a resume.
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/last-v1.ckpt
+
+model:
+  learning_rate: 5.0e-5
+  mv2_freeze_at: 2              # keep stages 0+1 frozen
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 2
+  lr_warmup_start_factor: 0.1
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 5.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 5.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 50
+  limit_train_batches: 2000     # BL30K is large — 2000 steps/epoch should suffice for stable gradients
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 4    # batch 2 * 4 = 8
+
+callbacks:
+  model_checkpoint:
+    monitor: val_loss
+    mode: min
+    filename: "best_slim_v2_phase2_bl30k"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
