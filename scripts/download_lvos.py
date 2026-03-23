@@ -52,17 +52,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Each entry: (google_drive_file_id, local_filename, split_key)
 LVOS_FILES: dict[str, list[tuple[str, str]]] = {
     "train": [
-        # Training images (two parts, ~15 GB each)
-        ("1SVDm6B-lrqXBjzCbNfE-IDsIFOlLXKKM", "train_images_part1.zip"),
-        ("1TDiS3OBbkBs4Q3bKbYJBQtVJaWd2ClvN", "train_images_part2.zip"),
-        # Training annotations (~1.5 GB)
-        ("1q2MmM3RB6U4DWH5Dfu60h4BpDf-Kvv2a", "train_annotations.zip"),
+        # Training images + annotations bundled together
+        # Source: https://lingyihongfd.github.io/lvos.github.io/dataset.html
+        ("1-ehpl5s0Fd14WwtT-GmWtIWa_BxZl9D6", "train.zip"),
     ],
     "valid": [
-        # Validation images (~12 GB)
-        ("1RfBaLCa7tGPITBvJXEgjRkLxFgobDhxt", "valid_images.zip"),
-        # Validation annotations (~500 MB)
-        ("1tJVLrFSEfmzJvBVKTzVDAMpGqlvGz4RA", "valid_annotations.zip"),
+        # Validation images + annotations bundled together
+        ("17Hwc__6i2rpF5e2s5OPqoywNxG5bzlcO", "valid.zip"),
     ],
 }
 
