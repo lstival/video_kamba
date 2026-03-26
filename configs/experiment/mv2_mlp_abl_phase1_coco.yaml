@@ -1,0 +1,69 @@
+# @package _global_
+#
+# Phase 1 — COCO Pre-training  │  MLP Ablation Baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+# Mirrors mv2_ssm_mem_phase1_coco.yaml exactly.
+# The ONLY structural difference is the model override:
+#   model: mv2_mlp_ablation  →  modulator_type=mlp, fusion_mode=concat
+#
+# Fairness constraints:
+#   - Same dataset (COCO pseudo-video), batch_size, limit_train_batches
+#   - Same optimiser: AdamW + OneCycleLR, lr=1e-4
+#   - Same backbone freeze (mv2_freeze_at=2)
+#   - Same gradient clip, precision, accumulate_grad_batches
+#   - Same number of epochs (20)
+#
+# Output checkpoint:  checkpoints/mlp_ablation/best_mlp_abl_phase1_coco.ckpt
+# Comet project:      video-mamba  |  tags: mlp-ablation, phase1, coco
+#
+# Gate for Phase 2:
+#   val_loss < 0.50 @ epoch 10  →  proceed to Phase 2 (DAVIS)
+#   val_loss ≥ 0.50             →  check LR warmup / data pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_mlp_ablation
+
+datamodule:
+  batch_size: 8
+
+model:
+  learning_rate: 1.0e-4
+  mv2_freeze_at: 2
+  optimizer_weight_decay: 0.05
+  use_checkpointing: true
+  use_identity_modulation: true
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 1.0e-4
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 1.0e-4
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 20
+  limit_train_batches: 3000
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 1
+
+callbacks:
+  model_checkpoint:
+    monitor: val_loss
+    mode: min
+    filename: "best_mlp_abl_phase1_coco"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/mlp_ablation

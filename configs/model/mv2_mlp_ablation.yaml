@@ -1,0 +1,84 @@
+_target_: models.video_mamba.VideoMambaSystem
+
+# ── Ablation identity ──────────────────────────────────────────────────────────
+# This config is the MLP baseline for the KAN ablation (Table 1 in the paper).
+# It is IDENTICAL to mv2_ssm_memory.yaml in every dimension EXCEPT the two
+# KAN-specific flags below.  Any deviation from mv2_ssm_memory.yaml outside
+# those flags is a confounder and must not be introduced.
+#
+# KAN components removed:
+#   1. modulator_type: mlp   → replaces FastKANModulator (RBF splines) with
+#                              MLPModulator (2-layer dense MLP) inside every
+#                              DiagonalKANSSMCore layer.
+#   2. fusion_mode: concat   → replaces KANSpatialGatingUpBlock with
+#                              ConcatUpBlock (Conv+BN+ReLU) in the decoder.
+#
+# Everything else — backbone, SSM depth/width, decoder dims, LR groups,
+# scheduled sampling — is kept identical so that the only independent variable
+# is the KAN modulation mechanism.
+
+# ── Encoder ───────────────────────────────────────────────────────────────────
+encoder_type: mobilenetv2
+dim_in: 256
+dim_out: 256
+
+dim_in_fine: 96
+dim_in_s2: 32
+dim_in_s1: 24
+
+mv2_output_stride: 16
+mv2_freeze_at: 0
+mv2_pretrained: true
+
+# ── Task heads ────────────────────────────────────────────────────────────────
+num_clf_classes: 51
+num_seg_classes: 11
+num_boxes: 10
+
+# ── Resolution ────────────────────────────────────────────────────────────────
+target_size: 480
+
+# ── Memory + Feature Fusion ───────────────────────────────────────────────────
+memory_update_freq: 1
+
+# ── MLP-SSM Temporal (ablation) ───────────────────────────────────────────────
+ssm_d_state: 16
+ssm_layers: 2
+modulator_type: mlp          # ← ABLATION: MLPModulator instead of FastKANModulator
+use_checkpointing: false
+use_ref_context: true
+use_identity_modulation: false
+consistency_weight: 0.0
+fusion_mode: concat          # ← ABLATION: ConcatUpBlock instead of KANSpatialGatingUpBlock
+
+# ── Dual-Timescale State Memory (DTSM) ────────────────────────────────────────
+# Disabled — ablation is on the fast SSM path only. DTSM is a separate
+# contribution that adds the slow path; it must not conflate the KAN ablation.
+use_dual_timescale_memory: false
+slow_ssm_d_state: 64
+slow_ssm_log_a_init: -3.0
+
+# ── Decoder ───────────────────────────────────────────────────────────────────
+dec_dim_up1: 192
+dec_dim_up2: 96
+dec_dim_up3: 48
+
+# ── LR Groups ─────────────────────────────────────────────────────────────────
+learning_rate: 1.0e-4
+temporal_lr_multiplier: 0.5
+trainable_backbone_lr_multiplier: 0.05
+frozen_backbone_lr_multiplier: 0.0
+optimizer_weight_decay: 0.05
+scheduler_eta_min: 1.0e-6
+
+# ── Scheduled Sampling ────────────────────────────────────────────────────────
+scheduled_sampling_rate: 0.0
+scheduled_sampling_start: -1.0
+scheduled_sampling_end: -1.0
+scheduled_sampling_warmup_epochs: 0
+
+# ── Training schedule defaults ────────────────────────────────────────────────
+max_epochs: 50
+lr_warmup_epochs: 0
+lr_warmup_start_factor: 0.1
+vos_loss_beta: 0.5

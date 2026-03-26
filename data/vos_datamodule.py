@@ -27,6 +27,7 @@ References:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import random
@@ -575,6 +576,130 @@ def _vos_collate(batch: List[Dict]) -> Tuple:
     return ref_imgs, ref_masks, query_imgs, query_masks, seq_names
 
 
+def _build_obj_present(query_masks: torch.Tensor, n_id: int) -> torch.Tensor:
+    """Build a boolean [T, n_id] tensor: True when object k+1 is visible in frame t.
+
+    Args:
+        query_masks: Integer mask tensor ``[T, H, W]`` with values 0..n_id.
+        n_id:        Number of object ID slots.
+
+    Returns:
+        Boolean tensor ``[T, n_id]``.
+    """
+    T = query_masks.shape[0]
+    obj_present = torch.zeros(T, n_id, dtype=torch.bool)
+    for t in range(T):
+        for k in range(1, n_id + 1):
+            obj_present[t, k - 1] = (query_masks[t] == k).any()
+    return obj_present
+
+
+def _joint_vos_collate(batch: List[Dict], n_id: int = 10) -> Tuple:
+    """Collate joint DAVIS / YouTube-VOS / LVOS batches into a unified 6-tuple.
+
+    Every sample receives an ``obj_present`` tensor — computed on-the-fly from
+    masks for DAVIS / YouTube-VOS samples that lack it, taken directly from
+    LVOS samples that already carry it.  All tensors are padded or truncated to
+    exactly ``n_id`` slots so the stacked shape is always ``[B, T, n_id]``.
+
+    Args:
+        batch: List of sample dicts from the dataset.
+        n_id:  Number of object ID slots (must match ``model.num_seg_classes - 1``).
+               Passed via ``functools.partial`` from ``train_dataloader``.
+
+    Returns:
+        ``(ref_imgs, ref_masks, query_imgs, query_masks, obj_present, meta)``
+        matching the :func:`~models.video_mamba.VideoMambaSystem._vos_step` format.
+    """
+    ref_imgs    = torch.stack([b["ref_img"]     for b in batch])
+    ref_masks   = torch.stack([b["ref_mask"]    for b in batch])
+    query_imgs  = torch.stack([b["query_imgs"]  for b in batch])
+    query_masks = torch.stack([b["query_masks"] for b in batch])
+
+    obj_presents: List[torch.Tensor] = []
+    for b in batch:
+        if "obj_present" in b:
+            obj_presents.append(b["obj_present"])  # [T, n_id] from LVOS
+        else:
+            qm = b["query_masks"]                   # [T, H, W]
+            # Exclude void/ignore label (255) before computing the object count.
+            # Without this guard, a DAVIS mask with ignore pixels returns
+            # n_id=255, blowing up obj_present to [T, 255].
+            valid = qm[qm != 255]
+            sample_max = int(valid.max().item()) if valid.numel() > 0 else 0
+            sample_n_id = max(sample_max, 1)
+            obj_presents.append(_build_obj_present(qm, sample_n_id))
+
+    # Pad or truncate every tensor to exactly n_id so the batch can be stacked.
+    padded = []
+    for op in obj_presents:
+        current = op.shape[1]
+        if current < n_id:
+            pad = torch.zeros(op.shape[0], n_id - current, dtype=torch.bool)
+            op = torch.cat([op, pad], dim=1)
+        elif current > n_id:
+            op = op[:, :n_id]
+        padded.append(op)
+
+    obj_present = torch.stack(padded)  # [B, T, n_id]
+    meta = [b["meta"] for b in batch]
+    return ref_imgs, ref_masks, query_imgs, query_masks, obj_present, meta
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LVOS — training adapter (wraps LVOSClipDataset to dict format)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LVOSVOSTrain(Dataset):
+    """Thin adapter wrapping :class:`data.lvos_finetune.LVOSClipDataset`.
+
+    Converts the 6-tuple output of ``LVOSClipDataset`` to the dict schema used
+    by :class:`DAVISVOSTrain` and :class:`YouTubeVOSTrain`, adding an
+    ``obj_present`` key so :func:`_joint_vos_collate` can unify all datasets
+    into the 6-element multi-object VOS batch format.
+
+    Args:
+        data_dir:    Path to the LVOS root (contains ``train/`` and ``valid/``).
+        clip_len:    Query frames per clip.
+        max_gap:     Maximum frame stride (LVOS long clips benefit from ≥5).
+        output_size: Spatial resolution.
+        n_id:        Number of object ID slots (must match model ``num_seg_classes - 1``).
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        clip_len: int = 4,
+        max_gap: int = 5,
+        output_size: int = 224,
+        n_id: int = 10,
+    ) -> None:
+        super().__init__()
+        from data.lvos_finetune import LVOSClipDataset
+        self._ds = LVOSClipDataset(
+            data_dir=data_dir,
+            split="train",
+            clip_len=clip_len,
+            max_gap=max_gap,
+            output_size=output_size,
+            n_id=n_id,
+        )
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> Dict:
+        ref_img, ref_mask, query_imgs, query_masks, obj_present, meta = self._ds[idx]
+        return {
+            "ref_img":     ref_img,
+            "ref_mask":    ref_mask,
+            "query_imgs":  query_imgs,
+            "query_masks": query_masks,
+            "obj_present": obj_present,
+            "meta":        meta,
+        }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LightningDataModule
 # ══════════════════════════════════════════════════════════════════════════════
@@ -633,6 +758,10 @@ class VOSDataModule(L.LightningDataModule):
         train_color_jitter_prob: float = 0.8,
         bl30k_root: Optional[str] = None,
         bl30k_sampling_ratio: float = 0.25,
+        lvos_root: Optional[str] = None,
+        lvos_sampling_ratio: float = 0.25,
+        lvos_max_gap: int = 5,
+        lvos_n_id: int = 10,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -654,6 +783,10 @@ class VOSDataModule(L.LightningDataModule):
         self.train_color_jitter_prob = train_color_jitter_prob
         self.bl30k_root           = bl30k_root
         self.bl30k_sampling_ratio = bl30k_sampling_ratio
+        self.lvos_root            = lvos_root
+        self.lvos_sampling_ratio  = lvos_sampling_ratio
+        self.lvos_max_gap         = lvos_max_gap
+        self.lvos_n_id            = lvos_n_id
 
         self._train_ds: Optional[Dataset] = None
         self._val_ds:   Optional[Dataset] = None
@@ -705,37 +838,49 @@ class VOSDataModule(L.LightningDataModule):
                     augmentor  = train_aug,
                 )
                 datasets.append(bl30k_train)
-                # If we have DAVIS, YTV and BL30K, we need to balance them.
-                # Assume bl30k_sampling_ratio is applied from the total.
+
+            lvos_train = None
+            if self.lvos_root is not None and Path(self.lvos_root).exists():
+                lvos_train = LVOSVOSTrain(
+                    data_dir    = str(self.lvos_root),
+                    clip_len    = self.clip_len,
+                    max_gap     = self.lvos_max_gap,
+                    output_size = self.output_size,
+                    n_id        = self.lvos_n_id,
+                )
+                datasets.append(lvos_train)
 
             if len(datasets) > 1:
                 from torch.utils.data import ConcatDataset
                 self._train_ds = ConcatDataset(datasets)
 
-                # Dynamic weights based on target ratios
-                # Suppose we want: 
-                # DAVIS: r_d, BL30K: r_bl, YTV: 1 - r_d - r_bl
-                r_d = self.davis_sampling_ratio
+                # Normalise sampling ratios across all active datasets.
+                # Any dataset with root=None contributes ratio=0.
+                r_d  = self.davis_sampling_ratio
                 r_bl = self.bl30k_sampling_ratio if self.bl30k_root else 0.0
-                r_y = 1.0 - r_d - r_bl
-                
-                # Normalize ratios if they exceed 1.0
-                total_r = r_d + r_bl + (r_y if self.ytv_root else 0.0)
-                r_d /= total_r
-                r_bl /= total_r
-                r_y /= total_r
+                r_lv = self.lvos_sampling_ratio  if self.lvos_root  else 0.0
+                r_y  = max(0.0, 1.0 - r_d - r_bl - r_lv)  # remainder to YTB
 
-                n_d = len(davis_train)
-                n_bl = len(bl30k_train) if self.bl30k_root else 1
-                n_y = len(ytv_train) if self.ytv_root else 1
+                total_r = r_d + r_bl + r_lv + (r_y if self.ytv_root else 0.0)
+                if total_r > 0:
+                    r_d  /= total_r
+                    r_bl /= total_r
+                    r_lv /= total_r
+                    r_y  /= total_r
 
-                weights = []
-                if self.davis_root:
-                    weights += [r_d / n_d] * n_d
+                n_d  = len(davis_train)
+                n_bl = len(bl30k_train) if (self.bl30k_root and Path(self.bl30k_root).exists()) else 1
+                n_y  = len(ytv_train)   if (self.ytv_root   and Path(self.ytv_root).exists())   else 1
+                n_lv = len(lvos_train)  if lvos_train is not None else 1
+
+                weights: List[float] = []
+                weights += [r_d  / n_d]  * n_d
                 if self.ytv_root and Path(self.ytv_root).exists():
-                    weights += [r_y / n_y] * n_y
+                    weights += [r_y  / n_y]  * n_y
                 if self.bl30k_root and Path(self.bl30k_root).exists():
                     weights += [r_bl / n_bl] * n_bl
+                if lvos_train is not None:
+                    weights += [r_lv / n_lv] * n_lv
 
                 self._sampler = WeightedRandomSampler(
                     weights,
@@ -743,8 +888,10 @@ class VOSDataModule(L.LightningDataModule):
                     replacement=True,
                 )
                 LOGGER.info(
-                    f"[VOSDataModule] Joint Training: {[len(ds) for ds in datasets]} samples | "
-                    f"Ratios: DAVIS={r_d:.1%}, YTV={r_y:.1%}, BL30K={r_bl:.1%}"
+                    "[VOSDataModule] Joint Training: dataset sizes=%s | "
+                    "Ratios: DAVIS=%.1f%% YTV=%.1f%% BL30K=%.1f%% LVOS=%.1f%%",
+                    [len(ds) for ds in datasets],
+                    r_d * 100, r_y * 100, r_bl * 100, r_lv * 100,
                 )
             else:
                 self._train_ds = davis_train
@@ -765,15 +912,18 @@ class VOSDataModule(L.LightningDataModule):
     # ── loaders ────────────────────────────────────────────────────────────────
 
     def train_dataloader(self) -> DataLoader:
-        # Use WeightedRandomSampler for joint DAVIS+YTB (shuffle=True is
+        # Use WeightedRandomSampler for joint datasets (shuffle=True is
         # mutually exclusive with a custom sampler).
+        # _joint_vos_collate is used when LVOS is in the mix (6-element format).
+        # _vos_collate is used for DAVIS-only / DAVIS+YTB (5-element format).
+        use_joint = self.lvos_root is not None and Path(self.lvos_root).exists()
         return DataLoader(
             self._train_ds,
             batch_size  = self.batch_size,
-            sampler     = self._sampler,   # None → default sequential, shuffle below
+            sampler     = self._sampler,
             shuffle     = self._sampler is None,
             num_workers = self.num_workers,
-            collate_fn  = _vos_collate,
+            collate_fn  = functools.partial(_joint_vos_collate, n_id=self.lvos_n_id) if use_joint else _vos_collate,
             pin_memory  = True,
             drop_last   = True,
         )

@@ -1,0 +1,102 @@
+# @package _global_
+#
+# Phase 3 — YouTube-VOS Fine-tuning from BL30K (MobileNetV2 + KAN-SSM + DTSM)
+#
+# Branches directly from BL30K Phase 1b checkpoint (best_slim_v2_phase2_bl30k-v2.ckpt),
+# parallel to the LVOS and DAVIS Phase 3 branches.  This produces a YouTube-VOS
+# specialised model for the YouTube-VOS 2019 val evaluation.
+#
+# Key decisions:
+#   ── pretrained_weights (not checkpoint_path): resets optimizer for clean
+#      domain shift from BL30K synthetic → YouTube-VOS real video.
+#   ── mv2_freeze_at: 1: BL30K adapted stage 2; unfreezing it helps with the
+#      large appearance diversity in YouTube-VOS (3.4k train sequences).
+#   ── DTSM enabled: YouTube-VOS has longer clips than DAVIS — the slow SSM
+#      path is directly exercised.
+#   ── limit_train_batches: 3500 (matches the prior joint ytbdav config;
+#      YouTube-VOS is large so 3500 steps/epoch is appropriate).
+#   ── scheduled_sampling 0.1 → 0.4: ramp over 5 epochs teaches the model to
+#      handle imperfect memory on the diverse YouTube-VOS categories.
+#   ── max_epochs: 50 (YouTube-VOS converges faster than DAVIS due to dataset
+#      size; monitor val_J_and_F for early stopping).
+#
+# Gate decision @ epoch 30 (check Comet):
+#   val_J_and_F > 0.65 → checkpoint is good
+#   val_J_and_F < 0.65 → investigate slow SSM or LR schedule
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: youtubevos
+
+# Weight-only transfer from BL30K checkpoint (resets optimizer).
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase2_bl30k-v2.ckpt
+
+model:
+  learning_rate: 3.0e-5
+  mv2_freeze_at: 1              # unfreeze stage 2 for YouTube-VOS appearance diversity
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3           # warmup after BL30K → YouTube-VOS domain shift
+  lr_warmup_start_factor: 0.1
+  # ── DTSM: keep enabled (inherited from BL30K pre-training) ───────────────
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
+  # ── Scheduled sampling ramp ───────────────────────────────────────────────
+  scheduled_sampling_start: 0.1
+  scheduled_sampling_end: 0.4
+  scheduled_sampling_warmup_epochs: 5
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 50
+  limit_train_batches: 3500     # YouTube-VOS: ~3.4k train seqs; 3500 steps/epoch
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2    # effective batch = 2×2 = 4
+
+callbacks:
+  model_checkpoint:
+    monitor: val_vos_J_and_F
+    mode: max
+    filename: "best_slim_v2_phase3_ytb"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
+
+  spike_diagnostics:
+    log_path: ${work_dir}/logs/spike_diagnostics_phase3_ytb.jsonl
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms/phase3_ytb
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "temporal_model_slow"
+      - "memory_bank_slow"
+      - "slow_residual_proj"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_fusion"

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=train_lvos_p3
+#SBATCH --job-name=train_ytb_p3
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -7,21 +7,16 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --time=72:00:00
-#SBATCH --output=logs/slurm/lvos_p3_train_%j.out
+#SBATCH --output=logs/slurm/ytb_p3_train_%j.out
 
 # ============================================================
-#  LVOS V2 Phase 3 Training — Long-range DTSM Fine-tuning
+#  YouTube-VOS Phase 3 Training — Fine-tuning from BL30K
 #
-#  Requires:
-#    1. Phase 1b BL30K checkpoint (best_slim_v2_phase2_bl30k.ckpt)
-#    2. LVOS V2 dataset at data/LVOS (or symlinked from Lustre)
-#       Run scripts/slurm_setup_lvos_lustre.sh first.
+#  Branches from best_slim_v2_phase2_bl30k-v2.ckpt (job 65781828).
+#  Parallel to LVOS and DAVIS Phase 3 branches.
 #
-#  Submit (depends on Phase 1b job 65781828):
-#    sbatch --dependency=afterok:65781828 scripts/slurm_train_lvos_phase3_lustre.sh
-#
-#  Submit (manual, after Phase 1b completes):
-#    sbatch scripts/slurm_train_lvos_phase3_lustre.sh
+#  Submit:
+#    sbatch scripts/slurm_train_ytb_phase3_lustre.sh
 # ============================================================
 
 set -euo pipefail
@@ -43,38 +38,37 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
 fi
 
 echo "=========================================="
-echo "  LVOS Phase 3 Training"
+echo "  YouTube-VOS Phase 3 Training"
 echo "  Job ID : ${SLURM_JOB_ID:-manual}"
 echo "  Node   : $(hostname)"
 echo "  Start  : $(date)"
 echo "=========================================="
 echo ""
 
-# Verify Phase 1b checkpoint exists — use -v2 (best as of job 65781828 step ~18k)
+# Verify BL30K checkpoint exists
 CKPT="${PROJECT_ROOT}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase2_bl30k-v2.ckpt"
 if [ ! -f "${CKPT}" ]; then
-    echo "ERROR: Phase 1b checkpoint not found: ${CKPT}"
-    echo "       Ensure Phase 1b (BL30K) training completed before running this job."
+    echo "ERROR: BL30K checkpoint not found: ${CKPT}"
+    echo "       Ensure BL30K Phase 1b training (job 65781828) completed."
     exit 1
 fi
-echo "  Phase 1b checkpoint : ${CKPT}"
+echo "  BL30K checkpoint : ${CKPT}"
 
-# Verify LVOS data is present
-LVOS_DIR="${PROJECT_ROOT}/data/LVOS"
-if [ ! -d "${LVOS_DIR}/train/JPEGImages" ]; then
-    echo "ERROR: LVOS train data not found at ${LVOS_DIR}/train/JPEGImages"
-    echo "       Run: sbatch scripts/slurm_setup_lvos_lustre.sh"
+# Verify YouTube-VOS data is present
+YTV_DIR="${PROJECT_ROOT}/data/YouTubeVOS"
+if [ ! -d "${YTV_DIR}/train/JPEGImages" ]; then
+    echo "ERROR: YouTube-VOS train data not found at ${YTV_DIR}/train/JPEGImages"
     exit 1
 fi
-echo "  LVOS data           : ${LVOS_DIR}"
+echo "  YouTube-VOS data : ${YTV_DIR}"
 echo ""
 
 # Run Phase 3 training
 python train.py \
-    datamodule=lvos \
-    +experiment=mv2_ssm_mem_phase3_lvos \
+    datamodule=youtubevos \
+    +experiment=mv2_ssm_mem_phase3_ytb \
     pretrained_weights="${CKPT}" \
-    trainer.max_epochs=60 \
+    trainer.max_epochs=50 \
     trainer.precision="bf16-mixed"
 
 echo ""

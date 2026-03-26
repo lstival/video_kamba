@@ -250,8 +250,6 @@ class VideoMambaSystem(L.LightningModule):
                 std=0.02 / math.sqrt(2),
             )
         
-        # Object ID Embedding for associative identity tracking
-        self.obj_id_embedding = nn.Embedding(num_seg_classes, dim_in)
         self.clf_head = ClassificationHead(dim_in=dim_in, num_classes=num_clf_classes)
         self.detection_head = DetectionHead(dim_in=dim_in, num_classes=num_clf_classes, num_boxes=num_boxes)
         # For multi-scale trainable encoders the decoder skips use
@@ -273,6 +271,24 @@ class VideoMambaSystem(L.LightningModule):
         # Keeping self.memory_bank as a reference to self.memory_bank_local for compat if needed.
         self.memory_bank = self.memory_bank_local
         self.feature_fusion = FeatureFusion(d_model=dim_in)
+
+        # Spatial identity encoding: one-hot object masks → patch-level embeddings.
+        # Conv2d with stride=16 downsamples naturally to the patch grid — no attention.
+        # Injected additively into query features at every propagation frame, giving
+        # the SSM a persistent per-object signal analogous to AOTT's id_bank.
+        # See: AOTT (Hierarchical Propagation), Kim et al., NeurIPS 2022.
+        # Input : [B, num_seg_classes, H, W]  (one-hot mask at full resolution)
+        # Output: [B, dim_in, H//16, W//16]   (patch-grid identity embeddings)
+        self.patch_wise_id_bank = nn.Conv2d(
+            num_seg_classes, dim_in, kernel_size=17, stride=16, padding=8, bias=False
+        )
+        nn.init.normal_(self.patch_wise_id_bank.weight, std=0.02)
+
+        # Inter-block carry state for sliding-window eval (reset_memory=False path).
+        # Not model parameters — cleared between sequences by reset_carry_state().
+        self._carry_prev_mask_int: Optional[torch.Tensor] = None  # [B, H, W] cpu
+        self._carry_prev_patch: Optional[torch.Tensor] = None      # [B, P, D] cpu
+        self._carry_gh_gw: Optional[tuple[int, int]] = None
 
         self.vos_loss_fn = HybridVOSLoss(beta=vos_loss_beta, from_logits=True)
 
@@ -436,6 +452,21 @@ class VideoMambaSystem(L.LightningModule):
         return max(0.0, min(1.0, rate))
 
     # ------------------------------------------------------------------
+    # Inter-block carry state management (eval / long-video inference)
+    # ------------------------------------------------------------------
+
+    def reset_carry_state(self) -> None:
+        """Clear the inter-block carry state.
+
+        Must be called between sequences when using ``reset_memory=False`` in
+        :meth:`forward` for sliding-window inference, so that stale state from
+        one sequence does not bleed into the next.
+        """
+        self._carry_prev_mask_int = None
+        self._carry_prev_patch = None
+        self._carry_gh_gw = None
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -445,6 +476,7 @@ class VideoMambaSystem(L.LightningModule):
         ref_frame: torch.Tensor = None,
         ref_mask: torch.Tensor = None,
         query_masks: torch.Tensor = None,
+        reset_memory: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass: memory-attention propagation followed by KAN-SSM refinement.
 
@@ -470,6 +502,12 @@ class VideoMambaSystem(L.LightningModule):
             query_masks: Ground-truth query masks ``[B, T, H, W]``.  Required
                          only during training for scheduled-sampling on memory
                          updates; may be ``None`` at evaluation.
+            reset_memory: When ``True`` (default / training), seeds the SSM
+                         memory banks from the reference frame and clears the
+                         carry state.  Set ``False`` for all blocks after the
+                         first during sliding-window long-video inference so
+                         that DTSM slow-path state and the prev-frame context
+                         carry across block boundaries.
 
         Returns:
             Tuple ``(logits_clf, pred_boxes, pred_box_logits, logits_seg)``
@@ -486,106 +524,166 @@ class VideoMambaSystem(L.LightningModule):
         D, P = query_patch.shape[2], query_patch.shape[3]
 
         if self.hparams.use_ref_context and ref_frame is not None and ref_mask is not None:
-            # ── 2. Reference feature extraction ────────────────────────
-            _ref_cls, _ref_features_raw = self.feature_extractor(ref_frame.unsqueeze(1))
-            _ref_features_ms = self._map_ms_features(_ref_features_raw)
-            ref_patch = _ref_features_ms["stage_3"]  # [B, 1, dim_in, P]
-            ref_patch_hw = _ref_features_ms.get("stage_3_hw")
-            # [B, 1, D, P] → [B, P, D]
-            ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
 
-            # --- Identity Vector Extraction (Option 1) ---
-            identity_vec = None
-            if self.hparams.use_identity_modulation:
-                # Pool reference features using the reference mask to get global object identity
-                # Mask downsampling [B, H, W] -> [B, 1, gh, gw] -> [B, P]
+            _use_carry = (
+                not reset_memory
+                and self._carry_prev_mask_int is not None
+                and self._carry_gh_gw is not None
+            )
+
+            if not _use_carry:
+                # ── 2. Reference feature extraction ──────────────────────────────
+                _ref_cls, _ref_features_raw = self.feature_extractor(ref_frame.unsqueeze(1))
+                _ref_features_ms = self._map_ms_features(_ref_features_raw)
+                ref_patch = _ref_features_ms["stage_3"]   # [B, 1, dim_in, P]
+                ref_patch_hw = _ref_features_ms.get("stage_3_hw")
+                # [B, 1, D, P] → [B, P, D]
+                ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)
+
+                # Patch-grid spatial dimensions (for identity embedding alignment)
                 if ref_patch_hw is not None:
                     gh, gw = ref_patch_hw
                 else:
                     gh, gw = H // 16, W // 16
-                m_down = F.interpolate(ref_mask.unsqueeze(1).float(), size=(gh, gw), mode='bilinear', align_corners=False)
-                m_down = (m_down.reshape(B, -1) > 0.5).float() # [B, P]
-                # Weighted average: [B, P, D] * [B, P, 1] -> [B, D]
-                # We use sum / (sum + eps) for stabilization
-                denom = m_down.sum(dim=1, keepdim=True) + 1e-6
-                identity_vec = (ref_patch_p * m_down.unsqueeze(-1)).sum(dim=1) / denom # [B, D]
-                
-                # Associative ID mixing: Enhance visual identity with learned object-ID tokens
-                id_tokens = self.obj_id_embedding(torch.arange(B, device=self.device) % self.hparams.num_seg_classes)
-                identity_vec = identity_vec + id_tokens # [B, D]
+                self._carry_gh_gw = (gh, gw)
 
-            # ── 3. Initialise memory bank with reference frame ──────────
-            # Seed both SSM states from reference frame
-            ref_fused = self.feature_fusion(ref_patch_p, ref_patch_p)  # self-fusion
-            ref_flat = ref_fused.reshape(B * P, 1, D)
-            
-            # Broadcast identity_vec for seeding: [B, D] -> [B*P, D]
-            id_seeding = None
-            if identity_vec is not None:
-                id_seeding = identity_vec.unsqueeze(1).repeat(1, P, 1).view(B * P, D)
+                # ── Spatial identity encoding from reference mask ─────────────────
+                ref_mask_safe = ref_mask.clone()
+                ref_mask_safe[ref_mask == 255] = 0
+                ref_onehot = (
+                    F.one_hot(ref_mask_safe.long(), num_classes=self.hparams.num_seg_classes)
+                    .permute(0, 3, 1, 2)
+                    .float()
+                )  # [B, num_seg_classes, H, W]
+                ref_id_embed = self.patch_wise_id_bank(ref_onehot)  # [B, D, ~gh, ~gw]
+                if ref_id_embed.shape[-2:] != (gh, gw):
+                    ref_id_embed = F.adaptive_avg_pool2d(ref_id_embed, (gh, gw))
+                ref_id_flat = ref_id_embed.flatten(2).permute(0, 2, 1)  # [B, P, D]
 
-            _, ref_h_local = self.temporal_model_local(ref_flat, prev_states=None, return_last_state=True, identity=id_seeding)
-            _, ref_h_global = self.temporal_model_global(ref_flat, prev_states=None, return_last_state=True, identity=id_seeding)
-            
-            self.memory_bank_local.reset()
-            self.memory_bank_global.reset()
-            self.memory_bank_local.set_state(ref_h_local)
-            self.memory_bank_global.set_state(ref_h_global)
+                # ── 3. Initialise memory bank from reference frame ────────────────
+                # Identity-enhanced self-fusion seeds the SSM with appearance + position.
+                ref_fused = self.feature_fusion(ref_patch_p + ref_id_flat, ref_patch_p)
+                ref_flat = ref_fused.reshape(B * P, 1, D)
 
-            if self.use_dual_timescale_memory:
-                _, ref_h_slow = self.temporal_model_slow(
-                    ref_flat, prev_states=None, return_last_state=True
+                id_seeding = None
+                if self.hparams.use_identity_modulation:
+                    id_seeding = (
+                        ref_id_embed.mean(dim=[-2, -1])
+                        .unsqueeze(1).repeat(1, P, 1).view(B * P, D)
+                    )
+
+                _, ref_h_local = self.temporal_model_local(
+                    ref_flat, prev_states=None, return_last_state=True, identity=id_seeding
                 )
-                self.memory_bank_slow.reset()
-                self.memory_bank_slow.set_state(ref_h_slow)
+                _, ref_h_global = self.temporal_model_global(
+                    ref_flat, prev_states=None, return_last_state=True, identity=id_seeding
+                )
 
-            # Spatial decoder guidance: binary objectness from reference mask
-            ref_mask_safe = ref_mask.clone()
-            ref_mask_safe[ref_mask == 255] = 0
-            prev_guide_mask = (ref_mask_safe > 0).float().unsqueeze(1)  # [B, 1, H, W]
+                self.memory_bank_local.reset()
+                self.memory_bank_global.reset()
+                self.memory_bank_local.set_state(ref_h_local)
+                self.memory_bank_global.set_state(ref_h_global)
+
+                if self.use_dual_timescale_memory:
+                    _, ref_h_slow = self.temporal_model_slow(
+                        ref_flat, prev_states=None, return_last_state=True
+                    )
+                    self.memory_bank_slow.reset()
+                    self.memory_bank_slow.set_state(ref_h_slow)
+
+                prev_mask_int = ref_mask_safe.long()  # [B, H, W]
+                prev_patch = ref_patch_p.detach()     # [B, P, D]
+            else:
+                # ── Carry state from previous block (no reference re-seeding) ─────
+                # SSM states in memory_bank_* already hold end-of-last-block state.
+                # Only prev_mask_int / prev_patch / gh,gw are restored from carry.
+                gh, gw = self._carry_gh_gw  # type: ignore[misc]
+                prev_mask_int = self._carry_prev_mask_int.to(x.device)  # type: ignore
+                prev_patch = self._carry_prev_patch.to(x.device)        # type: ignore
+
+            prev_guide_mask = (prev_mask_int > 0).float().unsqueeze(1)  # [B, 1, H, W]
             ss_rate = self._get_scheduled_sampling_rate()
-
             all_preds_seg: list[torch.Tensor] = []
             ssm_states = None
 
             for t in range(T):
                 # Current frame patches: [B, D, P] → [B, P, D]
-                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, dim_in]
-                # ── 4 & 5. Feature fusion and KAN-SSM temporal refinement ─────
-                fused = self.feature_fusion(curr_patch, ref_patch_p)    # [B, P, D]
+                curr_patch = query_patch[:, t].permute(0, 2, 1)  # [B, P, D]
+
+                # ── Identity injection: choose mask for this frame ───────────────
+                # Training:  ss_rate > 0 → Bernoulli mix of GT (teacher forcing)
+                #            and predicted (autoregressive) masks per sample.
+                #            ss_rate == 0 → pure teacher forcing (GT only).
+                # Inference: always propagate from the predicted mask.
+                if self.training and query_masks is not None and ss_rate > 0.0:
+                    use_pred = torch.rand(B, device=x.device) < ss_rate  # [B] bool
+                    gt_int = query_masks[:, t].long().clamp(
+                        0, self.hparams.num_seg_classes - 1
+                    )
+                    mask_for_id = torch.where(
+                        use_pred.view(B, 1, 1), prev_mask_int, gt_int
+                    )
+                elif self.training and query_masks is not None:
+                    # ss_rate == 0: teacher-force with GT masks
+                    mask_for_id = query_masks[:, t].long().clamp(
+                        0, self.hparams.num_seg_classes - 1
+                    )
+                else:
+                    # Inference: fully autoregressive
+                    mask_for_id = prev_mask_int
+
+                mask_for_id_safe = mask_for_id.clone()
+                mask_for_id_safe[mask_for_id_safe == 255] = 0
+
+                id_onehot = (
+                    F.one_hot(mask_for_id_safe, num_classes=self.hparams.num_seg_classes)
+                    .permute(0, 3, 1, 2)
+                    .float()
+                )  # [B, num_seg_classes, H, W]
+                curr_id_embed = self.patch_wise_id_bank(id_onehot)  # [B, D, ~gh, ~gw]
+                if curr_id_embed.shape[-2:] != (gh, gw):
+                    curr_id_embed = F.adaptive_avg_pool2d(curr_id_embed, (gh, gw))
+                curr_id_flat = curr_id_embed.flatten(2).permute(0, 2, 1)  # [B, P, D]
+
+                # ── 4 & 5. Feature fusion and KAN-SSM temporal refinement ────────
+                # Fuse current features (+ identity signal) against the PREVIOUS
+                # frame — enabling short-range motion propagation via FeatureFusion
+                # while long-range context flows through SSM hidden states.
+                fused = self.feature_fusion(curr_patch + curr_id_flat, prev_patch)
                 fused_flat = fused.reshape(B * P, 1, D)
 
-                # Broadcast identity_vec if present: [B, D] -> [B*P, D]
+                # SSM identity conditioning: spatial-mean of current id embedding.
                 curr_identity = None
-                if identity_vec is not None:
-                    curr_identity = identity_vec.unsqueeze(1).repeat(1, P, 1).reshape(B * P, -1)
+                if self.hparams.use_identity_modulation:
+                    curr_identity = (
+                        curr_id_embed.mean(dim=[-2, -1])                   # [B, D]
+                        .unsqueeze(1).repeat(1, P, 1).reshape(B * P, -1)  # [B*P, D]
+                    )
 
                 prev_h_local = self.memory_bank_local.get_state()
                 prev_h_global = self.memory_bank_global.get_state()
-                
+
                 out_local, next_h_local = self.temporal_model_local(
                     fused_flat, prev_states=prev_h_local, return_last_state=True,
-                    identity=curr_identity
+                    identity=curr_identity,
                 )
                 out_global, next_h_global = self.temporal_model_global(
                     fused_flat, prev_states=prev_h_global, return_last_state=True,
-                    identity=curr_identity
+                    identity=curr_identity,
                 )
-                
+
                 self.memory_bank_local.update_state(next_h_local)
                 self.memory_bank_global.update_state(next_h_global)
-                
-                # KAN Dynamic Temporal Fusion: Dynamic mix of local (motion) and global (re-id) context
-                ssm_cat = torch.cat([out_local, out_global], dim=-1) # [B*P, 1, D*2]
-                ssm_gate_flat = torch.sigmoid(self.temporal_gate(ssm_cat.reshape(-1, D*2)))
+
+                # KAN Dynamic Temporal Fusion: gated mix of local (motion) and global (re-id)
+                ssm_cat = torch.cat([out_local, out_global], dim=-1)  # [B*P, 1, D*2]
+                ssm_gate_flat = torch.sigmoid(self.temporal_gate(ssm_cat.reshape(-1, D * 2)))
                 ssm_gate = ssm_gate_flat.view(B * P, 1, D)
                 ssm_fused = (ssm_gate * out_global) + ((1 - ssm_gate) * out_local)
 
-                # ── DTSM slow consolidation path ─────────────────────────
-                # The slow SSM carries a persistent hidden state across all
-                # frames of the video.  Its output is injected as a residual
-                # correction on the fast-path fusion — contributing long-range
-                # context without any attention / softmax operation.
+                # ── DTSM slow consolidation path ─────────────────────────────────
+                # Persistent causal SSM carries long-range context across frames.
+                # Injected as a residual correction — no attention / softmax.
                 if self.use_dual_timescale_memory:
                     prev_h_slow = self.memory_bank_slow.get_state()
                     out_slow, next_h_slow = self.temporal_model_slow(
@@ -595,31 +693,41 @@ class VideoMambaSystem(L.LightningModule):
                     ssm_fused = ssm_fused + self.slow_residual_proj(out_slow)
 
                 # [B*P, 1, D] → [B, 1, D, P] for decoder
-                # We pass the raw fused temporal context to enable hierarchical injection.
                 last_feat = (
-                    ssm_fused.squeeze(1)      # [B*P, D]
-                    .reshape(B, P, D)         # [B, P, D]
-                    .permute(0, 2, 1)         # [B, D, P]
-                    .unsqueeze(1)             # [B, 1, D, P]
+                    ssm_fused.squeeze(1)   # [B*P, D]
+                    .reshape(B, P, D)      # [B, P, D]
+                    .permute(0, 2, 1)      # [B, D, P]
+                    .unsqueeze(1)          # [B, 1, D, P]
                 )
 
-                # ── 6. Hierarchical decoding ────────────────────────────
-                # Decoder skip connections differ by encoder type:
-                # DINOv2: all stages at 14×14 (same resolution)
-                # Multi-scale encoders: stage_2(14x14), stage_1(28x28), stage_0(56x56).
+                # ── 6. Hierarchical decoding ─────────────────────────────────────
                 frame_ms = self._build_dec_ms(query_features_raw, t)
                 logits_t = self.seg_decoder(
                     last_feat, frame_ms, prev_mask=prev_guide_mask
                 )  # [B, 1, num_classes, H, W]
                 all_preds_seg.append(logits_t)
 
-                # No add_frame needed
-
-                # Update spatial guide: total objectness across all object channels
+                # ── Update propagation state for next frame ───────────────────────
                 pred_soft = torch.softmax(logits_t, dim=2)  # [B, 1, C, H, W]
                 prev_guide_mask = (
                     pred_soft[:, 0, 1:].sum(dim=1, keepdim=True).clamp(0.0, 1.0).detach()
                 )  # [B, 1, H, W]
+
+                # Integer predicted mask for identity encoding next frame.
+                # Resize to input resolution so patch_wise_id_bank strides correctly.
+                prev_mask_int = logits_t.squeeze(1).argmax(dim=1).detach()  # [B, lH, lW]
+                if prev_mask_int.shape[-2:] != (H, W):
+                    prev_mask_int = F.interpolate(
+                        prev_mask_int.unsqueeze(1).float(), size=(H, W), mode="nearest"
+                    ).squeeze(1).long()
+
+                # Previous-frame features for fusion next iteration (detached).
+                prev_patch = curr_patch.detach()
+
+            # Persist end-of-clip state so the next forward() call can carry it
+            # across when reset_memory=False (sliding-window long-video eval).
+            self._carry_prev_mask_int = prev_mask_int.cpu()
+            self._carry_prev_patch = prev_patch.cpu()
 
             logits_seg = torch.cat(all_preds_seg, dim=1)  # [B, T, C, H, W]
             ssm_cls = query_cls  # [B, T, 384]

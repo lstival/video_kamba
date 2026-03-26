@@ -1,0 +1,101 @@
+# @package _global_
+#
+# Phase 2 — DAVIS Fine-tuning  │  MLP Ablation Baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+# Mirrors mv2_ssm_mem_phase2_davis.yaml exactly.
+# Initialises from the MLP ablation Phase 1 checkpoint.
+#
+# Fairness constraints (must match the KAN model's Phase 2 config):
+#   - Same dataset (DAVIS 2017), limit_train_batches=500, max_epochs=100
+#   - Same optimiser: AdamW + OneCycleLR, lr=3e-5
+#   - Same backbone freeze (mv2_freeze_at=2 — stages 0+1 remain frozen)
+#   - Same gradient clip (0.5, norm), precision (bf16-mixed), accum (×2)
+#   - Same LR warmup: 3 epochs at ×0.1 start factor
+#   - Scheduled sampling ramp 0.0 → 0.3 over 100 epochs with 5-epoch warmup
+#     (identical to KAN Phase 2; needed to match exposure bias at inference)
+#
+# The checkpoint_path key below documents the intended initialisation.
+# It is NOT consumed by train.py — the SLURM script passes it via
+#   +pretrained_weights=...
+# so that the optimizer state and epoch counter restart from zero (Phase 1
+# used COCO; Phase 2 switches dataset and LR schedule).
+#
+# checkpoint_path (documentation only):
+#   ${work_dir}/checkpoints/mlp_ablation/best_mlp_abl_phase1_coco.ckpt
+#
+# Output checkpoint:  checkpoints/mlp_ablation/best_mlp_abl_phase2_davis.ckpt
+# Comet project:      video-mamba  |  tags: mlp-ablation, phase2, davis
+#
+# Gate decision @ epoch 50 (check Comet):
+#   val_J_and_F > 0.55  →  ablation complete; run eval_davis_full_sequence.sh
+#   val_J_and_F < 0.55  →  diagnose (check Phase 1 val_loss, LR warmup)
+# ═══════════════════════════════════════════════════════════════════════════════
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_mlp_ablation
+
+model:
+  learning_rate: 3.0e-5
+  mv2_freeze_at: 2
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3
+  lr_warmup_start_factor: 0.1
+
+  # Scheduled sampling: same ramp as KAN Phase 2 (0.0 → 0.3, warmup 5 ep).
+  # Keeps the MLP model's exposure-bias adaptation identical to the KAN model's
+  # so that the benchmark gap is attributable only to the modulator, not to
+  # differences in how each model handles imperfect memory at inference time.
+  scheduled_sampling_rate: 0.3
+  scheduled_sampling_start: 0.0
+  scheduled_sampling_end: 0.3
+  scheduled_sampling_warmup_epochs: 5
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 100
+  limit_train_batches: 500
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2
+
+callbacks:
+  model_checkpoint:
+    monitor: val_J_and_F
+    mode: max
+    filename: "best_mlp_abl_phase2_davis"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/mlp_ablation
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms_mlp_abl
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "feature_fusion"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_extractor"
+      - "ssm_output_fusion"

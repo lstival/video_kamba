@@ -75,9 +75,12 @@ callbacks:
     save_top_k: 1
     dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
 
+  spike_diagnostics:
+    log_path: ${work_dir}/logs/spike_diagnostics_phase2_davis.jsonl
+
   layer_gradient_norm_tracker:
     _target_: training.callbacks.LayerGradientNormTracker
-    output_dir: ${work_dir}/artifacts/gradient_norms
+    output_dir: ${work_dir}/artifacts/gradient_norms/phase2_davis
     log_every_n_steps: 50
     exploding_threshold: 1.0e+03
     vanishing_threshold: 1.0e-07

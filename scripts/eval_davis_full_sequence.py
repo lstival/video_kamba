@@ -41,6 +41,14 @@ import torch.nn.functional as F
 from jaxtyping import Float
 from omegaconf import DictConfig
 from PIL import Image
+
+# PyTorch 2.6 changed the default of `weights_only` in torch.load from False to True,
+# breaking Lightning checkpoint loading for checkpoints that contain OmegaConf objects.
+# Our checkpoints are internally produced and trusted — revert the default to False.
+_torch_load_orig = torch.load
+torch.load = lambda *args, **kwargs: _torch_load_orig(  # type: ignore[assignment]
+    *args, **{**kwargs, "weights_only": False}
+)
 from torch import Tensor
 
 # ── Project root on path ──────────────────────────────────────────────────────
@@ -137,11 +145,13 @@ def _resize_pred_to_orig(
 class SlidingWindowVOSInference:
     """Segment a single video sequence using a sliding-window SSM strategy.
 
-    The MemoryBank on ``model`` persists across the entire sequence; the SSM
-    hidden state is reset at the start of each ``clip_len``-frame block.  This
-    replicates the exact training-time distribution for the SSM (always at most
-    ``clip_len`` steps per recurrent pass) while allowing the cross-attention
-    memory to grow with the sequence.
+    For each block of ``clip_len`` frames:
+    * **Block 0** — seeds SSM state from the reference frame (``reset_memory=True``).
+    * **Blocks 1+** — carries SSM states from the previous block across the boundary
+      (``reset_memory=False``).  This preserves DTSM slow-path accumulation across
+      the full sequence, which is the key long-range advantage of the SSM design.
+    * ``model.reset_carry_state()`` is called before each new sequence so that
+      stale state does not leak between sequences.
 
     Args:
         model:       Loaded :class:`VideoMambaSystem` in eval mode.
@@ -172,6 +182,15 @@ class SlidingWindowVOSInference:
     ) -> dict[str, np.ndarray]:
         """Run full-sequence inference and return per-frame label maps.
 
+        Calls ``model.forward()`` once per sliding-window block of ``clip_len``
+        frames, passing the reference frame and mask each time so the model
+        can seed its SSM states from the reference.  This matches the training
+        distribution exactly (each training clip also starts from the reference).
+
+        The model handles feature extraction, feature fusion, KAN-SSM temporal
+        refinement, DTSM slow-path state carry, and hierarchical decoding
+        internally — we only need to supply the batched frames.
+
         Args:
             seq_dataset: Per-sequence evaluation dataset.  Index 0 is the
                          reference frame; indices 1..N are query frames.
@@ -180,14 +199,14 @@ class SlidingWindowVOSInference:
             Dictionary mapping ``frame_name`` → uint8 NumPy array ``[H, W]``
             with integer object labels (0 = background).
         """
-        model = self.model
         device = self.device
+        model  = self.model
 
         # ── Reference frame ───────────────────────────────────────────────────
         ref_sample = seq_dataset[0]
         assert ref_sample["has_mask"], (
             f"Sequence '{seq_dataset.seq_name}': reference frame (idx 0) has no "
-            "annotation — cannot initialise memory bank."
+            "annotation — cannot initialise SSM memory."
         )
 
         ref_img_orig = _load_image(
@@ -195,72 +214,64 @@ class SlidingWindowVOSInference:
         )
         orig_h, orig_w = np.array(ref_img_orig).shape[:2]
 
-        ref_img_t = self._preprocess_image(ref_img_orig)   # [3, H', W']
-        ref_mask_t = ref_sample["mask"].to(device)          # [H', W'] — already at output_size
+        ref_img_t  = self._preprocess_image(ref_img_orig)   # [3, H', W']
+        ref_img_b  = ref_img_t.unsqueeze(0).to(device)      # [1, 3, H', W']
+        ref_mask_t = ref_sample["mask"]                      # [H', W']
+        ref_mask_b = ref_mask_t.unsqueeze(0).to(device)     # [1, H', W']
 
-        # Feature extraction: [1, 1, 3, H, W]
-        ref_img_batch = ref_img_t.unsqueeze(0).unsqueeze(0).to(device)
-        _, ref_raw = model.feature_extractor(ref_img_batch)
-
-        ref_ms = model._map_ms_features(ref_raw)
-        ref_patch = ref_ms["stage_3"]  # [1, 1, D, P]
-        ref_patch_hw = ref_ms.get("stage_3_hw")
-        ref_patch_p = ref_patch.squeeze(1).permute(0, 2, 1)  # [1, P, D]
-
-        ref_patch_fine, ref_patch_fine_hw = model._get_fine_features(ref_raw, t=0)  # [1, P2, Ch]
-
-        # Optional identity vector for identity-conditioned modulation.
-        identity_vec: Optional[Float[Tensor, "1 D"]] = None
-        if getattr(model.hparams, "use_identity_modulation", False):
-            identity_vec = self._extract_identity_vec(
-                ref_patch_p, ref_mask_t.unsqueeze(0), ref_patch_hw
-            )
-
-        # Initialise memory bank with reference frame (resets any previous state).
-        model.memory_bank.encode_reference(
-            ref_patch_p,
-            ref_mask_t.unsqueeze(0),
-            ref_patch_fine,
-            feat_hw=ref_patch_hw,
-            feat_hw_fine=ref_patch_fine_hw,
-        )
-
-        # Spatial decoder guidance: binary objectness from reference mask.
-        ref_mask_safe = ref_mask_t.clone()
-        ref_mask_safe[ref_mask_t == 255] = 0
-        _, H_enc, W_enc = ref_img_t.shape
-        prev_guide_mask = (ref_mask_safe > 0).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-
-        # ── Query frames ─────────────────────────────────────────────────────
+        # Seed the prediction dict with the reference mask at original resolution.
         predictions: dict[str, np.ndarray] = {
             seq_dataset.frame_names[0]: _resize_pred_to_orig(
-                ref_mask_t.cpu().clamp(0, 255),
-                orig_h, orig_w,
+                ref_mask_t.clamp(0, 255), orig_h, orig_w,
             )
         }
 
+        # Clear any carry state from a previous sequence.
+        model.reset_carry_state()
+
+        # ── Sliding-window query loop ─────────────────────────────────────────
         query_indices = list(range(1, len(seq_dataset)))
-        n_blocks = (len(query_indices) + self.clip_len - 1) // self.clip_len
+        n_blocks = max(1, (len(query_indices) + self.clip_len - 1) // self.clip_len)
 
         LOGGER.info(
-            "  seq=%s  frames=%d  blocks=%d  clip_len=%d",
+            "  seq=%s  total_frames=%d  blocks=%d  clip_len=%d",
             seq_dataset.seq_name, len(query_indices), n_blocks, self.clip_len,
         )
 
         for block_idx in range(n_blocks):
             block_start = block_idx * self.clip_len
-            block_end = min(block_start + self.clip_len, len(query_indices))
-            block_frame_indices = query_indices[block_start:block_end]
+            block_end   = min(block_start + self.clip_len, len(query_indices))
+            block_indices = query_indices[block_start:block_end]
 
-            prev_guide_mask, predictions = self._run_block(
-                block_frame_indices=block_frame_indices,
-                seq_dataset=seq_dataset,
-                prev_guide_mask=prev_guide_mask,
-                identity_vec=identity_vec,
-                predictions=predictions,
-                orig_h=orig_h,
-                orig_w=orig_w,
+            # Load and preprocess the block's frames.
+            block_imgs = [
+                self._preprocess_image(
+                    _load_image(str(seq_dataset.img_dir / seq_dataset.frame_names[i]))
+                )
+                for i in block_indices
+            ]
+            # [1, T_block, 3, H', W']
+            block_t = torch.stack(block_imgs, dim=0).unsqueeze(0).to(device)
+
+            # Block 0: seed SSM memory from the reference frame (reset_memory=True).
+            # Blocks 1+: carry SSM + prev-frame state from the previous block
+            #            (reset_memory=False) — DTSM slow-path state accumulates
+            #            over the full sequence without being wiped at boundaries.
+            reset_mem = block_idx == 0
+            _, _, _, logits_seg = model(
+                block_t,
+                ref_frame=ref_img_b,
+                ref_mask=ref_mask_b,
+                reset_memory=reset_mem,
             )
+            # logits_seg: [1, T_block, num_seg_classes, H', W']
+
+            pred_channels = torch.argmax(logits_seg, dim=2)  # [1, T_block, H', W']
+
+            for local_t, frame_idx in enumerate(block_indices):
+                frame_name = seq_dataset.frame_names[frame_idx]
+                pred_hw = pred_channels[0, local_t].cpu()  # [H', W']
+                predictions[frame_name] = _resize_pred_to_orig(pred_hw, orig_h, orig_w)
 
         return predictions
 
@@ -273,169 +284,6 @@ class SlidingWindowVOSInference:
         import torchvision.transforms.functional as TF
         t = TF.to_tensor(img)
         return TF.normalize(t, mean=_MEAN, std=_STD)
-
-    def _extract_identity_vec(
-        self,
-        ref_patch_p: Float[Tensor, "1 P D"],
-        ref_mask: Float[Tensor, "1 H W"],
-        ref_patch_hw: tuple[int, int] | None,
-    ) -> Float[Tensor, "1 D"]:
-        """Pool reference features weighted by mask objectness → identity vector.
-
-        Mirrors the identity-vector extraction in :meth:`VideoMambaSystem.forward`.
-
-        Args:
-            ref_patch_p: Reference coarse patches ``[1, P, D]``.
-            ref_mask:    Integer reference mask ``[1, H, W]``.
-            ref_patch_hw: Spatial shape ``(gh, gw)`` for patch grid.
-
-        Returns:
-            Identity vector ``[1, D]``.
-        """
-        B, P, D = ref_patch_p.shape
-        H, W = ref_mask.shape[-2:]
-        if ref_patch_hw is not None:
-            gh, gw = ref_patch_hw
-        else:
-            gh, gw = H // 16, W // 16
-
-        m_down = F.interpolate(
-            ref_mask.unsqueeze(1).float(), size=(gh, gw),
-            mode="bilinear", align_corners=False,
-        )
-        m_flat = (m_down.reshape(B, -1) > 0.5).float()       # [1, P]
-        denom = m_flat.sum(dim=1, keepdim=True) + 1e-6
-        identity_vec = (ref_patch_p * m_flat.unsqueeze(-1)).sum(dim=1) / denom  # [1, D]
-        return identity_vec
-
-    def _run_block(
-        self,
-        block_frame_indices: list[int],
-        seq_dataset: DAVISVOSEval,
-        prev_guide_mask: Float[Tensor, "1 1 H W"],
-        identity_vec: Optional[Float[Tensor, "1 D"]],
-        predictions: dict[str, np.ndarray],
-        orig_h: int,
-        orig_w: int,
-    ) -> tuple[Float[Tensor, "1 1 H W"], dict[str, np.ndarray]]:
-        """Process one block of frames, returning updated state.
-
-        Feature extraction is batched over the whole block for efficiency.
-        The SSM hidden-state starts fresh (``ssm_states=None``) at the top of
-        each block, and the MemoryBank carries over from the previous block.
-
-        Args:
-            block_frame_indices: Dataset indices for this block (all query frames).
-            seq_dataset:         Per-sequence evaluation dataset.
-            prev_guide_mask:     Binary objectness guide from the previous block's
-                                 last frame ``[1, 1, H, W]``.
-            identity_vec:        Pre-computed identity vector (or ``None``).
-            predictions:         Accumulator dict — updated in place.
-            orig_h:              Original frame height (for mask upsampling).
-            orig_w:              Original frame width.
-
-        Returns:
-            Tuple ``(updated_prev_guide_mask, updated_predictions)``.
-        """
-        model = self.model
-        device = self.device
-
-        # ── Batch feature extraction for the whole block ──────────────────────
-        block_imgs: list[Float[Tensor, "3 H W"]] = []
-        for frame_idx in block_frame_indices:
-            img_orig = _load_image(
-                str(seq_dataset.img_dir / seq_dataset.frame_names[frame_idx])
-            )
-            block_imgs.append(self._preprocess_image(img_orig))
-
-        # [1, T_block, 3, H, W]
-        block_tensor = torch.stack(block_imgs, dim=0).unsqueeze(0).to(device)
-        T_block = block_tensor.shape[1]
-
-        _, block_raw = model.feature_extractor(block_tensor)
-        block_ms = model._map_ms_features(block_raw)
-        block_patch = block_ms["stage_3"]  # [1, T_block, D, P]
-        block_patch_hw = block_ms.get("stage_3_hw")
-        D = block_patch.shape[2]
-        P = block_patch.shape[3]
-
-        # ── Frame-by-frame SSM + propagation loop ─────────────────────────────
-        # SSM state resets at the block boundary (stays in training distribution).
-        ssm_states = None
-
-        for local_t, frame_idx in enumerate(block_frame_indices):
-            frame_name = seq_dataset.frame_names[frame_idx]
-
-            # Coarse patches for this frame: [1, P, D]
-            curr_patch = block_patch[:, local_t].permute(0, 2, 1)  # [1, P, D]
-
-            # Fine-scale patches: [1, P2, Ch]
-            curr_patch_fine, curr_patch_fine_hw = model._get_fine_features(
-                block_raw, t=local_t
-            )
-
-            # ── Propagation: cross-attend query patches to memory bank ────────
-            K_mem, V_mem = model.memory_bank.get_memory()
-            prop_feat = model.propagation_attention(
-                curr_patch, K_mem, V_mem
-            )  # [1, P, prop_d_value]
-
-            # ── KAN-SSM temporal refinement ───────────────────────────────────
-            # T=1 per step (one token per SSM call) — recurrent hidden-state
-            # carries temporal context across the block.
-            prop_flat = prop_feat.reshape(P, 1, -1)  # [P, 1, prop_d_value]
-
-            # Broadcast identity if enabled: [1, D] → [P, D]
-            curr_identity: Optional[Float[Tensor, "P D"]] = None
-            if identity_vec is not None:
-                curr_identity = (
-                    identity_vec.squeeze(0)    # [D]
-                    .unsqueeze(0)              # [1, D]
-                    .expand(P, -1)             # [P, D]
-                )
-
-            ssm_out_flat, ssm_states = model.temporal_model(
-                prop_flat,
-                prev_states=ssm_states,
-                return_last_state=True,
-                identity=curr_identity,
-            )
-            # [P, 1, D] → [1, 1, D, P] for decoder
-            last_feat = (
-                ssm_out_flat.squeeze(1)    # [P, D]
-                .reshape(1, P, D)          # [1, P, D]
-                .permute(0, 2, 1)          # [1, D, P]
-                .unsqueeze(1)              # [1, 1, D, P]
-            )
-
-            # ── Hierarchical decoding ─────────────────────────────────────────
-            frame_dec_ms = model._build_dec_ms(block_raw, t=local_t)
-            logits_t = model.seg_decoder(
-                last_feat, frame_dec_ms, prev_mask=prev_guide_mask
-            )  # [1, 1, num_classes, H, W]
-
-            # ── Update memory bank with soft predicted mask ───────────────────
-            pred_soft = torch.softmax(logits_t, dim=2).squeeze(1)  # [1, C, H, W]
-            model.memory_bank.add_frame(
-                curr_patch.detach(),
-                pred_soft.detach(),
-                curr_patch_fine.detach(),
-                feat_hw=block_patch_hw,
-                feat_hw_fine=curr_patch_fine_hw,
-            )
-
-            # ── Update spatial objectness guide ───────────────────────────────
-            prev_guide_mask = (
-                pred_soft[:, 1:].sum(dim=1, keepdim=True).clamp(0.0, 1.0).detach()
-            )  # [1, 1, H, W]
-
-            # ── Store prediction at original resolution ───────────────────────
-            pred_hard = torch.argmax(pred_soft, dim=1).squeeze(0).cpu()  # [H, W]
-            predictions[frame_name] = _resize_pred_to_orig(
-                pred_hard, orig_h, orig_w
-            )
-
-        return prev_guide_mask, predictions
 
 
 # ══════════════════════════════════════════════════════════════════════════════

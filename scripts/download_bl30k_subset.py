@@ -5,7 +5,7 @@ All segments are downloaded sequentially: each tar is fetched, extracted into
 disk usage to one segment at a time (~120 GB).
 
 Official dataset page: https://henghuiding.github.io/MIVOS/ (BL30K section)
-Illinois Data Bank:    https://databank.illinois.edu/datasets/IDB-4930082
+Illinois Data Bank:    https://databank.illinois.edu/datasets/IDB-1702934
 
 Usage (SLURM / non-interactive):
     python scripts/download_bl30k_subset.py \\
@@ -40,15 +40,15 @@ LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Illinois Data Bank download links ────────────────────────────────────────
-# All links are from: https://databank.illinois.edu/datasets/IDB-4930082
+# All links are from: https://databank.illinois.edu/datasets/IDB-1702934
 # Verify current links on the dataset page if any redirect fails.
 BL30K_URLS: dict[str, str] = {
     "a": "https://databank.illinois.edu/datafiles/rvqd3/download",
-    "b": "https://databank.illinois.edu/datafiles/ximzd/download",
-    "c": "https://databank.illinois.edu/datafiles/4r7qf/download",
-    "d": "https://databank.illinois.edu/datafiles/y4cdl/download",
-    "e": "https://databank.illinois.edu/datafiles/3sp7e/download",
-    "f": "https://databank.illinois.edu/datafiles/qopvs/download",
+    "b": "https://databank.illinois.edu/datafiles/mgxzg/download",
+    "c": "https://databank.illinois.edu/datafiles/gmu94/download",
+    "d": "https://databank.illinois.edu/datafiles/osrh3/download",
+    "e": "https://databank.illinois.edu/datafiles/wqjjv/download",
+    "f": "https://databank.illinois.edu/datafiles/t86no/download",
 }
 
 ALL_SEGMENTS: list[str] = ["a", "b", "c", "d", "e", "f"]

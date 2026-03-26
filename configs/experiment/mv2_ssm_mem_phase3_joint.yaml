@@ -1,0 +1,114 @@
+# @package _global_
+#
+# Phase 3 — Joint Generalist Fine-tuning from BL30K (MobileNetV2 + KAN-SSM + DTSM)
+#
+# Trains on DAVIS (15%) + YouTube-VOS (60%) + LVOS (25%) simultaneously,
+# producing a single model competitive on all three benchmarks.
+#
+# Architecture additions vs Phase 1b (BL30K checkpoint):
+#   ── patch_wise_id_bank: Conv2d(11→256, k=17, s=16) spatial identity encoder
+#      (new module → random init via shape-safe weight loader, learns in Phase 3)
+#   ── Per-frame identity propagation replaces static reference pooling
+#   ── Feature fusion against previous frame (not always reference)
+#   ── Scheduled sampling ramps 0.05 → 0.35 over 10 epochs
+#
+# Training decisions:
+#   ── pretrained_weights resets optimizer for BL30K → mixed-domain shift.
+#   ── mv2_freeze_at: 1: backbone stage 2 unlocked for cross-domain adaptation.
+#   ── DTSM enabled: LVOS long sequences (408 frames avg) directly exercise the
+#      slow SSM path at every step.
+#   ── limit_train_batches: 2500 ≈ 2500×4 = 10k clips/epoch @ batch=4.
+#      LVOS contributes 25% ≈ 2500 LVOS clips/epoch; YTB dominates the rest.
+#   ── max_epochs: 60 — gate decision at epoch 30.
+#
+# Gate decision @ epoch 30 (check Comet):
+#   val_J_and_F > 0.62 → checkpoint generalises; continue to epoch 60
+#   val_J_and_F < 0.55 → check scheduled-sampling ramp & patch_wise_id_bank LR
+#
+# Evaluation after training (separate scripts):
+#   scripts/slurm_eval_davis_phase3_lustre.sh   → DAVIS val J&F
+#   scripts/slurm_eval_ytb_phase3_lustre.sh     → YouTube-VOS 2019 val J&F
+#   scripts/slurm_eval_lvos_phase3_lustre.sh    → LVOS val J&F
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: phase3_joint
+
+# Weight-only transfer from BL30K Phase 1b checkpoint (resets optimizer).
+# patch_wise_id_bank is new — it is skipped by the shape-safe loader and
+# gets random N(0, 0.02) init, learning from scratch during Phase 3.
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase2_bl30k-v2.ckpt
+
+model:
+  learning_rate: 2.5e-5
+  mv2_freeze_at: 1              # unfreeze stage 2 for cross-domain appearance shift
+  use_checkpointing: true
+  use_identity_modulation: true # SSM identity conditioning via spatial-mean of id_embed
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3
+  lr_warmup_start_factor: 0.1
+  # ── DTSM: keep enabled (inherited from BL30K pre-training) ──────────────
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
+  # ── Scheduled sampling ramp ──────────────────────────────────────────────
+  # Ramps from near-zero (teacher forcing) to 0.35 (autoregressive mix)
+  # over 10 warmup epochs, teaching the model to handle imperfect propagation
+  # from predicted masks on all three datasets.
+  scheduled_sampling_start: 0.05
+  scheduled_sampling_end: 0.35
+  scheduled_sampling_warmup_epochs: 10
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 2.5e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 2.5e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 60
+  limit_train_batches: 2500     # ≈2500 clips/epoch across all three datasets
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2    # effective batch = 4×2 = 8
+
+callbacks:
+  model_checkpoint:
+    monitor: val_J_and_F
+    mode: max
+    filename: "best_slim_v2_phase3_joint"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
+
+  spike_diagnostics:
+    log_path: ${work_dir}/logs/spike_diagnostics_phase3_joint.jsonl
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms/phase3_joint
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "patch_wise_id_bank"
+      - "temporal_model_slow"
+      - "memory_bank_slow"
+      - "slow_residual_proj"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_fusion"

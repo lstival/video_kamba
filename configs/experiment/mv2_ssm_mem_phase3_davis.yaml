@@ -1,0 +1,94 @@
+# @package _global_
+#
+# Phase 3 — DAVIS Fine-tuning from BL30K (MobileNetV2 + KAN-SSM + DTSM)
+#
+# Branches directly from BL30K Phase 1b checkpoint (best_slim_v2_phase2_bl30k-v2.ckpt),
+# parallel to the LVOS Phase 3 branch.  This produces a DAVIS-specialised model
+# for the DAVIS 2017 val evaluation.
+#
+# Key differences vs mv2_ssm_mem_phase2_davis.yaml (Phase 2, COCO → DAVIS):
+#   ── pretrained_weights (not checkpoint_path): resets optimizer for clean
+#      domain shift from BL30K synthetic → DAVIS real video.
+#   ── mv2_freeze_at: 2 → 1: BL30K already trained stage 2; unfreezing it
+#      here allows adaptation to DAVIS appearance without gradient explosion.
+#   ── DTSM enabled (use_dual_timescale_memory: true): inherited from BL30K,
+#      must remain on so slow SSM state propagates across the short DAVIS clips.
+#   ── max_epochs: 100 (DAVIS is only 60 train seqs — needs many passes).
+#   ── limit_train_batches: 500 (≈12 min/epoch; same as Phase 2 DAVIS).
+#
+# Gate decision @ epoch 50 (check Comet):
+#   val_J_and_F > 0.60 → checkpoint is good; continue or move to joint phase
+#   val_J_and_F < 0.60 → diagnose slow SSM gradient flow
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: davis_vos
+
+# Weight-only transfer from BL30K checkpoint (resets optimizer).
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase2_bl30k-v2.ckpt
+
+model:
+  learning_rate: 3.0e-5
+  mv2_freeze_at: 1              # unfreeze stage 2 — BL30K already adapted it
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 3           # warmup after BL30K synthetic → DAVIS real domain shift
+  lr_warmup_start_factor: 0.1
+  # ── DTSM: keep enabled (inherited from BL30K pre-training) ───────────────
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 3.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 3.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 100
+  limit_train_batches: 500      # DAVIS: 60 train seqs — repeat with shuffle
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2    # effective batch = 4×2 = 8
+
+callbacks:
+  model_checkpoint:
+    monitor: val_J_and_F
+    mode: max
+    filename: "best_slim_v2_phase3_davis"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
+
+  spike_diagnostics:
+    log_path: ${work_dir}/logs/spike_diagnostics_phase3_davis.jsonl
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms/phase3_davis
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "temporal_model_slow"
+      - "memory_bank_slow"
+      - "slow_residual_proj"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_fusion"

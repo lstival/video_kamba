@@ -1,0 +1,105 @@
+# @package _global_
+#
+# Phase 2 — Full BL30K Synthetic Video Pre-training (architecture-fixed run)
+#
+# Bridges COCO (static) → DAVIS/YTB/LVOS (real video).
+# Starts from Phase 1 COCO checkpoint with all architecture fixes applied:
+#   ── patch_wise_id_bank (Conv2d 11→256, k=17, s=16) replaces obj_id_embedding
+#   ── DTSM slow SSM path (d_state=64, A_bar≈0.995) learns long-range dynamics
+#   ── Previous-frame fusion (not always-reference)
+#
+# Data: full BL30K on Lustre (25 K sequences, 160 frames, 768×512)
+#   Override via: datamodule.data_dir=/lustre/.../BL30K
+#
+# Training decisions:
+#   ── pretrained_weights resets optimizer (COCO → BL30K domain shift).
+#   ── mv2_freeze_at: 2 keeps stages 0+1 frozen — only stage 2+, SSM, and
+#      patch_wise_id_bank learn. Backbone stability is critical when the slow
+#      SSM path (random init) is establishing its temporal attractor.
+#   ── limit_train_batches: 3000 (↑ from 2000) — 25K seqs × 160 frames gives
+#      enough diversity; more steps/epoch improves slow-path gradient coverage.
+#   ── accumulate_grad_batches: 4 → effective batch = 2×4 = 8.
+#   ── No scheduled sampling — BL30K uses GT masks throughout (teacher forcing).
+#      Scheduled sampling is introduced in Phase 3 (real video datasets).
+#   ── Monitors val_loss (BL30K has no J&F reference annotations).
+#
+# Gate decision @ epoch 25 (check Comet):
+#   val_loss < 0.30 → healthy; continue to epoch 50
+#   val_loss > 0.45 → check DTSM gradient norms (slow SSM may be vanishing)
+#
+defaults:
+  - override /callbacks: default
+  - override /model: mv2_ssm_memory
+  - override /datamodule: bl30k
+
+# Weight-only transfer from Phase 1 (COCO) checkpoint.
+# patch_wise_id_bank is new — skipped by shape-safe loader, gets N(0,0.02) init.
+# obj_id_embedding (removed) is silently dropped by the loader.
+pretrained_weights: ${work_dir}/checkpoints/ssm_mem_v2_aot/best_slim_v2_phase1_coco.ckpt
+
+model:
+  learning_rate: 5.0e-5
+  mv2_freeze_at: 2              # stages 0+1 frozen; stage 2+ fine-tuned
+  use_checkpointing: true
+  use_identity_modulation: true
+  optimizer_weight_decay: 0.05
+  lr_warmup_epochs: 2
+  lr_warmup_start_factor: 0.1
+  # ── DTSM: slow consolidation path learns long-range temporal dynamics ──────
+  # Random init (new module) — BL30K 160-frame sequences give sufficient signal.
+  use_dual_timescale_memory: true
+  slow_ssm_d_state: 64
+  slow_ssm_log_a_init: -3.0
+
+  opt:
+    optimizer:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: 5.0e-5
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      weight_decay: 0.05
+
+    lr_scheduler:
+      _target_: torch.optim.lr_scheduler.OneCycleLR
+      _partial_: true
+      max_lr: 5.0e-5
+      pct_start: 0.1
+      anneal_strategy: cos
+      div_factor: 10.0
+      final_div_factor: 100.0
+
+trainer:
+  max_epochs: 50
+  limit_train_batches: 3000     # ↑ from 2000: full 25K seqs justify more coverage/epoch
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 4    # effective batch = 2×4 = 8
+
+callbacks:
+  model_checkpoint:
+    monitor: val_loss
+    mode: min
+    filename: "best_slim_v2_phase2_bl30k_full"
+    save_top_k: 1
+    dirpath: ${work_dir}/checkpoints/ssm_mem_v2_aot
+
+  spike_diagnostics:
+    log_path: ${work_dir}/logs/spike_diagnostics_phase2_bl30k_full.jsonl
+
+  layer_gradient_norm_tracker:
+    _target_: training.callbacks.LayerGradientNormTracker
+    output_dir: ${work_dir}/artifacts/gradient_norms/phase2_bl30k_full
+    log_every_n_steps: 50
+    exploding_threshold: 1.0e+03
+    vanishing_threshold: 1.0e-07
+    patience: 50
+    track_layer_names:
+      - "patch_wise_id_bank"
+      - "temporal_model_slow"
+      - "memory_bank_slow"
+      - "slow_residual_proj"
+      - "temporal_model_local"
+      - "temporal_model_global"
+      - "feature_fusion"

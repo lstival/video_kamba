@@ -622,13 +622,21 @@ class SegmentationDecoder(nn.Module):
         # top-down pyramid with AOT-style multi-scale temporal injection
         # up1: 14×14 semantics + Stage-3 skip  → [BT, dec1, 28, 28]
         x1 = execute_up(self.up1, x, s3, ref_s3, r_mask)
-        
-        # Inject temporal context into Stride-8 (Detailed) skip-connection
+
+        # Inject temporal context into Stride-8 (Detailed) skip-connection.
+        # ConvTranspose2d(stride=2) outputs exactly 2×spatial_input which may
+        # differ from the encoder stride-8 size by 1 pixel for non-square or
+        # odd-resolution inputs (e.g. LVOS 720P, shorter-side=480 resize).
+        # Nearest-neighbour interpolation aligns without artefacts.
         t_s8 = self.temporal_proj_s8(x)
+        if t_s8.shape[-2:] != s2.shape[-2:]:
+            t_s8 = nn.functional.interpolate(t_s8, size=s2.shape[-2:], mode="nearest")
         x2 = execute_up(self.up2, x1, s2 + t_s8, ref_s2, r_mask)
-        
-        # Inject temporal context into Stride-4 (Edge) skip-connection
+
+        # Inject temporal context into Stride-4 (Edge) skip-connection.
         t_s4 = self.temporal_proj_s4(t_s8)
+        if t_s4.shape[-2:] != s1.shape[-2:]:
+            t_s4 = nn.functional.interpolate(t_s4, size=s1.shape[-2:], mode="nearest")
         x3 = execute_up(self.up3, x2, s1 + t_s4, ref_s1, r_mask)
 
         logits = self.final_head(x3)   # [BT, num_classes, 56, 56]
